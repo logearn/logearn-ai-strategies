@@ -31,41 +31,22 @@ if (ratHolder) {
   return false
 }
 
-// ===== 跌破斐波0.86 拉黑：历史最低市值 或 当前市值 任一 < 0.86 即拉黑 =====
-// 需求："历史曾跌破" 与 "当前在0.86下方" 只要有一个成立就拉黑（取并集，最严格）——
-//   即哪怕现在已反弹回0.86上方，只要历史跌破过也照样拉黑。
-// 历史最低市值：用 Kline 最高点(max_up_mcap_time)之后所有K线 low 换算得到。
-// 0.86 回撤位市值 = 历史最高市值 × (1 - 0.86) = max_up_mcap × 0.14
-// ⚠️ Kline 在纯【代币实时流】模式可能被忽略、add_blacklist 也是空操作——上线看日志确认。
+// ===== 跌破斐波0.86 拉黑（只看当前市值）=====
+// 【斐波锚点】最低点固定为 0（不追踪前低/动态最低点），最高点为历史最高市值 max_up_mcap；
+//   0.86 回撤位市值 = 最高 × (1 - 0.86) = max_up_mcap × 0.14（即从高点跌超 86%、只剩 14% 才算跌破）。
+// 【跌破判断】只看当前市值 mcap 是否 < 0.86位，不再遍历K线历史、不判断"历史曾跌破"。
+//   当前市值跌破即 add_blacklist 永久拉黑。
+// ⚠️ add_blacklist 在纯【代币实时流】模式是空操作——上线看日志确认。
 const maxMcap = L.max_up_mcap || 0
 const mcap = L.mcap || 0
-const maxTime = L.max_up_mcap_time || 0
-const curPrice = Number(KI.current_price) || 0
-const klineBars = Array.isArray(KI.kline_bars) ? KI.kline_bars : []
 
 if (maxMcap > 0 && mcap > 0) {
-  const fib086 = maxMcap * (1 - 0.86)
+  const fibLow = 0 // 斐波那契最低点固定为 0
+  const fib086 = fibLow + (maxMcap - fibLow) * (1 - 0.86)
 
-  // 计算历史最低市值（最高点之后）
-  let histLowMcap = null
-  let histSource = ''
-  if (curPrice > 0 && klineBars.length > 0 && maxTime > 0) {
-    const priceToMcap = mcap / curPrice
-    let minLow = Infinity
-    for (const k of klineBars) {
-      if (!k || typeof k.low !== 'number' || typeof k.time !== 'number') continue
-      if (k.time < maxTime) continue
-      if (k.low < minLow) minLow = k.low
-    }
-    if (minLow !== Infinity) { histLowMcap = minLow * priceToMcap; histSource = 'K线历史最低' }
-  }
-  // 拿不到 Kline 历史时，用当前市值兜底当历史值（此时历史与当前同源）
-  if (histLowMcap === null) { histLowMcap = mcap; histSource = '快照兜底(无K线)' }
-
-  const histBroke = histLowMcap < fib086   // 历史跌破
-  const curBroke = mcap < fib086           // 当前跌破
+  const curBroke = mcap < fib086 // 当前市值跌破
   const blacklistChecks = [
-    ['历史或当前跌破斐波0.86(' + histSource + ')', histBroke || curBroke, '历史' + histLowMcap.toFixed(0) + '/当前' + mcap.toFixed(0), '两者均>=0.86位' + fib086.toFixed(0) + '(历史最高' + maxMcap.toFixed(0) + ')'],
+    ['当前市值跌破斐波0.86', curBroke, mcap.toFixed(0), '>= 0.86位' + fib086.toFixed(0) + '(最高' + maxMcap.toFixed(0) + '/最低0)'],
   ]
   const blackHit = blacklistChecks.filter(c => c[1])
   if (blackHit.length) {

@@ -72,11 +72,11 @@ const isFirstFibRebound = finishedDeepCycles === 0
 
 const checks = [
   ['Pump发射', isPump, `${L.platform_name}`, '含 Pump'],
-  ['创建时长(小时)', ageHours < 8, ageHours.toFixed(2), '< 8'],
+  ['创建时长(小时)', ageHours < 7, ageHours.toFixed(2), '< 8'],
   ['已发射外盘', !!migrated, !!migrated, '= true'],
   ['历史最高市值USD', maxMcap > 220000, maxMcap.toFixed(0), '> 220000'],
   ['当前买入市值上限USD', mcap <= 800000, mcap.toFixed(0), '<= 800000'],
-  ['精选+共振+反弹+苏醒总次数', signalTotal >= 3, `精${featuredCnt}+共${whaleCnt}+反${vbCnt}+苏${awakeCnt}=${signalTotal}`, '>= 3'],
+  ['精选+共振+反弹+苏醒总次数', signalTotal >= 5, `精${featuredCnt}+共${whaleCnt}+反${vbCnt}+苏${awakeCnt}=${signalTotal}`, '>= 3'],
   ['24h成交额USD', vol24Usd >= 300000, vol24Usd.toFixed(0), '>= 300000'],
   ['垃圾钱包占比%', shit < 5, shit, '< 5'],
   ['新钱包占比%', newVol < 60, newVol, '< 60'],

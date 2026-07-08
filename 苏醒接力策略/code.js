@@ -1,4 +1,4 @@
-// 苏醒接力策略：Pump / four.meme 发射 + 10分钟内苏醒信号价格逐个抬高 + 最新苏醒在成本线上
+// 苏醒接力策略：Pump / four.meme 发射 + 30分钟内苏醒信号价格逐个抬高 + 最新苏醒在成本线上
 // + 当前苏醒暴量>=8k(USD) + 排除关注地址后 单地址持仓<=10% 转账持仓<=10%
 const ALLOW_PLATFORMS = [
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump（SOL）
@@ -27,7 +27,7 @@ const latestTime = latestWake ? num(latestWake.signalTime) : 0
 const prevTime = prevWake ? num(prevWake.signalTime) : 0
 const gap = prevWake ? latestTime - prevTime : -1
 
-const WINDOW = 600
+const WINDOW = 1800 // 30分钟
 const inWindow = latestWake ? wakeSorted.filter(w => latestTime - num(w.signalTime) <= WINDOW).length : 0
 
 // 苏醒暴量（换算 USD 用于 8k 门槛）
@@ -50,7 +50,7 @@ const maxTransferIn = nonFollowed.reduce((m, h) => Math.max(m, num(h.transfer_in
 
 const checks = [
   ['平台', ALLOW_PLATFORMS.includes(logearn.platform), logearn.platform, 'pump/four'],
-  ['10分钟内多苏醒', !!prevWake && inWindow > 1 && gap <= WINDOW, `${inWindow}个/间隔${gap}s`, '>1且<=600s'],
+  ['30分钟内多苏醒', !!prevWake && inWindow > 1 && gap <= WINDOW, `${inWindow}个/间隔${gap}s`, '>1且<=1800s'],
   ['价格>前一个', !!prevWake && latestMcap > prevMcap, `${latestMcap.toFixed(0)}>${prevMcap.toFixed(0)}`, '当前市值>前一个'],
   ['暴量>=8k', latestVolUsd >= 8000, `$${latestVolUsd.toFixed(0)}`, '>=8000'],
   ['成本线上', deviationPct > 0, deviationPct.toFixed(1) + '%', '>0'],

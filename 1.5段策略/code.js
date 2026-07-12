@@ -1,8 +1,14 @@
-// 1.5段策略 v26
-// 【依赖 kline_and_indicators 与 chip_analысis，单币深度分析场景，非实时流批量场景】
+// 1.5段策略 v27
+// 【依赖 kline_and_indicators 与 chip_analysis，单币深度分析场景，非实时流批量场景】
 //
-// 本版改动（相对 v25）：
-// 新增"买入市值 < $120k"上限（mcap < 120000）——低市值入场赔率更好，砍掉高市值平庸单。
+// 本版改动（相对 v26）：修复 avg 成本线取错的 bug。
+// 问题：findAvgPriceAtTime 在 low_price_time 早于本地 avg_price_bars 覆盖范围时，
+//        会 fallback 到"最老那根 bar"（累计成本刚起步、值最低），导致 avg 被严重低估
+//        （例：low=28851/avg被算成19158，实际应≈25k）。
+// 修法B（宽松）：一旦查找超出 K 线覆盖范围（找不到 time<=t 的 bar），
+//        改用当前成本线 ctx.kline_and_indicators.current_avg_price 换算的市值做近似，
+//        而不是拿最老那根；并在 retraceInfo 标注 (近似:当前成本线)。
+//        avg_price_bars 为 newest first，最后一根是最老一根——只有当 t 比最老一根还早才算超范围。
 
 try {
   const nowSec = Math.floor(Date.now() / 1000)
@@ -64,13 +70,20 @@ try {
 
   function toSec(t) { const n = Number(t) || 0; return n > 1e12 ? Math.floor(n / 1000) : n }
   const avgPriceBars = (ctx.kline_and_indicators?.avg_price_bars || []).map(b => ({ ...b, time: toSec(b.time) }))
+  const oldestBarTime = avgPriceBars.length ? avgPriceBars[avgPriceBars.length - 1].time : Infinity // newest first→最后一根最老
+  const currentAvgPrice = ctx.kline_and_indicators?.current_avg_price || 0 // 当前成本线(USD单价)
   const vList = ctx.logearn?.v_breakout_volume_list || []
   const currentPriceUsd = ctx.kline_and_indicators?.current_price || 0
   const mcapPerUsdPrice = currentPriceUsd > 0 ? (mcap / currentPriceUsd) : 0
 
+  // 返回 { value, approx }：命中范围内→精确取该时刻 avg；超出K线最早覆盖范围→用当前成本线近似
   function findAvgPriceAtTime(t) {
-    for (let i = 0; i < avgPriceBars.length; i++) { if (avgPriceBars[i].time <= t) return avgPriceBars[i].value }
-    return avgPriceBars.length ? avgPriceBars[avgPriceBars.length - 1].value : null
+    for (let i = 0; i < avgPriceBars.length; i++) {
+      if (avgPriceBars[i].time <= t) return { value: avgPriceBars[i].value, approx: false }
+    }
+    // 找不到 time<=t 的 bar：说明 t 早于本地K线覆盖范围（旧的fallback会取到最老一根导致低估）
+    if (t < oldestBarTime && currentAvgPrice > 0) return { value: currentAvgPrice, approx: true }
+    return { value: null, approx: false }
   }
   function vFinished(v) { return (v?.fibon_break4 > 0) || (v?.fibon_break4_time != null && v.fibon_break4_time !== 0) }
 
@@ -112,13 +125,14 @@ try {
   let retraceBreakOk = false
   let retraceInfo = 'none'
   if (hasEffectiveV && recentV.low_price_mcap && recentV.low_price_time && mcapPerUsdPrice > 0) {
-    const avgAtLow = findAvgPriceAtTime(toSec(recentV.low_price_time))
+    const r = findAvgPriceAtTime(toSec(recentV.low_price_time))
+    const avgAtLow = r.value
     if (avgAtLow != null && avgAtLow > 0) {
       const avgMcapAtLow = avgAtLow * mcapPerUsdPrice
       const threshold = avgMcapAtLow * (1 + RETRACE_TOLERANCE)
       const gapPct = ((recentV.low_price_mcap - avgMcapAtLow) / avgMcapAtLow * 100)
       retraceBreakOk = recentV.low_price_mcap < threshold
-      retraceInfo = `low=${recentV.low_price_mcap.toFixed(0)}/avg=${avgMcapAtLow.toFixed(0)}(${gapPct.toFixed(1)}%)`
+      retraceInfo = `low=${recentV.low_price_mcap.toFixed(0)}/avg=${avgMcapAtLow.toFixed(0)}(${gapPct.toFixed(1)}%)${r.approx ? '(近似:当前成本线)' : ''}`
     } else {
       retraceInfo = 'avgAtLow无效'
     }

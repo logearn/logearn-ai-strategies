@@ -1,10 +1,8 @@
-// 1.5段策略 v23
-// 【依赖 kline_and_indicators 与 chip_analysis，单币深度分析场景，非实时流批量场景】
+// 1.5段策略 v26
+// 【依赖 kline_and_indicators 与 chip_analысis，单币深度分析场景，非实时流批量场景】
 //
-// 本版改动（相对 v22）：
-// 新增"V转信号持续时间 > 2分钟"才有效。
-// 口径：持续时间 = 回撤时长 = low_price_time - top_price_time（从见顶到触底的秒数），要求 > 120 秒。
-// （对应 content 里"回调时长"那段；太短的回撤视为噪声，不算有效V转形态）
+// 本版改动（相对 v25）：
+// 新增"买入市值 < $120k"上限（mcap < 120000）——低市值入场赔率更好，砍掉高市值平庸单。
 
 try {
   const nowSec = Math.floor(Date.now() / 1000)
@@ -12,6 +10,7 @@ try {
   const HOLD_LIMIT = 10
   const TRANSFER_LIMIT = 10
   const MIN_V_DURATION = 120 // V转回撤持续时间下限（秒）= 2分钟
+  const MCAP_LIMIT = 120000  // 买入市值上限（USD）
 
   const hasChip = !!ctx.chip_analysis
   const hasKline = !!ctx.kline_and_indicators && Array.isArray(ctx.kline_and_indicators.avg_price_bars)
@@ -34,6 +33,9 @@ try {
   const ageSec = swapBeginTime > 0 ? (nowSec - swapBeginTime) : Infinity
   const ageHour = ageSec / 3600
   const withinWindow = swapBeginTime > 0 && ageSec <= 15 * 3600
+
+  const mcap = ctx.logearn?.mcap || 0
+  const mcapOk = mcap > 0 && mcap < MCAP_LIMIT
 
   const innerSellRatio = ctx.chip_analysis?.inner_sell_ratio || 0
   const innerSellOk = innerSellRatio >= 60
@@ -63,7 +65,6 @@ try {
   function toSec(t) { const n = Number(t) || 0; return n > 1e12 ? Math.floor(n / 1000) : n }
   const avgPriceBars = (ctx.kline_and_indicators?.avg_price_bars || []).map(b => ({ ...b, time: toSec(b.time) }))
   const vList = ctx.logearn?.v_breakout_volume_list || []
-  const mcap = ctx.logearn?.mcap || 0
   const currentPriceUsd = ctx.kline_and_indicators?.current_price || 0
   const mcapPerUsdPrice = currentPriceUsd > 0 ? (mcap / currentPriceUsd) : 0
 
@@ -92,6 +93,22 @@ try {
     vDurationOk = vDurationSec > MIN_V_DURATION
   }
 
+  // ===== 当前 V转反弹阶段（反弹20%/40%/60%/新高 = fibon_break1/2/3/4）=====
+  let vStageLabel = 'none'
+  let vStageDetail = 'none'
+  if (hasEffectiveV) {
+    const reached = (val, t) => (Number(val) > 0) || (t != null && Number(t) > 0)
+    const stages = [
+      ['反弹20%', reached(recentV.fibon_break1, recentV.fibon_break1_time), recentV.fibon_break1_time],
+      ['反弹40%', reached(recentV.fibon_break2, recentV.fibon_break2_time), recentV.fibon_break2_time],
+      ['反弹60%', reached(recentV.fibon_break3, recentV.fibon_break3_time), recentV.fibon_break3_time],
+      ['反弹新高', reached(recentV.fibon_break4, recentV.fibon_break4_time), recentV.fibon_break4_time],
+    ]
+    for (const [name, ok] of stages) { if (ok) vStageLabel = name }
+    if (vStageLabel === 'none') vStageLabel = '未反弹(仅回撤确认)'
+    vStageDetail = stages.map(([name, ok, t]) => `${name}:${ok ? '✓' : '✗'}${ok && t ? '@' + toSec(t) : ''}`).join(' ')
+  }
+
   let retraceBreakOk = false
   let retraceInfo = 'none'
   if (hasEffectiveV && recentV.low_price_mcap && recentV.low_price_time && mcapPerUsdPrice > 0) {
@@ -112,6 +129,7 @@ try {
     ['毕业', graduated, launchTime, '>0'],
     ['平台', isTargetPlatform, platformLabel, 'Pump/four'],
     ['时长h', withinWindow, ageHour === Infinity ? 'NA' : ageHour.toFixed(1), '<=15'],
+    ['市值', mcapOk, mcap.toFixed(0), '<120k'],
     ['内盘卖出', innerSellOk, innerSellRatio, '>=60'],
     ['成本线上', deviationOk, avgPriceDeviationPct, '>0'],
     ['垃圾盘', shitOk, shitVolume, '<7'],
@@ -125,10 +143,16 @@ try {
   const passed = checks.every(c => c[1])
   if (!passed) {
     const fails = checks.filter(c => !c[1]).map(([n, , a, e]) => `${n}=${a}[${e}]`).join(' | ')
-    ctx.log.error('未命中 ' + fails)
+    ctx.log.error(`未命中 ${fails}${hasEffectiveV ? ' | V转阶段=' + vStageLabel : ''}`)
     return false
   }
-  ctx.log.success(`命中<1.5段> V转${retraceInfo} 持续${(vDurationSec / 60).toFixed(1)}min 持仓${maxHold.toFixed(1)} 卖出${innerSellRatio} 偏离${avgPriceDeviationPct}`)
+
+  // ===== 下单时刻留痕（用于和实际成交价格对比）=====
+  const orderTimeSec = nowSec
+  const orderTimeStr = new Date(nowSec * 1000).toISOString()
+  const orderMcap = mcap
+  const orderPriceUsd = currentPriceUsd
+  ctx.log.success(`命中<1.5段> [下单快照] 时间=${orderTimeStr}(${orderTimeSec}) 市值=$${orderMcap.toFixed(0)} 价格=$${orderPriceUsd} | V转阶段=${vStageLabel} [${vStageDetail}] | ${retraceInfo} 持续${(vDurationSec / 60).toFixed(1)}min 持仓${maxHold.toFixed(1)} 卖出${innerSellRatio} 偏离${avgPriceDeviationPct}`)
   return true
 } catch (e) {
   ctx.log.error('策略异常: ' + (e && e.message ? e.message : String(e)))

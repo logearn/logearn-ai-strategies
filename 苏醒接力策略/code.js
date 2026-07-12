@@ -1,6 +1,9 @@
-// 苏醒接力策略：Pump / four.meme 发射 + 30分钟内苏醒信号价格逐个抬高 + 最新苏醒在成本线上
+// 苏醒接力策略 v1.0
+// Pump / four.meme 发射 + 30分钟内苏醒信号价格逐个抬高 + 最新苏醒在成本线上
 // + 排除关注地址后 单地址持仓<=10% 转账持仓<=10% + 生命周期<=1个月需至少2次早期精选信号
 // + 已毕业到外盘（过滤内盘）+ 毕业满1小时（过滤刚毕业1h内）
+const STRATEGY_VERSION = 'v1.0'
+
 const ALLOW_PLATFORMS = [
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump（SOL）
   'four.meme',                                    // four.meme（BSC）
@@ -73,7 +76,7 @@ const checks = [
   ['精选信号(<=1月需>=2)', featuredPass, `年龄${ageDays === Infinity ? 'NA' : ageDays.toFixed(1)}天/精选${featuredCount}次`, youngNeedFeatured ? '>=2' : '不限(>1月)'],
 ]
 
-const detail = `[${symbol}] ` + checks.map(([n, ok, a]) => `${n}(${ok ? 'Y' : 'N'}):${a}`).join(' | ')
+const detail = `[${STRATEGY_VERSION}][${symbol}] ` + checks.map(([n, ok, a]) => `${n}(${ok ? 'Y' : 'N'}):${a}`).join(' | ')
 if (!checks.every(c => c[1])) { ctx.log.error('未命中 ' + detail); return false }
 ctx.log.success('命中 ' + detail)
 return true

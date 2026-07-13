@@ -1,14 +1,10 @@
-// 1.5段策略 v27
+// 1.5段策略 v28
 // 【依赖 kline_and_indicators 与 chip_analysis，单币深度分析场景，非实时流批量场景】
 //
-// 本版改动（相对 v26）：修复 avg 成本线取错的 bug。
-// 问题：findAvgPriceAtTime 在 low_price_time 早于本地 avg_price_bars 覆盖范围时，
-//        会 fallback 到"最老那根 bar"（累计成本刚起步、值最低），导致 avg 被严重低估
-//        （例：low=28851/avg被算成19158，实际应≈25k）。
-// 修法B（宽松）：一旦查找超出 K 线覆盖范围（找不到 time<=t 的 bar），
-//        改用当前成本线 ctx.kline_and_indicators.current_avg_price 换算的市值做近似，
-//        而不是拿最老那根；并在 retraceInfo 标注 (近似:当前成本线)。
-//        avg_price_bars 为 newest first，最后一根是最老一根——只有当 t 比最老一根还早才算超范围。
+// 本版改动（相对 v27）：
+// 恢复并新增"新钱包持仓（扣除我关注地址持仓占比后）< 70"限制。
+// 关注地址持仓占比 = sum(walletPositionMap[*].token_balance)/total_supply*100（占总发行量%），
+// 用 new_volume 减去它再判 < 70。
 
 try {
   const nowSec = Math.floor(Date.now() / 1000)
@@ -17,6 +13,7 @@ try {
   const TRANSFER_LIMIT = 10
   const MIN_V_DURATION = 120 // V转回撤持续时间下限（秒）= 2分钟
   const MCAP_LIMIT = 120000  // 买入市值上限（USD）
+  const NEW_LIMIT = 70       // 新钱包持仓上限（%，已扣关注地址）
 
   const hasChip = !!ctx.chip_analysis
   const hasKline = !!ctx.kline_and_indicators && Array.isArray(ctx.kline_and_indicators.avg_price_bars)
@@ -52,10 +49,22 @@ try {
   const shitVolume = ctx.logearn?.shit_volume ?? 999
   const shitOk = shitVolume < 7
 
+  // 关注地址集合 + 关注地址持仓占比
   const followedSet = new Set()
   const wpm = ctx.logearn?.followed_signal_state?.walletPositionMap || {}
-  for (const k of Object.keys(wpm)) { if (k) followedSet.add(k.toLowerCase()) }
+  let followedBalanceSum = 0
+  for (const k of Object.keys(wpm)) {
+    if (k) followedSet.add(k.toLowerCase())
+    followedBalanceSum += wpm[k]?.token_balance || 0
+  }
   for (const f of (ctx.logearn?.followed_list || [])) { if (f?.wallet) followedSet.add(f.wallet.toLowerCase()) }
+  const totalSupply = ctx.logearn?.total_supply || 0
+  const followedHoldPercent = totalSupply > 0 ? (followedBalanceSum / totalSupply * 100) : 0
+
+  // 新钱包持仓（扣关注）
+  const newVolumeRaw = ctx.logearn?.new_volume ?? 999
+  const newVolumeAdj = newVolumeRaw - followedHoldPercent
+  const newOk = newVolumeAdj < NEW_LIMIT
 
   const top5 = ctx.chip_analysis?.top5_holders || []
   let maxHold = 0, maxTransferIn = 0
@@ -70,18 +79,16 @@ try {
 
   function toSec(t) { const n = Number(t) || 0; return n > 1e12 ? Math.floor(n / 1000) : n }
   const avgPriceBars = (ctx.kline_and_indicators?.avg_price_bars || []).map(b => ({ ...b, time: toSec(b.time) }))
-  const oldestBarTime = avgPriceBars.length ? avgPriceBars[avgPriceBars.length - 1].time : Infinity // newest first→最后一根最老
-  const currentAvgPrice = ctx.kline_and_indicators?.current_avg_price || 0 // 当前成本线(USD单价)
+  const oldestBarTime = avgPriceBars.length ? avgPriceBars[avgPriceBars.length - 1].time : Infinity
+  const currentAvgPrice = ctx.kline_and_indicators?.current_avg_price || 0
   const vList = ctx.logearn?.v_breakout_volume_list || []
   const currentPriceUsd = ctx.kline_and_indicators?.current_price || 0
   const mcapPerUsdPrice = currentPriceUsd > 0 ? (mcap / currentPriceUsd) : 0
 
-  // 返回 { value, approx }：命中范围内→精确取该时刻 avg；超出K线最早覆盖范围→用当前成本线近似
   function findAvgPriceAtTime(t) {
     for (let i = 0; i < avgPriceBars.length; i++) {
       if (avgPriceBars[i].time <= t) return { value: avgPriceBars[i].value, approx: false }
     }
-    // 找不到 time<=t 的 bar：说明 t 早于本地K线覆盖范围（旧的fallback会取到最老一根导致低估）
     if (t < oldestBarTime && currentAvgPrice > 0) return { value: currentAvgPrice, approx: true }
     return { value: null, approx: false }
   }
@@ -96,7 +103,6 @@ try {
   const hasEffectiveV = !!recentV
   const vFresh = hasEffectiveV && (nowSec - (recentV.signalTime || 0)) <= 60 * 60
 
-  // V转持续时间（回撤时长）= 触底时间 - 见顶时间，需 > 2分钟
   let vDurationSec = 0
   let vDurationOk = false
   if (hasEffectiveV) {
@@ -106,7 +112,6 @@ try {
     vDurationOk = vDurationSec > MIN_V_DURATION
   }
 
-  // ===== 当前 V转反弹阶段（反弹20%/40%/60%/新高 = fibon_break1/2/3/4）=====
   let vStageLabel = 'none'
   let vStageDetail = 'none'
   if (hasEffectiveV) {
@@ -147,6 +152,7 @@ try {
     ['内盘卖出', innerSellOk, innerSellRatio, '>=60'],
     ['成本线上', deviationOk, avgPriceDeviationPct, '>0'],
     ['垃圾盘', shitOk, shitVolume, '<7'],
+    ['新钱包', newOk, `${newVolumeAdj.toFixed(1)}(原${newVolumeRaw}-关注${followedHoldPercent.toFixed(1)})`, '<70'],
     ['单地址持仓', holdOk, maxHold.toFixed(1), '<10'],
     ['单地址转账', transferOk, maxTransferIn.toFixed(1), '<10'],
     ['有效V转', hasEffectiveV, hasEffectiveV ? 'y' : 'n', 'confirmed&未收尾'],

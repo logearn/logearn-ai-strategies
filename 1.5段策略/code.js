@@ -1,7 +1,10 @@
-// 1.5段策略 v28
+// 1.5段策略 v29
 // 【依赖 kline_and_indicators 与 chip_analysis，单币深度分析场景，非实时流批量场景】
 //
-// 本版改动（相对 v27）：
+// 本版改动（相对 v28）：
+// 新增"筹码限制"：chip_analysis.below_percent（当前价下方筹码占比）> above_percent（上方筹码占比）。
+//
+// v28改动（相对 v27）：
 // 恢复并新增"新钱包持仓（扣除我关注地址持仓占比后）< 70"限制。
 // 关注地址持仓占比 = sum(walletPositionMap[*].token_balance)/total_supply*100（占总发行量%），
 // 用 new_volume 减去它再判 < 70。
@@ -42,6 +45,11 @@ try {
 
   const innerSellRatio = ctx.chip_analysis?.inner_sell_ratio || 0
   const innerSellOk = innerSellRatio >= 60
+
+  const CHIP_BUFFER = 2 // 筹码下大于上的容忍buff（%）
+  const abovePercent = ctx.chip_analysis?.above_percent || 0
+  const belowPercent = ctx.chip_analysis?.below_percent || 0
+  const chipBelowAboveOk = belowPercent + CHIP_BUFFER > abovePercent
 
   const avgPriceDeviationPct = ctx.kline_and_indicators?.avg_price_deviation_pct ?? -999
   const deviationOk = avgPriceDeviationPct > 0
@@ -101,7 +109,6 @@ try {
     if (!recentV || (v.signalTime || 0) > (recentV.signalTime || 0)) recentV = v
   }
   const hasEffectiveV = !!recentV
-  const vFresh = hasEffectiveV && (nowSec - (recentV.signalTime || 0)) <= 60 * 60
 
   let vDurationSec = 0
   let vDurationOk = false
@@ -150,6 +157,7 @@ try {
     ['时长h', withinWindow, ageHour === Infinity ? 'NA' : ageHour.toFixed(1), '<=15'],
     ['市值', mcapOk, mcap.toFixed(0), '<120k'],
     ['内盘卖出', innerSellOk, innerSellRatio, '>=60'],
+    ['筹码下大于上', chipBelowAboveOk, `below=${belowPercent.toFixed(1)}/above=${abovePercent.toFixed(1)}`, '下>上'],
     ['成本线上', deviationOk, avgPriceDeviationPct, '>0'],
     ['垃圾盘', shitOk, shitVolume, '<7'],
     ['新钱包', newOk, `${newVolumeAdj.toFixed(1)}(原${newVolumeRaw}-关注${followedHoldPercent.toFixed(1)})`, '<70'],
@@ -157,7 +165,6 @@ try {
     ['单地址转账', transferOk, maxTransferIn.toFixed(1), '<10'],
     ['有效V转', hasEffectiveV, hasEffectiveV ? 'y' : 'n', 'confirmed&未收尾'],
     ['V转持续min', vDurationOk, hasEffectiveV ? (vDurationSec / 60).toFixed(1) : 'NA', '>2'],
-    ['V转新鲜min', vFresh, hasEffectiveV ? ((nowSec - (recentV.signalTime || 0)) / 60).toFixed(0) : 'NA', '<=60'],
     ['V转路径', retraceBreakOk, retraceInfo, '低点<成本*1.1'],
   ]
   const passed = checks.every(c => c[1])

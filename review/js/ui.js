@@ -673,6 +673,83 @@ function clearFilter() {
   ta.style.display = 'none';
 }
 
+// ========== 过滤条件保存为"预设方案"（design doc §15.1） ==========
+// 常用的过滤条件组合（比如"低风险信号：bundler占比<10% AND top10持仓<30%"）存起来，随时一键应用，
+// 不用每次都重新拼几行条件。存储格式和 customFields/datasetIndex 一样走 localStorage。
+const FILTER_PRESETS_STORAGE_KEY = 'chart_filter_presets';
+let filterPresets = [];
+
+function loadFilterPresets() {
+  try {
+    const raw = localStorage.getItem(FILTER_PRESETS_STORAGE_KEY);
+    filterPresets = raw ? JSON.parse(raw) || [] : [];
+  } catch (e) { filterPresets = []; }
+}
+function saveFilterPresetsToStorage() {
+  try { localStorage.setItem(FILTER_PRESETS_STORAGE_KEY, JSON.stringify(filterPresets)); } catch (e) {}
+}
+function renderFilterPresetOptions() {
+  const sel = document.getElementById('filterPresetSelect');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">-- 选择预设 --</option>' + filterPresets.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}（${p.conditions.length}条件）</option>`).join('');
+  if (filterPresets.some(p => p.id === current)) sel.value = current;
+}
+
+function saveFilterPreset() {
+  const name = document.getElementById('filterPresetInput').value.trim();
+  if (!name) { alert('请填写预设方案名'); return; }
+  const conditions = [];
+  document.querySelectorAll('#filterRows .filter-row').forEach(row => {
+    const field = row.querySelector('.filter-field').value.trim();
+    const op = row.querySelector('.filter-op').value;
+    const threshold = row.querySelector('.filter-threshold').value.trim();
+    if (field && threshold !== '') conditions.push({ field, op, threshold });
+  });
+  if (!conditions.length) { alert('当前没有有效的过滤条件（字段+阈值都填写才算有效），无法保存'); return; }
+  filterPresets = filterPresets.filter(p => p.name !== name); // 同名覆盖
+  filterPresets.push({ id: Date.now() + '_' + Math.random().toString(36).slice(2, 8), name, conditions });
+  saveFilterPresetsToStorage();
+  document.getElementById('filterPresetInput').value = '';
+  renderFilterPresetOptions();
+  alert(`已保存预设「${name}」（${conditions.length} 个条件）`);
+}
+
+function applyFilterPreset() {
+  const id = document.getElementById('filterPresetSelect').value;
+  if (!id) { alert('请先从下拉框选择一个预设'); return; }
+  const preset = filterPresets.find(p => p.id === id);
+  if (!preset) return;
+  if (!matchedRows.length) { alert('请先点击"分析"加载数据'); return; }
+
+  // 预设里的字段名如果在当前数据集里不存在（比如换了一批字段结构不同的数据），跳过无效字段行并提示，
+  // 而不是应用一半报错中断（design doc §15.1 边界情况）
+  const validConditions = [];
+  const invalidFields = [];
+  for (const c of preset.conditions) {
+    if (isFilterableField(c.field)) validConditions.push(c);
+    else invalidFields.push(c.field);
+  }
+  if (invalidFields.length) {
+    alert(`以下字段在当前数据集里不存在，已跳过：\n${invalidFields.join('\n')}`);
+  }
+  if (!validConditions.length) { alert('该预设里的字段在当前数据集里全部不存在，无法应用'); return; }
+
+  document.querySelectorAll('#filterRows .filter-row').forEach(r => { if (r._acDestroy) r._acDestroy(); });
+  document.getElementById('filterRows').innerHTML = '';
+  for (const c of validConditions) addFilterRow(c.field, c.op, c.threshold);
+  applyFilter();
+}
+
+function deleteFilterPreset() {
+  const id = document.getElementById('filterPresetSelect').value;
+  if (!id) { alert('请先从下拉框选择一个预设'); return; }
+  const preset = filterPresets.find(p => p.id === id);
+  if (!preset || !confirm(`确定删除预设「${preset.name}」？`)) return;
+  filterPresets = filterPresets.filter(p => p.id !== id);
+  saveFilterPresetsToStorage();
+  renderFilterPresetOptions();
+}
+
 // X 指标多选（标签式）：输入联想，选中/回车添加为标签，点 × 或退格删除；
 // 每个选中的指标对应一张独立散点图，自上而下平铺
 let batchXSelected = [];
@@ -1035,6 +1112,11 @@ document.getElementById('addFilterRow').addEventListener('click', () => addFilte
 document.getElementById('applyFilter').addEventListener('click', applyFilter);
 document.getElementById('copyFilterCAs').addEventListener('click', copyFilterCAs);
 document.getElementById('clearFilter').addEventListener('click', clearFilter);
+document.getElementById('saveFilterPresetBtn').addEventListener('click', saveFilterPreset);
+document.getElementById('applyFilterPresetBtn').addEventListener('click', applyFilterPreset);
+document.getElementById('deleteFilterPresetBtn').addEventListener('click', deleteFilterPreset);
+loadFilterPresets();
+renderFilterPresetOptions();
 addFilterRow();
 document.getElementById('fieldQualityOnlyIssues').addEventListener('change', renderFieldQuality);
 

@@ -468,6 +468,23 @@
           <button id="copyFilterCAs" class="secondary">复制 CA</button>
           <button id="clearFilter" class="secondary">清除</button>
         </div>
+        <div class="row" style="margin-top: 8px; gap: 8px; align-items: center;">
+          <div class="control" style="flex: 0; min-width: 160px;">
+            <label for="filterPresetInput">预设方案名</label>
+            <input type="text" id="filterPresetInput" placeholder="如 低风险信号">
+          </div>
+          <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
+            <button type="button" id="saveFilterPresetBtn" class="secondary">保存为预设</button>
+          </div>
+          <div class="control" style="flex: 0; min-width: 180px;">
+            <label for="filterPresetSelect">应用已保存的预设</label>
+            <select id="filterPresetSelect"><option value="">-- 选择预设 --</option></select>
+          </div>
+          <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
+            <button type="button" id="applyFilterPresetBtn" class="secondary">应用</button>
+            <button type="button" id="deleteFilterPresetBtn" class="secondary" title="删除下拉框里选中的预设">删除</button>
+          </div>
+        </div>
         <div id="filterStats" class="stats" style="margin-top: 10px;"></div>
         <div class="table-scroll" style="margin-top: 10px; max-height: 300px;">
           <table class="desc-table">

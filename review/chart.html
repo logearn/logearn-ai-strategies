@@ -247,6 +247,14 @@
     textarea:hover { background: var(--surface-3); }
     textarea:focus { outline: none; background: var(--surface-2); border-color: var(--accent); box-shadow: 0 0 0 4px rgba(10,132,255,.25); }
     #binBarChart { border-radius: var(--radius-sm); overflow: hidden; }
+    /* 图表容器在生成前是空的固定高度 div，视觉上和普通空白区域没有区别，容易让页面看起来像"坏了"或者有大段死区；
+       :empty 只在真的没有子节点时命中，Plotly.newPlot 渲染后会插入 svg 等子节点，占位提示会自动消失，不需要额外 JS 控制 */
+    div[id$="Chart"]:empty {
+      display: flex; align-items: center; justify-content: center;
+      border: 1px dashed var(--border); border-radius: var(--radius-sm);
+      color: var(--text-muted); font-size: 13px; min-height: 120px;
+    }
+    div[id$="Chart"]:empty::before { content: '点击上方按钮生成图表后在此显示'; }
     .tag-input:focus-within { border-color: var(--accent); box-shadow: 0 0 0 4px rgba(10,132,255,.25); }
     .tag-input input, .tag-input input:focus, .tag-input input:hover {
       flex: 1; min-width: 200px; background: transparent; border: none; box-shadow: none;
@@ -398,7 +406,7 @@
           <label for="snapshotLabelInput">备注名</label>
           <input type="text" id="snapshotLabelInput" placeholder="如 7月第一批数据">
         </div>
-        <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
+        <div class="control" style="flex: 0 0 auto; min-width: auto; display:flex; align-items:flex-end;">
           <button type="button" id="saveSnapshotBtn">保存当前快照</button>
         </div>
       </div>
@@ -429,7 +437,7 @@
           <label for="datasetLabelInput">数据集名称</label>
           <input type="text" id="datasetLabelInput" placeholder="如 昨天的数据">
         </div>
-        <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
+        <div class="control" style="flex: 0 0 auto; min-width: auto; display:flex; align-items:flex-end;">
           <button type="button" id="saveDatasetBtn">保存当前完整数据集</button>
         </div>
       </div>
@@ -459,13 +467,13 @@
             <label for="snapsFile">snapshots JSON（如 snapshots_*.json）</label>
             <input type="file" id="snapsFile" accept=".json">
           </div>
-          <div class="control" style="flex: 0; min-width: auto;">
+          <div class="control" style="flex: 0 0 auto; min-width: auto;">
             <button id="analyzeBtn">分析</button>
           </div>
-          <div class="control hidden" id="appendWrap" style="flex: 0; min-width: auto;">
+          <div class="control hidden" id="appendWrap" style="flex: 0 0 auto; min-width: auto;">
             <button id="appendDataBtn" class="secondary" title="把上面选中的新文件合并进当前工作集，而不是整体替换">追加数据</button>
           </div>
-          <div class="control hidden" id="downloadWrap" style="flex: 0; min-width: auto; display:flex; align-items:flex-end; gap: 10px;">
+          <div class="control hidden" id="downloadWrap" style="flex: 0 0 auto; min-width: auto; display:flex; align-items:flex-end; gap: 10px;">
             <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; white-space:nowrap;">
               <input type="radio" name="downloadCsvScope" id="downloadCsvScopeFiltered" value="filtered" checked> 导出过滤后数据
             </label>
@@ -504,14 +512,14 @@
             <label for="filterPresetInput">预设方案名</label>
             <input type="text" id="filterPresetInput" placeholder="如 低风险信号">
           </div>
-          <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
+          <div class="control" style="flex: 0 0 auto; min-width: auto; display:flex; align-items:flex-end;">
             <button type="button" id="saveFilterPresetBtn" class="secondary">保存为预设</button>
           </div>
           <div class="control" style="flex: 0; min-width: 180px;">
             <label for="filterPresetSelect">应用已保存的预设</label>
             <select id="filterPresetSelect"><option value="">-- 选择预设 --</option></select>
           </div>
-          <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
+          <div class="control" style="flex: 0 0 auto; min-width: auto; display:flex; align-items:flex-end;">
             <button type="button" id="applyFilterPresetBtn" class="secondary">应用</button>
             <button type="button" id="deleteFilterPresetBtn" class="secondary" title="删除下拉框里选中的预设">删除</button>
           </div>
@@ -553,8 +561,8 @@
             <option value="returnMax" selected>returnMax</option>
           </select>
         </div>
-        <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
-          <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;">
+        <div class="control checkbox-control" style="flex: 0 0 auto; min-width: auto;">
+          <label>
             <input type="checkbox" id="distLogX" checked> 对数 X 轴
           </label>
         </div>
@@ -629,7 +637,7 @@
     </div>
     <div class="panel-body" id="corrBody_">
       <div class="row" style="margin-bottom: 10px;">
-        <div class="control" style="flex: 0; min-width: auto;">
+        <div class="control" style="flex: 0 0 auto; min-width: auto;">
           <label for="corrTarget">目标</label>
           <select id="corrTarget">
             <option value="all">全部</option>
@@ -637,7 +645,7 @@
             <option value="returnMax" selected>returnMax</option>
           </select>
         </div>
-        <div class="control" style="flex: 0; min-width: auto;">
+        <div class="control" style="flex: 0 0 auto; min-width: auto;">
           <label for="corrSource">来源</label>
           <select id="corrSource">
             <option value="all">全部</option>
@@ -645,7 +653,7 @@
             <option value="assembled">组装字段</option>
           </select>
         </div>
-        <div class="control" style="flex: 0; min-width: auto;">
+        <div class="control" style="flex: 0 0 auto; min-width: auto;">
           <label for="topN">Top</label>
           <select id="topN">
             <option value="20" selected>20</option>
@@ -654,14 +662,14 @@
             <option value="99999">全部</option>
           </select>
         </div>
-        <div class="control" style="flex: 0; min-width: auto;">
+        <div class="control" style="flex: 0 0 auto; min-width: auto;">
           <label for="corrSortBy">排序</label>
           <select id="corrSortBy">
             <option value="r" selected>|r| 降序</option>
             <option value="delta">|Δ|（线性/单调差异）降序</option>
           </select>
         </div>
-        <div class="control" style="flex: 0; min-width: auto;">
+        <div class="control" style="flex: 0 0 auto; min-width: auto;">
           <label for="corrCorrection">多重比较校正</label>
           <select id="corrCorrection">
             <option value="bh" selected>Benjamini-Hochberg FDR（推荐，较宽松）</option>
@@ -671,8 +679,8 @@
         </div>
       </div>
       <div class="row" style="margin-bottom: 10px; align-items: flex-end;">
-        <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:center;">
-          <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; margin:0;">
+        <div class="control checkbox-control" style="flex: 0 0 auto; min-width: auto;">
+          <label>
             <input type="checkbox" id="oosEnabled"> 启用样本外验证
           </label>
         </div>
@@ -694,10 +702,10 @@
           <label for="bootstrapResamples">Bootstrap 重抽样次数</label>
           <input type="number" id="bootstrapResamples" value="500" min="100" max="2000" step="100">
         </div>
-        <div class="control" style="flex: 0; min-width: auto;">
+        <div class="control" style="flex: 0 0 auto; min-width: auto;">
           <button type="button" id="computeBootstrapCIBtn">计算置信区间（当前表内字段）</button>
         </div>
-        <div class="control" style="flex: 0; min-width: auto;">
+        <div class="control" style="flex: 0 0 auto; min-width: auto;">
           <button type="button" id="cancelBootstrapCIBtn" class="hidden">取消计算</button>
         </div>
       </div>
@@ -801,10 +809,10 @@
         <input type="text" id="colorField" class="field-search" placeholder="留空=无颜色，或搜索字段..." autocomplete="off">
         <datalist id="colorFieldList"></datalist>
       </div>
-      <div class="control" style="flex: 0; min-width: auto;">
+      <div class="control" style="flex: 0 0 auto; min-width: auto;">
         <button id="plotBtn">绘图</button>
       </div>
-      <div class="control" style="flex: 0; min-width: auto;">
+      <div class="control" style="flex: 0 0 auto; min-width: auto;">
         <button type="button" id="globalSwapBtn" class="secondary active" title="开启时：X轴=returnMax，Y轴=上面选择的指标；关闭时恢复默认">⇄ 坐标对换</button>
       </div>
       <div class="stats" id="plotStats"></div>
@@ -854,7 +862,7 @@
           <option value="ci95">95% 置信区间</option>
         </select>
       </div>
-      <div class="control" style="flex: 0; min-width: auto;">
+      <div class="control" style="flex: 0 0 auto; min-width: auto;">
         <button id="genBinBarBtn">生成分箱柱状图</button>
       </div>
     </div>
@@ -866,7 +874,7 @@
           <option value="returnMax">returnMax</option>
         </select>
       </div>
-      <div class="control" style="flex: 0; min-width: auto;">
+      <div class="control" style="flex: 0 0 auto; min-width: auto;">
         <button type="button" id="binRecommendBtn" class="secondary">自动推荐断点</button>
       </div>
       <div class="control" style="flex: 1;">
@@ -916,15 +924,15 @@
               <label for="corrMatrixThreshold">共线阈值 |r|≥</label>
               <input type="number" id="corrMatrixThreshold" value="0.8" min="0" max="1" step="0.05">
             </div>
-            <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
-              <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;">
+            <div class="control checkbox-control" style="flex: 0 0 auto; min-width: auto;">
+              <label>
                 <input type="checkbox" id="corrMatrixHighlight" checked> 只高亮共线对
               </label>
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="importTop10CorrBtn">导入相关性表 Top10</button>
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="genCorrMatrixBtn">生成矩阵</button>
             </div>
           </div>
@@ -964,7 +972,7 @@
               <label for="groupMinSample">最小样本量</label>
               <input type="number" id="groupMinSample" value="10" min="5">
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="genGroupCompareBtn">生成分组对比</button>
             </div>
           </div>
@@ -996,13 +1004,13 @@
                 <input type="text" id="importanceInput" placeholder="输入字段名联想，选中自动添加..." autocomplete="off">
               </div>
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="genImportanceBtn">运行回归</button>
             </div>
           </div>
           <div class="row" style="margin-top: 4px; align-items: flex-end;">
-            <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:center;">
-              <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; margin:0;">
+            <div class="control checkbox-control" style="flex: 0 0 auto; min-width: auto;">
+              <label>
                 <input type="checkbox" id="regOosEnabled"> 启用样本外验证
               </label>
             </div>
@@ -1048,18 +1056,18 @@
             </div>
           </div>
           <div class="row" style="margin-top: 4px; align-items: flex-end;">
-            <div class="control" style="flex: 0; min-width: auto; display:flex; gap:14px;">
-              <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; margin:0;">
+            <div class="control checkbox-control" style="flex: 0 0 auto; min-width: auto; display:flex; flex-direction:row; gap:8px;">
+              <label>
                 <input type="checkbox" id="interactionOpRatio" checked> 比值 A/B
               </label>
-              <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; margin:0;">
+              <label>
                 <input type="checkbox" id="interactionOpDiff" checked> 差值 A-B
               </label>
-              <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; margin:0;">
+              <label>
                 <input type="checkbox" id="interactionOpProduct" checked> 乘积 A×B
               </label>
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="genInteractionBtn">生成并评估</button>
             </div>
           </div>
@@ -1093,10 +1101,10 @@
               <label for="timeBucketCount">分桶数</label>
               <input type="number" id="timeBucketCount" value="8" min="2" max="30">
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="genTimeAnalysisBtn">生成时间分析</button>
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="downloadTimeAnalysisCsvBtn">下载 CSV</button>
             </div>
           </div>
@@ -1130,10 +1138,10 @@
               <label for="rollingStepDays">步长（天）</label>
               <input type="number" id="rollingStepDays" value="1" min="0.05" step="0.5">
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="genRollingCorrBtn">生成滚动相关性</button>
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="downloadRollingCorrCsvBtn">下载 CSV</button>
             </div>
           </div>
@@ -1157,12 +1165,12 @@
               <label for="catValueField">目标数值字段</label>
               <input type="text" id="catValueField" class="field-search" placeholder="如 returnMax" autocomplete="off">
             </div>
-            <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
-              <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;">
+            <div class="control checkbox-control" style="flex: 0 0 auto; min-width: auto;">
+              <label>
                 <input type="checkbox" id="catSigTest" checked> 启用显著性检验
               </label>
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="genCatAnalysisBtn">生成分类分析</button>
             </div>
           </div>
@@ -1203,7 +1211,7 @@
                 <option value="lower">字段越小越可能盈利</option>
               </select>
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="genRocBtn">生成 ROC 曲线</button>
             </div>
           </div>
@@ -1218,10 +1226,10 @@
                 <input type="text" id="rocBatchInput" placeholder="输入字段名联想，选中自动添加..." autocomplete="off">
               </div>
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="importRocTop10Btn">导入相关性表 Top10</button>
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="genRocBatchBtn">批量计算 AUC</button>
             </div>
           </div>
@@ -1254,10 +1262,10 @@
                 <input type="text" id="similarFieldsInput" placeholder="输入字段名联想，选中自动添加..." autocomplete="off">
               </div>
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="importSimilarTop10Btn" class="secondary">导入相关性表 Top10</button>
             </div>
-            <div class="control" style="flex: 0; min-width: auto;">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="genSimilarBtn">检索相似 Case</button>
             </div>
           </div>

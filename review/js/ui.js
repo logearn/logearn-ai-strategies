@@ -810,18 +810,27 @@ function plotFromButton() {
   plot();
 }
 
+// CSV 导出跟随当前工作集（design doc §15.3）：之前导出的是全量 matchedRows，忽略了顶部"全局条件过滤"，
+// 用户过滤掉的记录依然会被导出，容易造成"导出的数据和界面上看到的分析结果不一致"的误解，改成导出 activeRows。
+// 同时列集合显式并入 customFields 的字段名，避免某个自定义字段对所有行都算不出值（比如公式依赖的原始字段
+// 在这批数据里全部缺失）时，因为 flatMap 扫不到任何一行有这个 key 而整列从 CSV 里消失、用户却毫无察觉。
 function downloadCsv() {
-  if (!matchedRows.length) return;
-  const featureKeys = [...new Set(matchedRows.flatMap(r => Object.keys(r.features)))].sort();
-  const cols = ['id','symbol','tokenAddress','signalType','initialMcap','currentMcap','maxMcap','returnCurrent','returnMax', ...featureKeys];
+  if (!activeRows.length) { alert('当前没有数据可导出（请检查过滤条件或先点击"分析"）'); return; }
+  const featureKeys = [...new Set([
+    ...activeRows.flatMap(r => Object.keys(r.features)),
+    ...customFields.map(c => c.name),
+  ])].sort();
+  const categoricalKeys = [...new Set(activeRows.flatMap(r => Object.keys(r.categorical || {})))].sort();
+  const cols = ['id','symbol','tokenAddress','signalType','initialMcap','currentMcap','maxMcap','returnCurrent','returnMax', ...featureKeys, ...categoricalKeys];
   const lines = [cols.map(csvEscape).join(',')];
-  for (const r of matchedRows) {
+  for (const r of activeRows) {
     const row = cols.map(c => {
       if (c === 'id') return r.id;
       if (c === 'symbol') return r.symbol;
       if (c === 'tokenAddress') return r.tokenAddress;
       if (c === 'signalType') return r.signalType;
       if (['initialMcap','currentMcap','maxMcap','returnCurrent','returnMax'].includes(c)) return r[c];
+      if (categoricalKeys.includes(c)) return r.categorical && r.categorical[c] !== undefined ? r.categorical[c] : '';
       return r.features[c] === undefined || r.features[c] === null ? '' : r.features[c];
     });
     lines.push(row.map(csvEscape).join(','));
@@ -845,7 +854,11 @@ async function analyze() {
   btn.disabled = true; btn.textContent = '分析中...';
   try {
     const [calls, snapshots] = await Promise.all([readJson(callsFile), readJson(snapsFile)]);
-    matchedRows = buildRows(calls, snapshots);
+    // 大数据量时分批处理并汇报进度（design doc §14.3），避免上万条 calls 同步循环卡死页面没反应
+    matchedRows = await buildRows(calls, snapshots, (done, total) => {
+      btn.textContent = `分析中... ${done}/${total}`;
+      document.getElementById('fileHint').textContent = `正在匹配数据... ${done}/${total}`;
+    });
     const skipped = buildRows.lastSkippedByTimeDiff || 0;
     if (!matchedRows.length) {
       alert('未匹配到有效样本，请检查两个 JSON 是否对应。' + (skipped ? `（另有 ${skipped} 条因 call 与最近快照时间差超过阈值被跳过）` : ''));

@@ -156,7 +156,12 @@ function callKey(c) {
 // 单位：秒。默认 1 小时，可按数据实际采集频率调整。
 const MAX_SNAPSHOT_MATCH_DIFF_SECONDS = 3600;
 
-function buildRows(calls, snapshots) {
+// 大数据量处理进度反馈（design doc §14.3）：calls 数量较大时（比如上万条），逐条匹配+展开的同步循环
+// 会长时间占住主线程，页面表现为“点了分析按钮后卡死没反应”。这里改成 async 函数，每处理完一批（CHUNK_SIZE）
+// 就通过 onProgress 回调汇报进度，并 await 一次 setTimeout(0) 把主线程让给浏览器刷新 UI，避免整页冻结。
+const BUILD_ROWS_CHUNK_SIZE = 500;
+
+async function buildRows(calls, snapshots, onProgress) {
   const snapsByKey = new Map();
   for (const s of snapshots) {
     const k = snapKey(s);
@@ -165,7 +170,12 @@ function buildRows(calls, snapshots) {
   }
   const rows = [];
   let skippedByTimeDiff = 0;
-  for (const c of calls) {
+  for (let ci = 0; ci < calls.length; ci++) {
+    const c = calls[ci];
+    if (ci > 0 && ci % BUILD_ROWS_CHUNK_SIZE === 0) {
+      if (onProgress) onProgress(ci, calls.length);
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
     const list = snapsByKey.get(callKey(c));
     if (!list || !list.length) continue;
     let s = list[0];

@@ -809,6 +809,50 @@
         </div>
 
         <div class="pro-section">
+          <h4>3.5 特征组合探索（组合生成器）</h4>
+          <p class="hint" style="margin: 0 0 10px;">两个字段的比值/差值/乘积有时比单独任何一个都更有解释力。多选候选字段（建议不超过 10 个，超过 15 个不允许运行），勾选要尝试的运算方式，只展示比原始两个字段单独的 r 都更强（提升 ≥ 0.05）的组合。</p>
+          <div class="row">
+            <div class="control" style="flex: 0; min-width: 140px;">
+              <label for="interactionTargetField">目标</label>
+              <select id="interactionTargetField">
+                <option value="returnCurrent">returnCurrent</option>
+                <option value="returnMax" selected>returnMax</option>
+              </select>
+            </div>
+            <div class="control" style="flex: 1 1 100%; position: relative;">
+              <label for="interactionInput">候选字段（可多选，建议 ≤10 个，上限 15 个）</label>
+              <div class="tag-input" id="interactionTagBox">
+                <input type="text" id="interactionInput" placeholder="输入字段名联想，选中自动添加..." autocomplete="off">
+              </div>
+            </div>
+          </div>
+          <div class="row" style="margin-top: 4px; align-items: flex-end;">
+            <div class="control" style="flex: 0; min-width: auto; display:flex; gap:14px;">
+              <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; margin:0;">
+                <input type="checkbox" id="interactionOpRatio" checked> 比值 A/B
+              </label>
+              <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; margin:0;">
+                <input type="checkbox" id="interactionOpDiff" checked> 差值 A-B
+              </label>
+              <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; margin:0;">
+                <input type="checkbox" id="interactionOpProduct" checked> 乘积 A×B
+              </label>
+            </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="genInteractionBtn">生成并评估</button>
+            </div>
+          </div>
+          <div id="interactionWarning" class="hint hidden" style="margin: 10px 0; color: var(--warn, #ff9f0a);"></div>
+          <div id="interactionSummary" class="hint" style="margin: 0 0 10px;"></div>
+          <div class="table-scroll" style="margin-top: 10px; max-height: 320px;">
+            <table class="desc-table">
+              <thead><tr><th>组合表达式</th><th class="num">新组合 r</th><th class="num">字段 A 单独 r</th><th class="num">字段 B 单独 r</th><th class="num">提升幅度</th><th class="num">n</th><th>操作</th></tr></thead>
+              <tbody id="interactionBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="pro-section">
           <h4>4. 时间维度分析</h4>
           <p class="hint" style="margin: 0 0 10px;">子视图 A：按开仓时间（swap_begin_time）分桶，查看胜率/均值/与特征的相关性是否随时间漂移。子视图 B：用滚动窗口串联出相关性随时间变化的连续曲线，判断策略是否随市场环境变化而失效。</p>
           <h5 style="margin: 6px 0;">子视图 A：分桶统计</h5>

@@ -503,6 +503,112 @@ function renderFeatureImportance(targetField, fields, oosOptions) {
   `).join('');
 }
 
+// ---------- 3.5 特征组合探索 ----------
+function interactionExpr(a, b, op) {
+  if (op === 'ratio') return `${a} / ${b}`;
+  if (op === 'diff') return `${a} - ${b}`;
+  return `${a} × ${b}`;
+}
+
+// 组装字段名只允许字母/数字/下划线/点，原始字段名里的其它符号（如空格、括号）统一替换成下划线
+function sanitizeForFieldName(f) {
+  return f.replace(/[^a-zA-Z0-9_.]/g, '_');
+}
+
+function interactionFieldName(a, b, op) {
+  const opTag = op === 'ratio' ? 'div' : op === 'diff' ? 'minus' : 'times';
+  return `custom.${sanitizeForFieldName(a)}_${opTag}_${sanitizeForFieldName(b)}`;
+}
+
+function interactionFieldCode(a, b, op) {
+  const aExpr = `f[${JSON.stringify(a)}]`;
+  const bExpr = `f[${JSON.stringify(b)}]`;
+  if (op === 'ratio') return `${bExpr} !== 0 ? ${aExpr} / ${bExpr} : NaN`;
+  if (op === 'diff') return `${aExpr} - ${bExpr}`;
+  return `${aExpr} * ${bExpr}`;
+}
+
+function computeFeatureInteractions(fields, ops, targetField) {
+  const results = [];
+  for (let i = 0; i < fields.length; i++) {
+    for (let j = i + 1; j < fields.length; j++) {
+      const A = fields[i], B = fields[j];
+      for (const op of ops) {
+        const pairs = [];
+        for (const row of activeRows) {
+          const av = getFeature(row, A), bv = getFeature(row, B), tv = getFeature(row, targetField);
+          if (!isFiniteNumber(av) || !isFiniteNumber(bv) || !isFiniteNumber(tv)) continue;
+          let dv;
+          if (op === 'ratio') { if (bv === 0) continue; dv = av / bv; }
+          else if (op === 'diff') dv = av - bv;
+          else dv = av * bv;
+          if (!Number.isFinite(dv)) continue;
+          pairs.push({ av, bv, tv, dv });
+        }
+        // 完整案例太少时相关系数不稳定，直接跳过而不是硬凑一个没有意义的结果
+        if (pairs.length < 10) continue;
+        const rNew = pearson(pairs.map(p => [p.dv, p.tv]));
+        const rA = pearson(pairs.map(p => [p.av, p.tv]));
+        const rB = pearson(pairs.map(p => [p.bv, p.tv]));
+        if (!Number.isFinite(rNew)) continue;
+        const baseMax = Math.max(Number.isFinite(rA) ? Math.abs(rA) : 0, Number.isFinite(rB) ? Math.abs(rB) : 0);
+        const improvement = Math.abs(rNew) - baseMax;
+        // 只保留比两个原始字段单独的 r 都更强、且提升幅度 >= 0.05 的组合，避免展示大量无意义的微弱提升
+        if (improvement < 0.05) continue;
+        results.push({ a: A, b: B, op, rNew, rA, rB, improvement, n: pairs.length });
+      }
+    }
+  }
+  results.sort((x, y) => Math.abs(y.rNew) - Math.abs(x.rNew));
+  return results;
+}
+
+function renderFeatureInteractions(fields, ops, targetField) {
+  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (fields.length < 2) { alert('请至少选择 2 个候选字段'); return; }
+  if (fields.length > 15) { alert(`候选字段数量（${fields.length}）超过上限 15 个，请减少后再运行。`); return; }
+  if (!ops.length) { alert('请至少勾选一种运算方式'); return; }
+
+  const warnEl = document.getElementById('interactionWarning');
+  if (fields.length > 10) {
+    warnEl.classList.remove('hidden');
+    warnEl.textContent = `字段较多（${fields.length} 个），组合评估可能比较慢，建议减少到 10 个以内。`;
+  } else {
+    warnEl.classList.add('hidden');
+  }
+
+  const results = computeFeatureInteractions(fields, ops, targetField);
+  const summaryEl = document.getElementById('interactionSummary');
+  const totalCombos = fields.length * (fields.length - 1) / 2 * ops.length;
+  summaryEl.textContent = `共评估 ${totalCombos} 种组合，其中 ${results.length} 种比原始字段单独表现更强（|r| 提升 ≥ 0.05）。`;
+
+  document.getElementById('interactionBody').innerHTML = results.map(r => `
+    <tr>
+      <td>${escapeHtml(interactionExpr(r.a, r.b, r.op))}</td>
+      <td class="num">${r.rNew.toFixed(4)}</td>
+      <td class="num">${Number.isFinite(r.rA) ? r.rA.toFixed(4) : '-'}</td>
+      <td class="num">${Number.isFinite(r.rB) ? r.rB.toFixed(4) : '-'}</td>
+      <td class="num">+${r.improvement.toFixed(4)}</td>
+      <td class="num">${r.n}</td>
+      <td><button type="button" class="addInteractionFieldBtn" data-a="${escapeHtml(r.a)}" data-b="${escapeHtml(r.b)}" data-op="${r.op}">加入组装字段库</button></td>
+    </tr>
+  `).join('') || '<tr><td colspan="7" style="text-align:center; color:var(--text-muted);">没有找到比原始字段更强的组合</td></tr>';
+
+  document.querySelectorAll('.addInteractionFieldBtn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const a = btn.dataset.a, b = btn.dataset.b, op = btn.dataset.op;
+      const name = interactionFieldName(a, b, op);
+      const code = interactionFieldCode(a, b, op);
+      if (customFields.some(c => c.name === name)) { alert(`字段 ${name} 已存在于组装字段库中`); return; }
+      customFields.push({ name, code });
+      saveCustomFields();
+      refreshAfterCustomFieldChange();
+      btn.textContent = '已加入 ✓';
+      btn.disabled = true;
+    });
+  });
+}
+
 // ---------- 4. 时间维度分析 ----------
 function renderTimeAnalysis(featureField, targetField, bucketCount) {
   if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
@@ -855,6 +961,15 @@ function initProAnalytics() {
       method: document.getElementById('regOosSplitMethod').value,
       ratio: Number(document.getElementById('regOosTrainRatio').value) || 0.7
     });
+  });
+
+  const interactionSelector = makeFieldTagSelector('interactionInput', 'interactionTagBox');
+  document.getElementById('genInteractionBtn').addEventListener('click', () => {
+    const ops = [];
+    if (document.getElementById('interactionOpRatio').checked) ops.push('ratio');
+    if (document.getElementById('interactionOpDiff').checked) ops.push('diff');
+    if (document.getElementById('interactionOpProduct').checked) ops.push('product');
+    renderFeatureInteractions(interactionSelector.getSelected(), ops, document.getElementById('interactionTargetField').value);
   });
 
   // 分组/分类字段用 filterFieldList（含 signalType/symbol 等分类字段 + 全部数值字段），

@@ -418,6 +418,7 @@ function addFilterRow(field = '', op = '>=', threshold = '') {
 // 数据集（activeRows）变化后统一刷新下游视图：字段质量 / 相关性 / 总览 / 散点图
 function refreshAnalysisViews() {
   renderFieldQuality();
+  renderDistribution();
   allCorrelations = computeCorrelations(activeRows);
   renderCorrTable();
   updateSummary();
@@ -788,6 +789,9 @@ document.getElementById('corrSource').addEventListener('change', renderCorrTable
 document.getElementById('topN').addEventListener('change', renderCorrTable);
 document.getElementById('corrCorrection').addEventListener('change', renderCorrTable);
 document.getElementById('corrSortBy').addEventListener('change', renderCorrTable);
+document.getElementById('distTargetField').addEventListener('change', renderDistribution);
+document.getElementById('distLogX').addEventListener('change', renderDistribution);
+document.getElementById('distBinCount').addEventListener('change', renderDistribution);
 document.getElementById('oosEnabled').addEventListener('change', renderCorrTable);
 document.getElementById('oosSplitMethod').addEventListener('change', renderCorrTable);
 document.getElementById('oosTrainRatio').addEventListener('change', renderCorrTable);

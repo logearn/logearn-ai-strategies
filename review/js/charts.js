@@ -340,6 +340,81 @@ function logearnUrl(addr) {
   return `https://logearn.com/cn/${chainSlug}/tokens/${addr}`;
 }
 
+// 收益分布：直方图 + P10~P99 分位数表。目标字段（returnCurrent/returnMax）恒为正，对数轴默认开启，
+// 但保留"含 0/负值时自动关闭对数轴"这层保护，以防未来复用到其他可能含 0/负值的字段。
+function renderDistribution() {
+  const panel = document.getElementById('distPanel');
+  if (!panel) return;
+  if (!activeRows.length) { panel.classList.add('hidden'); return; }
+  panel.classList.remove('hidden');
+
+  const targetField = document.getElementById('distTargetField').value;
+  const logXInput = document.getElementById('distLogX');
+  const values = activeRows.map(r => getFeature(r, targetField)).filter(isFiniteNumber).map(Number);
+  const summaryEl = document.getElementById('distSummary');
+
+  if (values.length < 5) {
+    summaryEl.textContent = '有效样本过少（<5），无法生成分布图。';
+    Plotly.purge('distChart');
+    document.getElementById('distQuantileBody').innerHTML = '';
+    return;
+  }
+
+  const hasNonPositive = values.some(v => v <= 0);
+  logXInput.disabled = hasNonPositive;
+  if (hasNonPositive) logXInput.checked = false;
+  const logX = logXInput.checked;
+
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mean = sorted.reduce((a, b) => a + b, 0) / sorted.length;
+  const q = {
+    p10: percentile(sorted, 0.1), p25: percentile(sorted, 0.25), p50: percentile(sorted, 0.5),
+    p75: percentile(sorted, 0.75), p90: percentile(sorted, 0.9), p99: percentile(sorted, 0.99)
+  };
+
+  const plotValues = logX ? values.map(v => Math.log10(v)) : values;
+  const n = values.length;
+  const binCountInput = Number(document.getElementById('distBinCount').value);
+  const binCount = binCountInput > 0 ? binCountInput : Math.max(5, Math.round(Math.sqrt(n)));
+  const medianLine = logX ? Math.log10(q.p50) : q.p50;
+  const meanLine = logX ? Math.log10(mean) : mean;
+
+  Plotly.newPlot('distChart', [{
+    x: plotValues, type: 'histogram', nbinsx: binCount,
+    marker: { color: '#0a84ff' }
+  }], darkLayout({
+    title: `${targetField} 分布${logX ? '（log10 X轴）' : ''}（n=${n}）`,
+    xaxis: { title: logX ? `log10(${targetField})` : targetField },
+    yaxis: { title: '样本数' },
+    margin: { t: 50 },
+    shapes: [
+      { type: 'line', x0: medianLine, x1: medianLine, y0: 0, y1: 1, yref: 'paper', line: { color: '#30d158', dash: 'dash', width: 2 } },
+      { type: 'line', x0: meanLine, x1: meanLine, y0: 0, y1: 1, yref: 'paper', line: { color: '#ff9f0a', dash: 'dash', width: 2 } }
+    ],
+    annotations: [
+      { x: medianLine, y: 1, yref: 'paper', text: '中位数', showarrow: false, yshift: 14, font: { color: '#30d158' } },
+      { x: meanLine, y: 1, yref: 'paper', text: '均值', showarrow: false, yshift: -4, font: { color: '#ff9f0a' } }
+    ]
+  }), { responsive: true });
+
+  // 均值明显高于中位数 → 分布右偏，用一句自然语言提示，而不是让用户自己对比两个数字
+  const skewRatio = q.p50 > 0 ? mean / q.p50 : NaN;
+  summaryEl.textContent = Number.isFinite(skewRatio) && skewRatio > 1.3
+    ? `均值（${formatNumberSmart(mean)}）明显高于中位数（${formatNumberSmart(q.p50)}），说明收益分布右偏，少数极端案例拉高了平均表现。`
+    : '';
+
+  document.getElementById('distQuantileBody').innerHTML = `
+    <tr>
+      <td class="num">${formatNumberSmart(q.p10)}</td>
+      <td class="num">${formatNumberSmart(q.p25)}</td>
+      <td class="num">${formatNumberSmart(q.p50)}</td>
+      <td class="num">${formatNumberSmart(q.p75)}</td>
+      <td class="num">${formatNumberSmart(q.p90)}</td>
+      <td class="num">${formatNumberSmart(q.p99)}</td>
+      <td class="num">${formatNumberSmart(mean)}</td>
+    </tr>`;
+}
+
 function parseBreakpoints(text) {
   return text.split(',').map(s => parseFloat(s.trim())).filter(Number.isFinite).sort((a, b) => a - b);
 }

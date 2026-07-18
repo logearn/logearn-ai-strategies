@@ -401,6 +401,42 @@
     </div>
   </div>
 
+  <div class="panel hidden" id="distPanel">
+    <div class="panel-header-row" data-target="distBody_">
+      <h3>收益分布</h3>
+      <button type="button" class="collapse-toggle">▾</button>
+    </div>
+    <div class="panel-body" id="distBody_">
+      <p class="hint" style="margin: -6px 0 12px;">平均倍数好看，不代表大部分信号都好看——收益倍数天然是长尾分布，少数暴涨 token 会把均值拉得很高，只看均值容易高估策略的"典型表现"。</p>
+      <div class="row" style="margin-bottom: 10px;">
+        <div class="control" style="flex: 0; min-width: 140px;">
+          <label for="distTargetField">目标字段</label>
+          <select id="distTargetField">
+            <option value="returnCurrent">returnCurrent</option>
+            <option value="returnMax" selected>returnMax</option>
+          </select>
+        </div>
+        <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
+          <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;">
+            <input type="checkbox" id="distLogX" checked> 对数 X 轴
+          </label>
+        </div>
+        <div class="control" style="flex: 0; min-width: 140px;">
+          <label for="distBinCount">分箱数（留空自动）</label>
+          <input type="number" id="distBinCount" placeholder="自动" min="5" max="200">
+        </div>
+      </div>
+      <div id="distSummary" class="hint" style="margin: 0 0 10px;"></div>
+      <div id="distChart" style="width: 100%; height: 380px;"></div>
+      <div class="table-scroll" style="margin-top: 10px;">
+        <table class="desc-table">
+          <thead><tr><th>P10</th><th>P25</th><th>P50（中位数）</th><th>P75</th><th>P90</th><th>P99</th><th>均值</th></tr></thead>
+          <tbody id="distQuantileBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
   <div class="panel hidden" id="fieldQualityPanel">
     <div class="panel-header-row" data-target="fieldQualityBody_">
       <h3>字段质量总览</h3>

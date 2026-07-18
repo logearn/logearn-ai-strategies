@@ -84,6 +84,41 @@ function plot() {
   for (const f of fields) renderChartCard(f, yField);
 }
 
+// 导出任意已渲染的 Plotly 图为 PNG（design doc §15.4），供散点图/分箱柱状图/收益分布图统一复用。
+// useLightBg 时临时把背景/字体色切成浅色再导出，导出完成后（无论成功失败）都会切回原来的颜色，
+// 不影响页面上实际展示的图表。
+async function exportChartPng(chartDiv, filename, useLightBg) {
+  if (!chartDiv || !chartDiv.querySelector('.main-svg')) { alert('该图表还没有渲染，无法导出'); return; }
+  let prevColors = null;
+  if (useLightBg) {
+    const layout = chartDiv.layout || {};
+    prevColors = {
+      paper_bgcolor: layout.paper_bgcolor,
+      plot_bgcolor: layout.plot_bgcolor,
+      'font.color': layout.font ? layout.font.color : undefined,
+    };
+    try { await Plotly.relayout(chartDiv, { paper_bgcolor: '#ffffff', plot_bgcolor: '#ffffff', 'font.color': '#1d1d1f' }); } catch (e) {}
+  }
+  try {
+    const dataUrl = await Plotly.toImage(chartDiv, {
+      format: 'png',
+      width: Math.max(600, chartDiv.clientWidth || 900),
+      height: Math.max(400, chartDiv.clientHeight || 480),
+      scale: 2,
+    });
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = `${(filename || 'chart').replace(/[\\/:*?"<>|]/g, '_')}.png`;
+    a.click();
+  } catch (e) {
+    alert('导出失败：' + e.message);
+  } finally {
+    if (useLightBg && prevColors) {
+      try { await Plotly.relayout(chartDiv, prevColors); } catch (e) {}
+    }
+  }
+}
+
 function renderChartCard(xField, yField) {
   const opt = getChartSettings(xField);
   const card = document.createElement('div');
@@ -123,7 +158,21 @@ function renderChartCard(xField, yField) {
       done();
     }
   });
+  // 导出为图片（design doc §15.4）：Plotly 自带 toImage API，不需要自己实现导出逻辑；
+  // 用当前图表标题作为默认文件名，避免拿到一堆"newplot.png"分不清是哪张图；scale:2 保证贴进文档里不糊。
+  const exportBtn = document.createElement('button');
+  exportBtn.type = 'button';
+  exportBtn.className = 'chart-tool-btn';
+  exportBtn.title = '导出该图为 PNG 图片';
+  exportBtn.textContent = '🖼 导出PNG';
+  const lightExportLabel = document.createElement('label');
+  lightExportLabel.className = 'chart-opt';
+  lightExportLabel.title = '深色主题下导出的图片背景是深色，贴到白底文档/PPT 里会不协调，勾选后临时用浅色背景导出（不影响页面上实际展示的图表）';
+  lightExportLabel.innerHTML = '<input type="checkbox" class="export-light-bg"> 导出用浅色背景';
+  exportBtn.addEventListener('click', () => exportChartPng(chartDiv, titleText.textContent, lightExportLabel.querySelector('input').checked));
   titleBar.appendChild(titleText);
+  titleBar.appendChild(exportBtn);
+  titleBar.appendChild(lightExportLabel);
   titleBar.appendChild(copyBtn);
 
   const chartDiv = document.createElement('div');

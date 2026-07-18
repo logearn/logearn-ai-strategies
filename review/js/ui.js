@@ -1055,6 +1055,9 @@ document.getElementById('resetAllChartOptsBtn').addEventListener('click', () => 
   if (!batchXSelected.length) { alert('当前没有已展示的图表'); return; }
   resetAllChartOptions();
 });
+document.querySelectorAll('.export-png-btn').forEach(btn => {
+  btn.addEventListener('click', () => exportChartPng(document.getElementById(btn.dataset.target), btn.dataset.filename));
+});
 document.getElementById('genBinBarBtn').addEventListener('click', renderBinBarChart);
 document.getElementById('binRecommendBtn').addEventListener('click', () => {
   if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }

@@ -628,19 +628,37 @@
 
         <div class="pro-section">
           <h4>1. 相关性矩阵 / 热力图</h4>
-          <p class="hint" style="margin: 0 0 10px;">选中若干字段，查看两两 Pearson r 热力图，快速发现高度共线的字段（避免把两个高度相关的字段都当成独立的"强特征"）。</p>
+          <p class="hint" style="margin: 0 0 10px;">选中若干字段，查看两两 Pearson r 热力图，快速发现高度共线的字段（避免把两个高度相关的字段都当成独立的"强特征"）。点击非对角线格子可直接把这两个字段设为散点图的 X/Y 并跳转查看具体分布。</p>
           <div class="row">
             <div class="control" style="flex: 1 1 100%; position: relative;">
-              <label for="corrMatrixInput">选择字段（可多选）</label>
+              <label for="corrMatrixInput">选择字段（可多选，建议 ≤ 20 个）</label>
               <div class="tag-input" id="corrMatrixTagBox">
                 <input type="text" id="corrMatrixInput" placeholder="输入字段名联想，选中自动添加..." autocomplete="off">
               </div>
+            </div>
+            <div class="control" style="flex: 0; min-width: 120px;">
+              <label for="corrMatrixThreshold">共线阈值 |r|≥</label>
+              <input type="number" id="corrMatrixThreshold" value="0.8" min="0" max="1" step="0.05">
+            </div>
+            <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
+              <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;">
+                <input type="checkbox" id="corrMatrixHighlight" checked> 只高亮共线对
+              </label>
+            </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="importTop10CorrBtn">导入相关性表 Top10</button>
             </div>
             <div class="control" style="flex: 0; min-width: auto;">
               <button type="button" id="genCorrMatrixBtn">生成矩阵</button>
             </div>
           </div>
           <div id="corrMatrixChart" style="width: 100%; height: 480px;"></div>
+          <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
+            <table class="desc-table">
+              <thead><tr><th>字段 A</th><th>字段 B</th><th class="num">r</th><th>提示</th></tr></thead>
+              <tbody id="corrMatrixPairsBody"></tbody>
+            </table>
+          </div>
         </div>
 
         <div class="pro-section">

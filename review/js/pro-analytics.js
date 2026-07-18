@@ -80,14 +80,30 @@ function makeFieldTagSelector(inputId, tagBoxId) {
     input.focus();
   });
 
-  return { getSelected: () => selected };
+  return {
+    getSelected: () => selected,
+    addField: f => { if (scatterOptions.includes(f) && !selected.includes(f)) { selected.push(f); render(); } }
+  };
 }
 
 // ---------- 1. 相关性矩阵 / 热力图 ----------
-function renderCorrMatrix(fields) {
+function renderCorrMatrix(fields, threshold, onlyHighlight) {
   if (fields.length < 2) { alert('请至少选择 2 个字段'); return; }
   if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  threshold = Number.isFinite(threshold) ? threshold : 0.8;
+
+  // 边界情况 1：字段在当前 activeRows 里全部缺失；边界情况 2：字段方差为 0（所有取值相同）——
+  // 这两种情况下 pearson 分母为 0 或样本不足，r 本身没有意义，需要单独标注，不能和"确实不相关"混为一谈
+  const fieldStatus = new Map();
+  for (const f of fields) {
+    const vals = activeRows.map(row => getFeature(row, f)).filter(isFiniteNumber).map(Number);
+    if (!vals.length) fieldStatus.set(f, 'missing');
+    else if (new Set(vals).size <= 1) fieldStatus.set(f, 'constant');
+    else fieldStatus.set(f, 'ok');
+  }
+
   const matrix = fields.map(fx => fields.map(fy => {
+    if (fieldStatus.get(fx) !== 'ok' || fieldStatus.get(fy) !== 'ok') return NaN;
     if (fx === fy) return 1;
     const pairs = [];
     for (const row of activeRows) {
@@ -96,16 +112,62 @@ function renderCorrMatrix(fields) {
     }
     return pairs.length >= 5 ? pearson(pairs) : NaN;
   }));
-  const text = matrix.map(row => row.map(v => Number.isFinite(v) ? v.toFixed(2) : 'N/A'));
+
+  const cellNote = f => fieldStatus.get(f) === 'missing' ? '数据不足' : fieldStatus.get(f) === 'constant' ? '无变化' : null;
+  const text = matrix.map((row, i) => row.map((v, j) => {
+    const note = cellNote(fields[i]) || cellNote(fields[j]);
+    if (note) return note;
+    return Number.isFinite(v) ? v.toFixed(2) : 'N/A';
+  }));
+  // "只高亮共线对"开启时，非共线（|r|<threshold 且非对角线）的格子调低透明度，让共线对在视觉上更突出
+  const z = onlyHighlight
+    ? matrix.map((row, i) => row.map((v, j) => {
+        if (i === j || !Number.isFinite(v)) return v;
+        return Math.abs(v) >= threshold ? v : v * 0.25;
+      }))
+    : matrix;
+
   Plotly.newPlot('corrMatrixChart', [{
-    z: matrix, x: fields, y: fields, type: 'heatmap',
+    z, x: fields, y: fields, type: 'heatmap',
     zmin: -1, zmax: 1, colorscale: 'RdBu', reversescale: true,
     text, texttemplate: '%{text}', hoverinfo: 'x+y+z'
   }], darkLayout({
-    title: '字段两两 Pearson r 相关性矩阵',
+    title: `字段两两 Pearson r 相关性矩阵${onlyHighlight ? `（已弱化 |r|<${threshold} 的格子）` : ''}`,
     margin: { t: 50, l: 140, b: 140 },
     xaxis: { tickangle: -45 }
   }), { responsive: true });
+
+  const chartEl = document.getElementById('corrMatrixChart');
+  chartEl.on('plotly_click', evt => {
+    const p = evt.points && evt.points[0];
+    if (!p || p.x === p.y) return;
+    if (fieldStatus.get(p.x) !== 'ok' || fieldStatus.get(p.y) !== 'ok') return;
+    if (scatterOptions.includes(p.x) && !batchXSelected.includes(p.x)) batchXSelected.push(p.x);
+    setFieldInputValue('yField', p.y);
+    renderBatchTags();
+    plot();
+    document.getElementById('scatterPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+
+  // 共线对列表：遍历上三角矩阵（不含对角线），筛出 |r| >= threshold 的字段对，作为热力图的文字化摘要
+  const pairs = [];
+  for (let i = 0; i < fields.length; i++) {
+    for (let j = i + 1; j < fields.length; j++) {
+      const r = matrix[i][j];
+      if (Number.isFinite(r) && Math.abs(r) >= threshold) pairs.push({ a: fields[i], b: fields[j], r });
+    }
+  }
+  pairs.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
+  document.getElementById('corrMatrixPairsBody').innerHTML = pairs.length
+    ? pairs.map(p => `
+      <tr>
+        <td>${escapeHtml(p.a)}</td>
+        <td>${escapeHtml(p.b)}</td>
+        <td class="num">${p.r.toFixed(4)}</td>
+        <td style="color:var(--text-muted)">这两个字段可能在描述同一件事，同时作为独立特征使用需谨慎</td>
+      </tr>
+    `).join('')
+    : `<tr><td colspan="4" style="text-align:center; color:var(--text-muted);">没有 |r| ≥ ${threshold} 的共线对</td></tr>`;
 }
 
 // ---------- 2. 分组对比分析 ----------
@@ -629,7 +691,23 @@ function initProAnalytics() {
   });
 
   const corrMatrixSelector = makeFieldTagSelector('corrMatrixInput', 'corrMatrixTagBox');
-  document.getElementById('genCorrMatrixBtn').addEventListener('click', () => renderCorrMatrix(corrMatrixSelector.getSelected()));
+  document.getElementById('genCorrMatrixBtn').addEventListener('click', () => renderCorrMatrix(
+    corrMatrixSelector.getSelected(),
+    Number(document.getElementById('corrMatrixThreshold').value),
+    document.getElementById('corrMatrixHighlight').checked
+  ));
+  // 默认预填"相关性表 Top10 字段 + returnCurrent + returnMax"——从当前已计算好的 allCorrelations 里取
+  // |r| 最大的前 10 个不重复字段（allCorrelations 本身已按 |r| 降序排好，直接取前几个去重即可）
+  document.getElementById('importTop10CorrBtn').addEventListener('click', () => {
+    if (!allCorrelations.length) { alert('请先点击"分析"加载数据'); return; }
+    corrMatrixSelector.addField('returnCurrent');
+    corrMatrixSelector.addField('returnMax');
+    const seen = new Set();
+    for (const c of allCorrelations) {
+      if (seen.size >= 10) break;
+      if (!seen.has(c.feature)) { seen.add(c.feature); corrMatrixSelector.addField(c.feature); }
+    }
+  });
 
   const importanceSelector = makeFieldTagSelector('importanceInput', 'importanceTagBox');
   document.getElementById('genImportanceBtn').addEventListener('click', () => {

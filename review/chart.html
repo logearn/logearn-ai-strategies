@@ -336,7 +336,29 @@
       <div class="app-subtitle">上传 calls / snapshots JSON，在浏览器本地完成匹配、收益计算、相关性分析与筛选</div>
     </div>
     <button type="button" id="snapshotToggleBtn" class="secondary" title="保存/对比分析快照">📷 快照</button>
+    <button type="button" id="reportToggleBtn" class="secondary" title="一键生成分析报告">📄 报告</button>
     <button type="button" id="themeToggleBtn" class="secondary theme-toggle-btn" title="切换深色/浅色主题">🌙 深色</button>
+  </div>
+
+  <div class="panel hidden" id="reportPanel">
+    <div class="panel-header-row" data-target="reportBody_">
+      <h3>一键生成分析报告</h3>
+      <button type="button" class="collapse-toggle">▾</button>
+    </div>
+    <div class="panel-body" id="reportBody_">
+      <p class="hint" style="margin: -6px 0 12px;">工具只负责呈现数据事实，报告最后留一个"结论区"给你手动补充解读，不替你下结论。</p>
+      <div class="row" style="gap: 16px; flex-wrap: wrap;">
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;"><input type="checkbox" id="reportIncSummary" checked> 总览统计</label>
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;"><input type="checkbox" id="reportIncQuality" checked> 数据质量摘要</label>
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;"><input type="checkbox" id="reportIncCorr" checked> Top 相关性表</label>
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;"><input type="checkbox" id="reportIncCharts" checked> 当前图表（散点图/分箱图/分布图）</label>
+      </div>
+      <div class="row" style="margin-top: 10px; gap: 8px; align-items: center;">
+        <button type="button" id="genReportMdBtn">生成 Markdown 报告</button>
+        <button type="button" id="genReportPrintBtn" class="secondary">生成可打印页面（另存为PDF）</button>
+        <span class="hint" id="reportStatusHint" style="margin: 0;"></span>
+      </div>
+    </div>
   </div>
 
   <div class="panel hidden" id="snapshotPanel">

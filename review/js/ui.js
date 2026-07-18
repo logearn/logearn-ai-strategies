@@ -1158,3 +1158,125 @@ document.getElementById('saveSnapshotBtn').addEventListener('click', saveCurrent
 document.getElementById('compareSnapshotsBtn').addEventListener('click', compareSelectedSnapshots);
 loadAnalysisSnapshots();
 renderSnapshotList();
+
+// ========== 一键生成分析报告（design doc §10.3） ==========
+// 只负责拼接各面板已经算好的数据（不重新计算），图表部分用 Plotly.toImage 导出成 base64 图片；
+// 报告结构：过滤条件说明 → 总览统计 → 数据质量摘要 → Top相关性表 → 关键图表 → 结论区（留空给用户手动补充）。
+async function buildReportSections(options) {
+  const parts = [];
+  parts.push(`# 分析报告\n\n生成时间：${new Date().toLocaleString()}\n\n过滤条件：${describeCurrentFilter()}\n\n样本数：${activeRows.length}（原始 ${matchedRows.length} 条）\n`);
+
+  if (options.summary && activeRows.length) {
+    const cur = activeRows.map(r => r.returnCurrent);
+    const mx = activeRows.map(r => r.returnMax);
+    const cs = calcStats(cur, 1);
+    const ms = calcStats(mx, 1);
+    parts.push(`## 总览统计\n\n- returnCurrent 平均倍数：${cs.mean.toFixed(4)}x\n- 胜率（倍数>1）：${(cs.winRate * 100).toFixed(1)}%\n- returnMax 平均倍数：${ms.mean.toFixed(4)}x\n- 最大倍数：${ms.max.toFixed(4)}x\n`);
+  }
+
+  if (options.quality && activeRows.length) {
+    const alerts = computeQualityAlerts(activeRows);
+    parts.push(`## 数据质量摘要\n\n发现 ${alerts.length} 条可能存在数据问题的记录（详见工具内"异常值/数据质量报警"面板）。\n`);
+  }
+
+  if (options.corr && allCorrelations.length) {
+    const top = allCorrelations.slice().sort((a, b) => Math.abs(b.r) - Math.abs(a.r)).slice(0, 20);
+    let table = '## Top 相关性表\n\n| 目标 | 字段 | r | n | p |\n|---|---|---|---|---|\n';
+    for (const c of top) {
+      table += `| ${c.target} | ${c.feature} | ${c.r.toFixed(4)} | ${c.n} | ${Number.isFinite(c.p) ? c.p.toExponential(2) : '-'} |\n`;
+    }
+    parts.push(table);
+  }
+
+  if (options.charts) {
+    const chartDivs = [];
+    document.querySelectorAll('#plotStack .plot-chart').forEach((el, i) => { if (el.querySelector('.main-svg')) chartDivs.push({ title: `散点图 ${i + 1}`, el }); });
+    if (document.getElementById('binBarChart').querySelector('.main-svg')) chartDivs.push({ title: '分箱柱状图', el: document.getElementById('binBarChart') });
+    if (document.getElementById('distChart').querySelector('.main-svg')) chartDivs.push({ title: '收益分布直方图', el: document.getElementById('distChart') });
+    if (chartDivs.length) {
+      let chartsMd = '## 关键图表\n\n';
+      for (const c of chartDivs) {
+        try {
+          const dataUrl = await Plotly.toImage(c.el, { format: 'png', width: 900, height: 500 });
+          chartsMd += `### ${c.title}\n\n![${c.title}](${dataUrl})\n\n`;
+        } catch (e) { chartsMd += `### ${c.title}\n\n（导出失败：${e.message}）\n\n`; }
+      }
+      parts.push(chartsMd);
+    }
+  }
+
+  parts.push('## 结论\n\n（请在此手动补充解读，工具只呈现数据事实，不代替判断）\n');
+  return parts;
+}
+
+function getReportOptions() {
+  return {
+    summary: document.getElementById('reportIncSummary').checked,
+    quality: document.getElementById('reportIncQuality').checked,
+    corr: document.getElementById('reportIncCorr').checked,
+    charts: document.getElementById('reportIncCharts').checked,
+  };
+}
+
+async function generateMarkdownReport() {
+  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  const hintEl = document.getElementById('reportStatusHint');
+  hintEl.textContent = '正在生成报告...';
+  try {
+    const parts = await buildReportSections(getReportOptions());
+    const blob = new Blob([parts.join('\n')], { type: 'text/markdown;charset=utf-8;' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `分析报告_${new Date().toISOString().slice(0, 10)}.md`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    hintEl.textContent = '✅ 已生成并下载';
+  } catch (e) {
+    hintEl.textContent = '❌ 生成失败：' + e.message;
+  }
+}
+
+async function generatePrintableReport() {
+  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  const hintEl = document.getElementById('reportStatusHint');
+  hintEl.textContent = '正在生成可打印页面...';
+  try {
+    const parts = await buildReportSections(getReportOptions());
+    // 简单把 markdown 转成可读 HTML：标题/表格/图片分别处理，不追求完整 markdown 语法支持，够报告用即可
+    const html = parts.map(md => {
+      let html = escapeHtml(md);
+      html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>').replace(/^## (.+)$/gm, '<h2>$1</h2>').replace(/^### (.+)$/gm, '<h3>$1</h3>');
+      html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" style="max-width:100%; margin: 8px 0;">');
+      // 表格：把 markdown 表格行转成 <table>（每个 md 片段里最多一张表，简化处理）
+      const lines = html.split('\n');
+      let inTable = false, out = [];
+      for (const line of lines) {
+        if (/^\|/.test(line)) {
+          if (!inTable) { out.push('<table border="1" cellpadding="6" style="border-collapse:collapse;">'); inTable = true; }
+          if (/^\|[\s-|]+\|$/.test(line)) continue; // 表头分隔行
+          const cells = line.split('|').slice(1, -1).map(c => c.trim());
+          out.push('<tr>' + cells.map(c => `<td>${c}</td>`).join('') + '</tr>');
+        } else {
+          if (inTable) { out.push('</table>'); inTable = false; }
+          out.push(`<p>${line}</p>`);
+        }
+      }
+      if (inTable) out.push('</table>');
+      return out.join('\n');
+    }).join('\n');
+    const win = window.open('', '_blank');
+    win.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>分析报告</title>
+      <style>body{font-family:-apple-system,sans-serif; max-width:900px; margin:40px auto; color:#1d1d1f;} table{width:100%; margin:8px 0;} h1,h2,h3{margin-top:24px;}</style>
+      </head><body>${html}<script>window.onload=()=>window.print();</script></body></html>`);
+    win.document.close();
+    hintEl.textContent = '✅ 已在新窗口打开，可在打印对话框里选择"另存为PDF"';
+  } catch (e) {
+    hintEl.textContent = '❌ 生成失败：' + e.message;
+  }
+}
+
+document.getElementById('reportToggleBtn').addEventListener('click', () => {
+  document.getElementById('reportPanel').classList.toggle('hidden');
+});
+document.getElementById('genReportMdBtn').addEventListener('click', generateMarkdownReport);
+document.getElementById('genReportPrintBtn').addEventListener('click', generatePrintableReport);

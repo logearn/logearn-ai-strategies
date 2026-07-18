@@ -231,6 +231,9 @@
     .desc-table th { background: var(--surface-2); }
     .desc-table td:first-child { font-family: "SF Mono", "SFMono-Regular", Consolas, monospace; color: var(--text); vertical-align: top; font-size: 11.5px; }
     .desc-table td:last-child { color: var(--text-muted); }
+    .coverage-bar-wrap { position: relative; background: var(--surface-2); border-radius: 4px; height: 16px; width: 120px; overflow: hidden; }
+    .coverage-bar-fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); opacity: .5; }
+    .coverage-bar-text { position: relative; z-index: 1; font-size: 11px; line-height: 16px; text-align: center; }
     details summary { cursor: pointer; font-size: 13px; color: var(--accent); user-select: none; font-weight: 500; }
     .ellip { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     textarea {
@@ -395,6 +398,27 @@
         <button type="button" class="collapse-toggle">▾</button>
       </div>
       <div class="panel-body" id="summaryText"></div>
+    </div>
+  </div>
+
+  <div class="panel hidden" id="fieldQualityPanel">
+    <div class="panel-header-row" data-target="fieldQualityBody_">
+      <h3>字段质量总览</h3>
+      <button type="button" class="collapse-toggle">▾</button>
+    </div>
+    <div class="panel-body" id="fieldQualityBody_">
+      <p class="hint" style="margin: -6px 0 12px;">覆盖率过低（&lt;50%）或字段是常量（所有样本取值都一样）时，相关性/分组统计的结论都不可信——建议先看这里再看下面的相关性表。默认按覆盖率升序排列，最先暴露问题字段。</p>
+      <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer; margin-bottom:10px;">
+        <input type="checkbox" id="fieldQualityOnlyIssues"> 只看有问题的字段（覆盖率 &lt; 50% 或为常量）
+      </label>
+      <div class="table-scroll" style="max-height: 360px;">
+        <table class="desc-table">
+          <thead>
+            <tr><th>字段</th><th>中文含义</th><th>覆盖率</th><th class="num">唯一值数</th><th>标记</th></tr>
+          </thead>
+          <tbody id="fieldQualityBody"></tbody>
+        </table>
+      </div>
     </div>
   </div>
 

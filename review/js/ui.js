@@ -62,6 +62,92 @@ function renderCorrTable() {
   });
 }
 
+// 字段质量总览：遍历数值/分类字段，统计覆盖率（有值样本占比）和唯一值数量——
+// 覆盖率过低或字段是常量（唯一值数量=1）时，相关性/分组统计的结论都不可信，需要在看相关性表之前先暴露出来。
+// 基于 activeRows（过滤后数据集）而不是 matchedRows，保证用户调整过滤条件后这里的数字同步更新。
+function renderFieldQuality() {
+  const panel = document.getElementById('fieldQualityPanel');
+  const tbody = document.getElementById('fieldQualityBody');
+  if (!panel || !tbody) return;
+  if (!activeRows.length) { panel.classList.add('hidden'); return; }
+  panel.classList.remove('hidden');
+
+  const fields = [...new Set([...ROW_LEVEL_FIELDS, ...allNumericKeys, ...allCategoricalKeys])];
+  const total = activeRows.length;
+  let rowsData = fields.map(f => {
+    let nonEmpty = 0;
+    const uniq = new Set();
+    for (const r of activeRows) {
+      const v = getFeature(r, f);
+      const valid = typeof v === 'number' ? Number.isFinite(v) : (v !== undefined && v !== null && v !== '');
+      if (valid) { nonEmpty++; uniq.add(v); }
+    }
+    const coverage = nonEmpty / total;
+    const flag = nonEmpty > 0 && uniq.size === 1 ? 'constant' : (coverage < 0.5 ? 'low' : 'normal');
+    return { field: f, coverage, uniqueCount: uniq.size, flag };
+  });
+
+  const onlyIssues = document.getElementById('fieldQualityOnlyIssues').checked;
+  if (onlyIssues) rowsData = rowsData.filter(r => r.flag !== 'normal');
+  rowsData.sort((a, b) => a.coverage - b.coverage);
+
+  const badgeMap = { constant: '🔴 常量', low: '🟡 低覆盖', normal: '🟢 正常' };
+  tbody.innerHTML = rowsData.map(r => {
+    const pct = (r.coverage * 100).toFixed(1);
+    const desc = getFieldDesc(r.field) || '-';
+    return `
+    <tr>
+      <td class="ellip" style="cursor:pointer; color:var(--accent);" title="点击跳转到相关性表">
+        <span class="fq-jump" data-field="${escapeHtml(r.field)}">${escapeHtml(r.field)}</span>
+      </td>
+      <td class="ellip" title="${escapeHtml(desc)}">${escapeHtml(desc)}</td>
+      <td>
+        <div class="coverage-bar-wrap">
+          <div class="coverage-bar-fill" style="width:${pct}%;"></div>
+          <div class="coverage-bar-text">${pct}%</div>
+        </div>
+      </td>
+      <td class="num">${r.uniqueCount}</td>
+      <td>${badgeMap[r.flag]}</td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="5" style="text-align:center; color:var(--text-muted);">没有匹配的字段</td></tr>`;
+
+  tbody.querySelectorAll('.fq-jump').forEach(el => {
+    el.addEventListener('click', () => jumpToCorrField(el.dataset.field));
+  });
+}
+
+// 从字段质量表跳转到相关性表定位该字段：数值字段直接在相关性表里高亮对应行；
+// 分类字段本身不参与相关性计算（pearson 只对数值有意义），提示改去 Pro 分析的分组/分类视图看
+function jumpToCorrField(field) {
+  if (!scatterOptions.includes(field) && field !== 'returnCurrent' && field !== 'returnMax') {
+    alert('该字段是分类字段，不参与相关性计算；可以在下方“Pro 分析”里的“分组对比”或“分类字段分析”中查看。');
+    return;
+  }
+  document.getElementById('corrTarget').value = 'all';
+  document.getElementById('corrSource').value = 'all';
+  document.getElementById('topN').value = '99999';
+  renderCorrTable();
+  const panel = document.getElementById('corrPanel');
+  panel.classList.remove('hidden');
+  const body = document.getElementById('corrBody_');
+  if (body && body.classList.contains('hidden')) {
+    body.classList.remove('hidden');
+    const toggle = panel.querySelector('.collapse-toggle');
+    if (toggle) toggle.classList.remove('collapsed');
+  }
+  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  setTimeout(() => {
+    document.querySelectorAll('#corrBody tr').forEach(tr => {
+      if (tr.children[1] && tr.children[1].textContent === field) {
+        tr.style.transition = 'background .3s';
+        tr.style.background = 'var(--accent)';
+        setTimeout(() => { tr.style.background = ''; }, 1200);
+      }
+    });
+  }, 50);
+}
+
 function setFieldInputValue(inputId, value) {
   const input = document.getElementById(inputId);
   if (scatterOptions.includes(value)) input.value = value;
@@ -252,8 +338,9 @@ function addFilterRow(field = '', op = '>=', threshold = '') {
   div.querySelector('.removeFilterRow').addEventListener('click', () => { ac.destroy(); div.remove(); });
 }
 
-// 数据集（activeRows）变化后统一刷新下游视图：相关性 / 总览 / 散点图
+// 数据集（activeRows）变化后统一刷新下游视图：字段质量 / 相关性 / 总览 / 散点图
 function refreshAnalysisViews() {
+  renderFieldQuality();
   allCorrelations = computeCorrelations(activeRows);
   renderCorrTable();
   updateSummary();
@@ -628,6 +715,7 @@ document.getElementById('applyFilter').addEventListener('click', applyFilter);
 document.getElementById('copyFilterCAs').addEventListener('click', copyFilterCAs);
 document.getElementById('clearFilter').addEventListener('click', clearFilter);
 addFilterRow();
+document.getElementById('fieldQualityOnlyIssues').addEventListener('change', renderFieldQuality);
 
 // 折叠/展开：点击任意 .panel-header-row 切换其 data-target 对应的 .panel-body 显隐
 document.querySelectorAll('.panel-header-row[data-target]').forEach(header => {

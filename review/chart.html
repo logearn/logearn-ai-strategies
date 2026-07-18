@@ -455,6 +455,15 @@
           <tbody id="fieldQualityBody"></tbody>
         </table>
       </div>
+      <div id="arrayFieldQualityWrap" class="hidden" style="margin-top: 16px;">
+        <p class="hint" style="margin: 0 0 8px;"><strong>数组字段覆盖率</strong>（holders/kline_bars/各类 _list 事件数组）：这些字段不会出现在上面的相关性表里，需要在"自定义组装字段"面板用 <code>countWhere</code>/<code>avgField</code>/<code>sumField</code>/<code>giniCoefficient</code> 等聚合函数先转成标量才能分析，这里列出当前数据集里实际存在哪些数组字段，方便决定值得聚合哪个。</p>
+        <div class="table-scroll" style="max-height: 220px;">
+          <table class="desc-table">
+            <thead><tr><th>数组字段（row.arrays.xxx）</th><th>覆盖率</th><th class="num">平均长度</th></tr></thead>
+            <tbody id="arrayFieldQualityBody"></tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -574,6 +583,7 @@
     </div>
     <div class="panel-body" id="customFieldBody_">
       <p class="hint" style="margin: -6px 0 12px;">用 JS 代码自己组装新字段：<code>f</code> 是当前行全部扁平化字段（如 <code>f['pool_liquidity']</code>），<code>row</code> 是行元信息（<code>row.returnMax</code> / <code>row.returnCurrent</code> / <code>row.symbol</code> / <code>row.token_address</code>）。支持单表达式（如 <code>f['mcap'] / f['pool_liquidity']</code>）或带 <code>return</code> 的函数体。返回有限数值才会写入该行，返回 null/undefined/NaN 视为该行无值。后定义的字段可以引用先定义的自定义字段。定义保存在浏览器本地（localStorage），刷新不丢失。</p>
+      <p class="hint" style="margin: -6px 0 12px;"><strong>数组字段聚合</strong>（holders/kline_bars/各类 _list 事件数组）：<code>row.arrays</code> 存放原始数组（如 <code>row.arrays.holders</code>），配合内置聚合函数使用——<code>countWhere(arr, item =&gt; ...)</code> 按条件计数、<code>avgField(arr, 'field')</code>/<code>sumField(arr, 'field')</code>/<code>maxField</code>/<code>minField</code> 对某字段求均值/求和/最大/最小、<code>giniCoefficient(arr, 'field')</code> 算基尼系数（衡量分布集中度，0=平均 1=集中）。例：<code>giniCoefficient(row.arrays.holders, 'amount_percentage')</code>。</p>
       <div id="customFieldList"></div>
       <div class="row" style="margin-top: 10px;">
         <div class="control" style="flex: 1;">

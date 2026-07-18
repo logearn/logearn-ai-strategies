@@ -77,7 +77,11 @@ function num(x) {
 // 数值特征体系（out）只保留能解析成数字的值，纯分类字符串对相关性/回归毫无意义，不应该混进去。
 // 但这些分类字符串对"分组对比""分类字段分析"这类 Pro 功能是有价值的，所以单独收集到 catOut，
 // 与数值特征完全分开存放，不会污染 allNumericKeys/scatterOptions 等数值字段体系。
-function flattenObject(obj, prefix = '', catOut = null) {
+// arrOut（可选）：数组字段（holders/kline_bars/各类事件 _list 等）原本会被静默丢弃——单条数组元素对
+// "这个 token 好不好"没有直接意义，必须先聚合成标量才能进相关性/回归框架（design doc §20.0）。
+// 这里把原始数组按点号路径收集到 arrOut，供自定义字段公式里的 countWhere/avgField/sumField 等聚合函数使用，
+// 数组本身不参与 out（数值特征）体系。
+function flattenObject(obj, prefix = '', catOut = null, arrOut = null) {
   const out = {};
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return out;
   for (const k of Object.keys(obj)) {
@@ -93,14 +97,16 @@ function flattenObject(obj, prefix = '', catOut = null) {
       const n = num(v);
       if (n !== null) out[key] = pct ? n * 100 : n;
       else if (catOut && v.trim() !== '' && !looksLikeAddressString(v)) catOut[key] = v.trim();
-    } else if (typeof v === 'object' && !Array.isArray(v) && v !== null) {
-      Object.assign(out, flattenObject(v, key, catOut));
+    } else if (Array.isArray(v)) {
+      if (arrOut && v.length) arrOut[key] = v;
+    } else if (typeof v === 'object' && v !== null) {
+      Object.assign(out, flattenObject(v, key, catOut, arrOut));
     }
   }
   return out;
 }
 
-function flattenCtx(ctx, catOut = null) {
+function flattenCtx(ctx, catOut = null, arrOut = null) {
   const out = {};
   if (!ctx || typeof ctx !== 'object' || Array.isArray(ctx)) return out;
   for (const k of Object.keys(ctx)) {
@@ -111,8 +117,10 @@ function flattenCtx(ctx, catOut = null) {
     const v = ctx[k];
     if (isAddressLikeKey(k)) continue; // 地址类字段永远不参与数值特征展开
     // 对 ctx 下一级对象按原 key 作为前缀展开；标量直接保留原 key
-    if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
-      Object.assign(out, flattenObject(v, k, catOut));
+    if (Array.isArray(v)) {
+      if (arrOut && v.length) arrOut[k] = v; // 顶层数组字段（如 ctx.holders）
+    } else if (v !== null && typeof v === 'object') {
+      Object.assign(out, flattenObject(v, k, catOut, arrOut));
     } else if (typeof v === 'string') {
       const n = num(v);
       if (n !== null) out[k] = n;
@@ -177,8 +185,10 @@ function buildRows(calls, snapshots) {
     // 同时展开 snapshot.signal 和 snapshot.ctx；
     // ctx.logearn 与 signal 完全同源重复，flattenCtx 内部已跳过；ctx 下的 gmgn/kline_and_indicators 等仍保留 gmgn. / kline_and_indicators. 前缀
     const categorical = {};
-    const signalFeatures = flattenObject(s.signal || {}, '', categorical);
-    const ctxFeatures = flattenCtx(s.ctx || {}, categorical);
+    // 原始数组字段（holders/kline_bars/各类事件 _list 等）按点号路径收集，供自定义字段聚合函数使用（design doc §20.0）
+    const arrays = {};
+    const signalFeatures = flattenObject(s.signal || {}, '', categorical, arrays);
+    const ctxFeatures = flattenCtx(s.ctx || {}, categorical, arrays);
     const features = Object.assign({}, ctxFeatures, signalFeatures);
 
     // 优先使用 signal 里的 d1 买卖字段计算组装字段
@@ -238,7 +248,10 @@ function buildRows(calls, snapshots) {
       features,
       // 非数值分类字段（如 platform），供"分组对比""分类字段分析"等 Pro 功能使用；
       // 不参与 getFeature 数值体系（allNumericKeys/scatterOptions 不会包含这些 key）
-      categorical
+      categorical,
+      // 原始数组字段（如 holders/kline_bars/v_breakout_volume_list），供自定义字段公式里的
+      // countWhere/avgField/sumField/giniCoefficient 等聚合函数读取；不参与 getFeature 数值体系
+      arrays
     });
   }
   buildRows.lastSkippedByTimeDiff = skippedByTimeDiff;

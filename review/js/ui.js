@@ -269,6 +269,34 @@ async function runBootstrapCI() {
   renderCorrTable();
 }
 
+// 数组字段覆盖率（design doc §20.0）：holders/kline_bars/各类 _list 事件数组不会展开进数值特征体系，
+// 单独统计"哪些数组字段在当前数据集里非空覆盖率是多少、平均有几条元素"，方便用户决定值得花力气聚合哪个字段。
+function renderArrayFieldQuality() {
+  const wrap = document.getElementById('arrayFieldQualityWrap');
+  const tbody = document.getElementById('arrayFieldQualityBody');
+  if (!wrap || !tbody) return;
+  const arrayKeys = new Set();
+  activeRows.forEach(r => { if (r.arrays) Object.keys(r.arrays).forEach(k => arrayKeys.add(k)); });
+  if (!arrayKeys.size) { wrap.classList.add('hidden'); return; }
+  wrap.classList.remove('hidden');
+  const total = activeRows.length;
+  const rowsData = [...arrayKeys].map(k => {
+    let nonEmpty = 0, lenSum = 0;
+    for (const r of activeRows) {
+      const arr = r.arrays && r.arrays[k];
+      if (Array.isArray(arr) && arr.length) { nonEmpty++; lenSum += arr.length; }
+    }
+    return { field: k, coverage: nonEmpty / total, avgLen: nonEmpty ? lenSum / nonEmpty : 0 };
+  }).sort((a, b) => b.coverage - a.coverage);
+  tbody.innerHTML = rowsData.map(r => `
+    <tr>
+      <td class="ellip" title="row.arrays.${escapeHtml(r.field)}">${escapeHtml(r.field)}</td>
+      <td>${(r.coverage * 100).toFixed(1)}%</td>
+      <td class="num">${r.avgLen.toFixed(1)}</td>
+    </tr>
+  `).join('');
+}
+
 // 字段质量总览：遍历数值/分类字段，统计覆盖率（有值样本占比）和唯一值数量——
 // 覆盖率过低或字段是常量（唯一值数量=1）时，相关性/分组统计的结论都不可信，需要在看相关性表之前先暴露出来。
 // 基于 activeRows（过滤后数据集）而不是 matchedRows，保证用户调整过滤条件后这里的数字同步更新。
@@ -297,6 +325,8 @@ function renderFieldQuality() {
   const onlyIssues = document.getElementById('fieldQualityOnlyIssues').checked;
   if (onlyIssues) rowsData = rowsData.filter(r => r.flag !== 'normal');
   rowsData.sort((a, b) => a.coverage - b.coverage);
+
+  renderArrayFieldQuality();
 
   const badgeMap = { constant: '🔴 常量', low: '🟡 低覆盖', normal: '🟢 正常' };
   tbody.innerHTML = rowsData.map(r => {

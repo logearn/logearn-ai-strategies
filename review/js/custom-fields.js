@@ -6,6 +6,78 @@ const CUSTOM_FIELDS_STORAGE_KEY = 'chart_custom_fields';
 let customFields = []; // [{ name, code }]，按定义顺序计算，后面的可引用前面的
 const customFieldStats = new Map(); // name -> { ok, err, total, firstError, min, max }
 
+// 数组聚合函数（design doc §20.0）：holders/kline_bars/各类事件 _list 等数组字段单条元素没有直接分析意义，
+// 必须先聚合成标量才能进相关性/回归框架。这几个函数在自定义字段公式里通过 countWhere(arr, ...)/avgField(arr, field) 直接调用，
+// 第二个参数支持"字段名字符串"（取 item[field]）或"回调函数"（自定义取值/判断逻辑），覆盖大多数聚合场景。
+function resolveArrValue(item, field) {
+  if (item === null || item === undefined) return undefined;
+  return typeof field === 'function' ? field(item) : item[field];
+}
+function countWhere(arr, predicate) {
+  if (!Array.isArray(arr)) return null;
+  if (predicate === undefined) return arr.length;
+  let c = 0;
+  for (const item of arr) {
+    try {
+      const v = typeof predicate === 'function' ? predicate(item) : item === predicate;
+      if (v) c++;
+    } catch (e) { /* 单条元素取值出错，跳过不计入 */ }
+  }
+  return c;
+}
+function avgField(arr, field) {
+  if (!Array.isArray(arr) || !arr.length) return null;
+  let sum = 0, n = 0;
+  for (const item of arr) {
+    const v = Number(resolveArrValue(item, field));
+    if (Number.isFinite(v)) { sum += v; n++; }
+  }
+  return n ? sum / n : null;
+}
+function sumField(arr, field) {
+  if (!Array.isArray(arr)) return null;
+  let sum = 0;
+  for (const item of arr) {
+    const v = Number(resolveArrValue(item, field));
+    if (Number.isFinite(v)) sum += v;
+  }
+  return sum;
+}
+function maxField(arr, field) {
+  if (!Array.isArray(arr) || !arr.length) return null;
+  let m = -Infinity;
+  for (const item of arr) {
+    const v = Number(resolveArrValue(item, field));
+    if (Number.isFinite(v) && v > m) m = v;
+  }
+  return Number.isFinite(m) ? m : null;
+}
+function minField(arr, field) {
+  if (!Array.isArray(arr) || !arr.length) return null;
+  let m = Infinity;
+  for (const item of arr) {
+    const v = Number(resolveArrValue(item, field));
+    if (Number.isFinite(v) && v < m) m = v;
+  }
+  return Number.isFinite(m) ? m : null;
+}
+// 基尼系数：衡量数组某个数值字段的分布不平等程度，0=完全平均，1=完全集中（design doc §20.4，
+// 比如用在 holders 数组的 amount_percentage 上衡量持仓集中度，比单一的"前N大占比"更完整）
+function giniCoefficient(arr, field) {
+  if (!Array.isArray(arr)) return null;
+  const vals = arr.map(item => Number(resolveArrValue(item, field))).filter(Number.isFinite).sort((a, b) => a - b);
+  const n = vals.length;
+  if (n < 2) return null;
+  const sum = vals.reduce((a, b) => a + b, 0);
+  if (sum === 0) return 0;
+  let cumWeighted = 0;
+  for (let i = 0; i < n; i++) cumWeighted += (2 * (i + 1) - n - 1) * vals[i];
+  return cumWeighted / (n * sum);
+}
+// 自定义字段公式里可直接调用的聚合函数集合，编译/执行时作为额外参数注入 Function 作用域
+const AGGREGATE_FN_NAMES = ['countWhere', 'avgField', 'sumField', 'maxField', 'minField', 'giniCoefficient'];
+const AGGREGATE_FNS = [countWhere, avgField, sumField, maxField, minField, giniCoefficient];
+
 function loadCustomFields() {
   try {
     const raw = localStorage.getItem(CUSTOM_FIELDS_STORAGE_KEY);
@@ -20,9 +92,14 @@ function saveCustomFields() {
 }
 
 // 编译用户代码：没有 return 关键字时按单表达式处理，自动包一层 return (...)
+// 额外注入 countWhere/avgField/sumField/maxField/minField/giniCoefficient 六个聚合函数作为形参，
+// 公式里可以直接按函数名调用，比如 countWhere(row.arrays.holders, h => h.amount_percentage > 1)
 function compileCustomField(code) {
   const body = /\breturn\b/.test(code) ? code : `return (\n${code}\n);`;
-  return new Function('f', 'row', `"use strict";\n${body}`);
+  return new Function('f', 'row', ...AGGREGATE_FN_NAMES, `"use strict";\n${body}`);
+}
+function invokeCustomField(fn, features, meta) {
+  return fn(features, meta, ...AGGREGATE_FNS);
 }
 
 function customRowMeta(r) {
@@ -30,6 +107,8 @@ function customRowMeta(r) {
     id: r.id, symbol: r.symbol, token_address: r.tokenAddress, signalType: r.signalType,
     returnCurrent: r.returnCurrent, returnMax: r.returnMax,
     initialMcap: r.initialMcap, currentMcap: r.currentMcap, maxMcap: r.maxMcap,
+    // 原始数组字段（如 holders/kline_bars/v_breakout_volume_list），配合聚合函数使用（design doc §20.0）
+    arrays: r.arrays || {},
   };
 }
 
@@ -44,7 +123,7 @@ function applyCustomFields(rows) {
     if (fn) {
       for (const r of rows) {
         try {
-          const v = fn(r.features, customRowMeta(r));
+          const v = invokeCustomField(fn, r.features, customRowMeta(r));
           if (typeof v === 'number' && Number.isFinite(v)) {
             r.features[cf.name] = v;
             stat.ok++;
@@ -205,7 +284,7 @@ function testCustomFieldFromForm() {
   let errMsg = '';
   for (const r of rows.slice(0, 5)) {
     try {
-      const v = fn(r.features, customRowMeta(r));
+      const v = invokeCustomField(fn, r.features, customRowMeta(r));
       outputs.push(typeof v === 'number' && Number.isFinite(v) ? formatNumberSmart(v) : String(v));
     } catch (e) {
       outputs.push('<err>');

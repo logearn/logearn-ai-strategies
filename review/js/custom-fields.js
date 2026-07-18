@@ -230,12 +230,41 @@ function refreshAfterCustomFieldChange() {
   refreshAnalysisViews();
 }
 
+// 字段依赖分析（design doc §13.3）：扫描每个自定义字段的公式里引用到哪些其他自定义字段（通过 f['custom.xxx'] 读取方式扫描，
+// 和面板里现有的占位写法一致），维护一张 Map<被依赖的字段名, Set<依赖它的字段名>>，
+// 同时检测"引用了不存在的字段"（比如依赖的字段已经被删除但公式没同步改）。
+function extractFieldRefs(code) {
+  const refs = new Set();
+  const re = /f\[\s*['"]([^'"]+)['"]\s*\]/g;
+  let m;
+  while ((m = re.exec(code))) refs.add(m[1]);
+  return refs;
+}
+function computeCustomFieldDependencies() {
+  const dependents = new Map(); // 被依赖的字段名 -> Set(依赖它的字段名)
+  const brokenRefs = new Map(); // 字段名 -> Set(引用了但已不存在的 custom 字段名)
+  const namesSet = new Set(customFields.map(c => c.name));
+  for (const cf of customFields) dependents.set(cf.name, new Set());
+  for (const cf of customFields) {
+    for (const ref of extractFieldRefs(cf.code)) {
+      if (!ref.startsWith('custom.') || ref === cf.name) continue;
+      if (namesSet.has(ref)) dependents.get(ref).add(cf.name);
+      else {
+        if (!brokenRefs.has(cf.name)) brokenRefs.set(cf.name, new Set());
+        brokenRefs.get(cf.name).add(ref);
+      }
+    }
+  }
+  return { dependents, brokenRefs };
+}
+
 function renderCustomFieldList() {
   const box = document.getElementById('customFieldList');
   if (!customFields.length) {
     box.innerHTML = '<p class="hint" style="margin: 0;">还没有自定义字段。在下方填写字段名和 JS 代码后保存。</p>';
     return;
   }
+  const { dependents, brokenRefs } = computeCustomFieldDependencies();
   box.innerHTML = customFields.map((cf, i) => {
     const stat = customFieldStats.get(cf.name);
     let statHtml = '';
@@ -250,14 +279,21 @@ function renderCustomFieldList() {
     } else {
       statHtml = '<div class="cf-stat">尚未计算（点击"分析"后生效）</div>';
     }
+    const deps = dependents.get(cf.name);
+    const depBadge = deps && deps.size
+      ? ` <span class="cf-badge" title="${escapeHtml([...deps].join('\u3001'))}">🔗 被${deps.size}个字段依赖</span>` : '';
+    const broken = brokenRefs.get(cf.name);
+    const brokenHtml = broken && broken.size
+      ? `<div class="cf-stat err">⚠️ 引用了不存在的字段：${escapeHtml([...broken].join('\u3001'))}，计算结果将为空</div>` : '';
     return `<div class="cf-card">
       <div class="cf-head">
-        <span class="cf-name">${escapeHtml(cf.name)}</span>
+        <span class="cf-name">${escapeHtml(cf.name)}</span>${depBadge}
         <button type="button" class="secondary cf-edit" data-idx="${i}">编辑</button>
         <button type="button" class="secondary cf-del" data-idx="${i}">删除</button>
       </div>
       <div class="cf-code">${escapeHtml(cf.code)}</div>
       ${statHtml}
+      ${brokenHtml}
     </div>`;
   }).join('');
   box.querySelectorAll('.cf-edit').forEach(btn => btn.addEventListener('click', () => startEditCustomField(+btn.dataset.idx)));
@@ -289,7 +325,14 @@ function cancelEditCustomField() {
 function deleteCustomField(idx) {
   const cf = customFields[idx];
   if (!cf) return;
-  if (!confirm(`确定删除自定义字段 ${cf.name}？`)) return;
+  // 删除保护（design doc §13.3）：删除前先检测是否有其他字段依赖它，有的话明确警告具体会影响哪些字段，
+  // 而不是现在这种无声无息的"删了就删了"；不做级联自动删除，避免连锁误删
+  const { dependents } = computeCustomFieldDependencies();
+  const dependentNames = [...(dependents.get(cf.name) || [])];
+  const msg = dependentNames.length
+    ? `删除 ${cf.name} 后，依赖它的字段 ${dependentNames.join('\u3001')} 将无法正常计算（会显示为空），是否继续？`
+    : `确定删除自定义字段 ${cf.name}？`;
+  if (!confirm(msg)) return;
   customFields.splice(idx, 1);
   saveCustomFields();
   removeCustomFieldValues(cf.name);

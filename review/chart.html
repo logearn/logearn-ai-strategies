@@ -454,11 +454,20 @@
             <option value="99999">全部</option>
           </select>
         </div>
+        <div class="control" style="flex: 0; min-width: auto;">
+          <label for="corrCorrection">多重比较校正</label>
+          <select id="corrCorrection">
+            <option value="bh" selected>Benjamini-Hochberg FDR（推荐，较宽松）</option>
+            <option value="bonferroni">Bonferroni（更保守）</option>
+            <option value="none">不校正</option>
+          </select>
+        </div>
       </div>
+      <div id="corrCorrectionSummary" class="hint" style="margin: -4px 0 12px;"></div>
       <div class="table-scroll">
         <table>
           <thead>
-            <tr><th>目标</th><th>字段</th><th>中文含义</th><th>来源</th><th class="num">r</th><th class="num">n</th><th>操作</th></tr>
+            <tr><th>目标</th><th>字段</th><th>中文含义</th><th>来源</th><th class="num">r</th><th class="num">n</th><th class="num">p</th><th class="num">校正后 p</th><th>操作</th></tr>
           </thead>
           <tbody id="corrBody"></tbody>
         </table>

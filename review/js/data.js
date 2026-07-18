@@ -244,12 +244,14 @@ function computeCorrelations(rows) {
         }
       }
       if (pairs.length >= 5) {
+        const r = pearson(pairs);
         list.push({
           target: t.key,
           feature: fkey,
           source: isAssembledField(fkey) ? 'assembled' : 'original',
-          r: pearson(pairs),
-          n: pairs.length
+          r,
+          n: pairs.length,
+          p: pearsonPValue(r, pairs.length)
         });
       }
     }

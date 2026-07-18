@@ -34,22 +34,49 @@ function renderCorrTable() {
   const target = document.getElementById('corrTarget').value;
   const source = document.getElementById('corrSource').value;
   const top = Number(document.getElementById('topN').value);
-  let filtered = allCorrelations.filter(c => (target === 'all' || c.target === target) && (source === 'all' || c.source === source));
-  filtered = filtered.slice(0, top);
+  const correction = document.getElementById('corrCorrection').value;
+
+  // m 必须是当前 目标/来源 筛选下参与检验的全部字段数（不是 topN 截断后的数量），
+  // 否则会系统性低估需要校正的严重程度；corrSource/corrTarget 切换时 m 会跟着重新计算。
+  const fullSet = allCorrelations.filter(c => (target === 'all' || c.target === target) && (source === 'all' || c.source === source));
+  const rawPs = fullSet.map(c => c.p);
+  const adjustedPs = correction === 'bonferroni' ? bonferroniAdjust(rawPs)
+    : correction === 'none' ? rawPs
+    : benjaminiHochbergAdjust(rawPs);
+  fullSet.forEach((c, i) => { c._adjP = adjustedPs[i]; });
+
+  const rawSigCount = fullSet.filter(c => Number.isFinite(c.p) && c.p < 0.05).length;
+  const adjSigCount = fullSet.filter(c => Number.isFinite(c._adjP) && c._adjP < 0.05).length;
+  const summaryEl = document.getElementById('corrCorrectionSummary');
+  if (correction === 'none') {
+    summaryEl.textContent = `共 ${fullSet.length} 个字段参与检验，未校正时有 ${rawSigCount} 个字段 p<0.05。`;
+  } else {
+    const methodName = correction === 'bonferroni' ? 'Bonferroni' : 'BH-FDR';
+    summaryEl.textContent = `共 ${fullSet.length} 个字段参与检验，未校正时有 ${rawSigCount} 个字段 p<0.05，${methodName} 校正后仅剩 ${adjSigCount} 个仍然显著。`;
+  }
+
+  const filtered = fullSet.slice(0, top);
   const tbody = document.getElementById('corrBody');
-  tbody.innerHTML = filtered.map(c => `
-    <tr>
+  tbody.innerHTML = filtered.map(c => {
+    // 曾经 p<0.05、校正后不再显著的行：用浅灰+删除线区分，而不是直接从表格里消失——
+    // 让用户看到"曾经以为显著、其实经不起多重比较校验"的字段，这本身就是重要信息
+    const wasDemoted = correction !== 'none' && Number.isFinite(c.p) && c.p < 0.05 && !(Number.isFinite(c._adjP) && c._adjP < 0.05);
+    const rowStyle = wasDemoted ? ' style="color: var(--text-muted); text-decoration: line-through;"' : '';
+    return `
+    <tr${rowStyle}>
       <td>${escapeHtml(c.target)}</td>
       <td>${escapeHtml(c.feature)}</td>
       <td class="ellip" title="${escapeHtml(getFieldDesc(c.feature))}">${escapeHtml(getFieldDesc(c.feature)) || '暂无备注'}</td>
       <td><span class="tag ${c.source}">${c.source === 'assembled' ? '组装' : '原始'}</span></td>
       <td class="num">${c.r.toFixed(4)}</td>
       <td class="num">${c.n}</td>
+      <td class="num">${Number.isFinite(c.p) ? c.p.toFixed(4) : '-'}</td>
+      <td class="num">${Number.isFinite(c._adjP) ? c._adjP.toFixed(4) : '-'}</td>
       <td>
         <button class="setX" data-feature="${escapeHtml(c.feature)}" data-target="${escapeHtml(c.target)}">设 X,Y</button>
       </td>
-    </tr>
-  `).join('');
+    </tr>`;
+  }).join('');
   tbody.querySelectorAll('button.setX').forEach(btn => {
     btn.addEventListener('click', () => {
       const feature = btn.dataset.feature;
@@ -709,6 +736,7 @@ document.getElementById('searchCaInput').addEventListener('input', () => {
 document.getElementById('corrTarget').addEventListener('change', renderCorrTable);
 document.getElementById('corrSource').addEventListener('change', renderCorrTable);
 document.getElementById('topN').addEventListener('change', renderCorrTable);
+document.getElementById('corrCorrection').addEventListener('change', renderCorrTable);
 document.getElementById('downloadCsvBtn').addEventListener('click', downloadCsv);
 document.getElementById('addFilterRow').addEventListener('click', () => addFilterRow());
 document.getElementById('applyFilter').addEventListener('click', applyFilter);

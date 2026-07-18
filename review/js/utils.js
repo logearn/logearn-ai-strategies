@@ -143,3 +143,27 @@ function pearsonPValue(r, n) {
   const zscore = z / se;
   return 2 * (1 - normalCdf(Math.abs(zscore)));
 }
+
+// 多重比较校正：同时检验 m 个假设时，单个 p<0.05 的"显著性"含义会被稀释——
+// 纯靠运气也会有约 5% 的字段显示 p<0.05，需要校正后才能判断"真正显著"的字段数量。
+// Bonferroni：最简单但偏保守，等价于把显著性阈值除以 m。
+function bonferroniAdjust(pValues) {
+  const m = pValues.length;
+  return pValues.map(p => Number.isFinite(p) ? Math.min(1, p * m) : NaN);
+}
+
+// BH-FDR（Benjamini-Hochberg）：比 Bonferroni 宽松，是行业推荐默认值——
+// 把 p 值升序排列，adjusted_p(i) = min_{j>=i} { p(j) * m / j }（从最大 j 往回取累计最小值），
+// 与 R 语言 p.adjust(method="BH") 结果一致，不需要引入统计库。
+function benjaminiHochbergAdjust(pValues) {
+  const idx = pValues.map((_, i) => i).filter(i => Number.isFinite(pValues[i])).sort((a, b) => pValues[a] - pValues[b]);
+  const adjusted = pValues.map(() => NaN);
+  let runningMin = 1;
+  for (let rank = idx.length; rank >= 1; rank--) {
+    const i = idx[rank - 1];
+    const val = Math.min(1, pValues[i] * idx.length / rank);
+    runningMin = Math.min(runningMin, val);
+    adjusted[i] = runningMin;
+  }
+  return adjusted;
+}

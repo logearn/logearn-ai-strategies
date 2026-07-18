@@ -417,11 +417,19 @@
           <div class="control" style="flex: 0; min-width: auto;">
             <button id="analyzeBtn">分析</button>
           </div>
+          <div class="control hidden" id="appendWrap" style="flex: 0; min-width: auto;">
+            <button id="appendDataBtn" class="secondary" title="把上面选中的新文件合并进当前工作集，而不是整体替换">追加数据</button>
+          </div>
           <div class="control hidden" id="downloadWrap" style="flex: 0; min-width: auto;">
             <button id="downloadCsvBtn" class="secondary">下载 CSV</button>
           </div>
         </div>
-        <div class="hint" id="fileHint">请选择 calls 和 snapshots 两个 JSON 文件，页面会在浏览器里完成匹配、计算收益和相关性。</div>
+        <div class="row hidden" id="appendOptionsRow">
+          <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;">
+            <input type="checkbox" id="appendKeepFirst"> 重复记录（同 token_address + swap_begin_time）保留先导入的版本（默认保留新导入的版本）
+          </label>
+        </div>
+        <div class="hint" id="fileHint">请选择 calls 和 snapshots 两个 JSON 文件，页面会在浏览器里完成匹配、计算收益和相关性。分析完成后可以在上面重新选择另一批文件，点"追加数据"合并进当前工作集（而不是整体替换），按 token_address+swap_begin_time 自动去重。</div>
       </div>
     </div>
 

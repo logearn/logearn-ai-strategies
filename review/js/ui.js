@@ -844,6 +844,41 @@ function downloadCsv() {
   URL.revokeObjectURL(a.href);
 }
 
+// 将 matchedRows 定型后的公共收尾工作（重新计算候选字段列表/展开面板/刷新下游视图），
+// 被 analyze()（整体替换）和 appendData()（追加合并，§14.1）共享，避免两处都写一份容易漏同步。
+function finalizeMatchedRows() {
+  activeRows = matchedRows;
+  applyCustomFields(matchedRows);
+  allNumericKeys = [...new Set([...matchedRows.flatMap(r => Object.keys(r.features)), ...DERIVED_KEYS, ...customFields.map(c => c.name)])].sort();
+
+  const catValueSets = new Map();
+  for (const r of matchedRows) {
+    if (!r.categorical) continue;
+    for (const [k, v] of Object.entries(r.categorical)) {
+      if (!catValueSets.has(k)) catValueSets.set(k, new Set());
+      catValueSets.get(k).add(v);
+    }
+  }
+  allCategoricalKeys = [...catValueSets.entries()]
+    .filter(([, set]) => set.size >= 2 && set.size <= 50)
+    .map(([k]) => k)
+    .sort();
+
+  document.getElementById('filterPanel').classList.remove('hidden');
+  document.getElementById('summaryPanel').classList.remove('hidden');
+  document.getElementById('corrPanel').classList.remove('hidden');
+  document.getElementById('customFieldPanel').classList.remove('hidden');
+  document.getElementById('scatterPanel').classList.remove('hidden');
+  document.getElementById('proPanel').classList.remove('hidden');
+  document.getElementById('downloadWrap').classList.remove('hidden');
+  document.getElementById('appendWrap').classList.remove('hidden');
+  document.getElementById('appendOptionsRow').classList.remove('hidden');
+
+  updateScatterSelects();
+  renderCustomFieldList();
+  refreshAnalysisViews();
+}
+
 async function analyze() {
   const callsFile = document.getElementById('callsFile').files[0];
   const snapsFile = document.getElementById('snapsFile').files[0];
@@ -865,40 +900,8 @@ async function analyze() {
       alert('未匹配到有效样本，请检查两个 JSON 是否对应。' + (skipped ? `（另有 ${skipped} 条因 call 与最近快照时间差超过阈值被跳过）` : ''));
       return;
     }
-    activeRows = matchedRows;
-    // 先计算用户自定义组装字段，让它们和内置字段一样进入候选列表/相关性/图表
-    applyCustomFields(matchedRows);
-    // 组装字段（DERIVED_KEYS + 自定义字段）始终加入候选列表，即使当前数据集里没有任何一行真正算出该值
-    // （比如分母恰好都是 0/字段缺失），也不应该从联想框里"消失"，否则用户会误以为字段没加成功
-    allNumericKeys = [...new Set([...matchedRows.flatMap(r => Object.keys(r.features)), ...DERIVED_KEYS, ...customFields.map(c => c.name)])].sort();
-
-    // 分类字段：只保留在当前数据集中"看起来像分类"的字段（去重值数量 2~50 之间）——
-    // 去重值 1 个说明是常量没有分组意义，去重值过多（比如误把接近唯一的字符串当分类字段）会让下拉列表和分组表格失去可读性
-    const catValueSets = new Map();
-    for (const r of matchedRows) {
-      if (!r.categorical) continue;
-      for (const [k, v] of Object.entries(r.categorical)) {
-        if (!catValueSets.has(k)) catValueSets.set(k, new Set());
-        catValueSets.get(k).add(v);
-      }
-    }
-    allCategoricalKeys = [...catValueSets.entries()]
-      .filter(([, set]) => set.size >= 2 && set.size <= 50)
-      .map(([k]) => k)
-      .sort();
-
-    document.getElementById('filterPanel').classList.remove('hidden');
-    document.getElementById('summaryPanel').classList.remove('hidden');
-    document.getElementById('corrPanel').classList.remove('hidden');
-    document.getElementById('customFieldPanel').classList.remove('hidden');
-    document.getElementById('scatterPanel').classList.remove('hidden');
-    document.getElementById('proPanel').classList.remove('hidden');
-    document.getElementById('downloadWrap').classList.remove('hidden');
+    finalizeMatchedRows();
     document.getElementById('fileHint').textContent = `已分析完成：匹配 ${matchedRows.length} 条样本。` + (skipped ? ` 另有 ${skipped} 条因 call 与最近快照时间差超过 ${MAX_SNAPSHOT_MATCH_DIFF_SECONDS} 秒被跳过（未纳入分析）。` : '');
-
-    updateScatterSelects();
-    renderCustomFieldList();
-    refreshAnalysisViews();
   } catch (err) {
     alert('解析失败：' + err.message);
     console.error(err);
@@ -907,7 +910,50 @@ async function analyze() {
   }
 }
 
+// 追加数据（design doc §14.1）：把新选择的 calls/snapshots 合并进当前 matchedRows，而不是整体替换。
+// 按 token_address + swap_begin_time（与 buildRows 里的 callKey 同样的 key）去重，默认保留后导入的版本（因为
+// 后导入的通常是更新的数据），勾选"保留先导入的版本"时反过来。
+async function appendData() {
+  const callsFile = document.getElementById('callsFile').files[0];
+  const snapsFile = document.getElementById('snapsFile').files[0];
+  if (!callsFile || !snapsFile) { alert('请在上方重新选择要追加的 calls 和 snapshots JSON 文件'); return; }
+  if (!matchedRows.length) { alert('请先点击"分析"加载初始数据，再用这个按钮追加后续批次'); return; }
+  const btn = document.getElementById('appendDataBtn');
+  const keepFirst = document.getElementById('appendKeepFirst').checked;
+  btn.disabled = true; btn.textContent = '追加中...';
+  try {
+    const [calls, snapshots] = await Promise.all([readJson(callsFile), readJson(snapsFile)]);
+    const newRows = await buildRows(calls, snapshots, (done, total) => {
+      btn.textContent = `追加中... ${done}/${total}`;
+    });
+    if (!newRows.length) { alert('新文件里未匹配到有效样本，未发生合并'); return; }
+
+    const keyOf = r => `${r.tokenAddress || ''}_${r.swapBeginTime || ''}`;
+    const existingByKey = new Map(matchedRows.map(r => [keyOf(r), r]));
+    let addedCount = 0, overwrittenCount = 0;
+    for (const nr of newRows) {
+      const k = keyOf(nr);
+      if (existingByKey.has(k)) {
+        if (!keepFirst) existingByKey.set(k, nr); // 默认用新导入的覆盖，勾选保留先导入则不替换
+        overwrittenCount++;
+      } else {
+        existingByKey.set(k, nr);
+        addedCount++;
+      }
+    }
+    matchedRows = [...existingByKey.values()];
+    finalizeMatchedRows();
+    document.getElementById('fileHint').textContent = `追加完成：新增 ${addedCount} 条，去重重复 ${overwrittenCount} 条（${keepFirst ? '已保留先导入的版本' : '已用新导入的版本覆盖'}），当前工作集共 ${matchedRows.length} 条。`;
+  } catch (err) {
+    alert('追加失败：' + err.message);
+    console.error(err);
+  } finally {
+    btn.disabled = false; btn.textContent = '追加数据';
+  }
+}
+
 document.getElementById('analyzeBtn').addEventListener('click', analyze);
+document.getElementById('appendDataBtn').addEventListener('click', appendData);
 document.getElementById('plotBtn').addEventListener('click', plotFromButton);
 document.getElementById('globalSwapBtn').addEventListener('click', e => {
   defaultSwapped = !defaultSwapped;

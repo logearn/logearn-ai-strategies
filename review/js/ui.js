@@ -324,6 +324,13 @@ function renderFieldQuality() {
 
   const onlyIssues = document.getElementById('fieldQualityOnlyIssues').checked;
   if (onlyIssues) rowsData = rowsData.filter(r => r.flag !== 'normal');
+  const searchTerm = (document.getElementById('fieldQualitySearch').value || '').trim().toLowerCase();
+  if (searchTerm) {
+    rowsData = rowsData.filter(r => {
+      const desc = (getFieldDesc(r.field) || '').toLowerCase();
+      return r.field.toLowerCase().includes(searchTerm) || desc.includes(searchTerm);
+    });
+  }
   rowsData.sort((a, b) => a.coverage - b.coverage);
 
   renderArrayFieldQuality();
@@ -1201,6 +1208,7 @@ loadFilterPresets();
 renderFilterPresetOptions();
 addFilterRow();
 document.getElementById('fieldQualityOnlyIssues').addEventListener('change', renderFieldQuality);
+document.getElementById('fieldQualitySearch').addEventListener('input', renderFieldQuality);
 
 // 折叠/展开：点击任意 .panel-header-row 切换其 data-target 对应的 .panel-body 显隐
 document.querySelectorAll('.panel-header-row[data-target]').forEach(header => {

@@ -595,9 +595,16 @@
     </div>
     <div class="panel-body" id="fieldQualityBody_">
       <p class="hint" style="margin: -6px 0 12px;">覆盖率过低（&lt;50%）或字段是常量（所有样本取值都一样）时，相关性/分组统计的结论都不可信——建议先看这里再看下面的相关性表。默认按覆盖率升序排列，最先暴露问题字段。</p>
-      <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer; margin-bottom:10px;">
-        <input type="checkbox" id="fieldQualityOnlyIssues"> 只看有问题的字段（覆盖率 &lt; 50% 或为常量）
-      </label>
+      <div class="row" style="margin-bottom: 10px; align-items: center;">
+        <div class="control" style="flex: 0 0 auto; min-width: 220px;">
+          <input type="text" id="fieldQualitySearch" placeholder="🔍 搜索字段名或中文含义..." autocomplete="off">
+        </div>
+        <div class="control checkbox-control" style="flex: 0 0 auto; min-width: auto;">
+          <label>
+            <input type="checkbox" id="fieldQualityOnlyIssues"> 只看有问题的字段（覆盖率 &lt; 50% 或为常量）
+          </label>
+        </div>
+      </div>
       <div class="table-scroll" style="max-height: 360px;">
         <table class="desc-table">
           <thead>

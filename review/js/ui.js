@@ -1205,6 +1205,96 @@ document.getElementById('compareSnapshotsBtn').addEventListener('click', compare
 loadAnalysisSnapshots();
 renderSnapshotList();
 
+// ========== 完整数据集保存 / 切换（design doc §14.2） ==========
+// 和上面的"分析结果快照"（§10.1）是同一套存储体系的两种粒度：那边存摘要，这里存完整 matchedRows（含自定义字段结果）。
+// 索引（标签/时间/样本数/体积）单独存一个 key，完整数据分开存到各自的 key，删除/列表时不需要读入全部数据体积，
+// 只有真正"切换到该数据集"时才反序列化对应的那一份。
+const DATASET_INDEX_STORAGE_KEY = 'chart_datasets_index';
+const DATASET_DATA_KEY_PREFIX = 'chart_dataset_data_';
+const DATASET_SIZE_LIMIT_BYTES = 4 * 1024 * 1024; // 留出余量，不用满 5MB 上限，避免刚好卡在临界值报错
+let datasetIndex = [];
+
+function loadDatasetIndex() {
+  try {
+    const raw = localStorage.getItem(DATASET_INDEX_STORAGE_KEY);
+    datasetIndex = raw ? JSON.parse(raw) || [] : [];
+  } catch (e) { datasetIndex = []; }
+}
+function saveDatasetIndex() {
+  try { localStorage.setItem(DATASET_INDEX_STORAGE_KEY, JSON.stringify(datasetIndex)); } catch (e) {}
+}
+
+function saveCurrentDataset() {
+  if (!matchedRows.length) { alert('请先点击"分析"加载数据'); return; }
+  const hintEl = document.getElementById('datasetStatusHint');
+  const label = document.getElementById('datasetLabelInput').value.trim() || `数据集 ${datasetIndex.length + 1}`;
+  const serialized = JSON.stringify(matchedRows);
+  const sizeBytes = new Blob([serialized]).size;
+  if (sizeBytes > DATASET_SIZE_LIMIT_BYTES) {
+    hintEl.textContent = `⚠️ 数据集过大（约 ${(sizeBytes / 1024 / 1024).toFixed(1)}MB）无法完整保存，建议只保存分析结果摘要（见上方"保存当前快照"，更轻量）。`;
+    return;
+  }
+  const id = Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  try {
+    localStorage.setItem(DATASET_DATA_KEY_PREFIX + id, serialized);
+  } catch (e) {
+    hintEl.textContent = `⚠️ 保存失败（可能是浏览器存储空间已满）：${e.message}`;
+    return;
+  }
+  datasetIndex.push({ id, label, savedAt: new Date().toISOString(), n: matchedRows.length, sizeBytes });
+  saveDatasetIndex();
+  document.getElementById('datasetLabelInput').value = '';
+  hintEl.textContent = `✅ 已保存「${label}」（${matchedRows.length} 条，约 ${(sizeBytes / 1024).toFixed(0)}KB）`;
+  renderDatasetList();
+}
+
+function switchToDataset(id) {
+  const meta = datasetIndex.find(d => d.id === id);
+  if (!meta) return;
+  if (matchedRows.length && !confirm(`切换到「${meta.label}」将替换当前工作集（当前未保存的过滤/自定义字段状态不会丢失，自定义字段定义本身独立存储），是否继续？`)) return;
+  const raw = localStorage.getItem(DATASET_DATA_KEY_PREFIX + id);
+  if (!raw) { alert('未找到该数据集的完整数据（可能已被清除），仅保留了列表记录'); return; }
+  try {
+    matchedRows = JSON.parse(raw);
+  } catch (e) { alert('数据集解析失败：' + e.message); return; }
+  finalizeMatchedRows();
+  document.getElementById('fileHint').textContent = `已切换到数据集「${meta.label}」：${matchedRows.length} 条。`;
+}
+
+function deleteDataset(id) {
+  if (!confirm('确定删除这个数据集？')) return;
+  datasetIndex = datasetIndex.filter(d => d.id !== id);
+  saveDatasetIndex();
+  try { localStorage.removeItem(DATASET_DATA_KEY_PREFIX + id); } catch (e) {}
+  renderDatasetList();
+}
+
+function renderDatasetList() {
+  const tbody = document.getElementById('datasetListBody');
+  if (!datasetIndex.length) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted);">还没有保存的数据集</td></tr>';
+    return;
+  }
+  tbody.innerHTML = datasetIndex.slice().reverse().map(d => `
+    <tr>
+      <td>${escapeHtml(d.label)}</td>
+      <td>${new Date(d.savedAt).toLocaleString()}</td>
+      <td class="num">${d.n}</td>
+      <td class="num">${(d.sizeBytes / 1024).toFixed(0)}KB</td>
+      <td>
+        <button type="button" class="secondary dataset-switch" data-id="${d.id}">切换到该数据集</button>
+        <button type="button" class="secondary dataset-del" data-id="${d.id}">删除</button>
+      </td>
+    </tr>
+  `).join('');
+  tbody.querySelectorAll('.dataset-switch').forEach(btn => btn.addEventListener('click', () => switchToDataset(btn.dataset.id)));
+  tbody.querySelectorAll('.dataset-del').forEach(btn => btn.addEventListener('click', () => deleteDataset(btn.dataset.id)));
+}
+
+document.getElementById('saveDatasetBtn').addEventListener('click', saveCurrentDataset);
+loadDatasetIndex();
+renderDatasetList();
+
 // ========== 一键生成分析报告（design doc §10.3） ==========
 // 只负责拼接各面板已经算好的数据（不重新计算），图表部分用 Plotly.toImage 导出成 base64 图片；
 // 报告结构：过滤条件说明 → 总览统计 → 数据质量摘要 → Top相关性表 → 关键图表 → 结论区（留空给用户手动补充）。

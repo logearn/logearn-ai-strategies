@@ -395,6 +395,26 @@
           </table>
         </div>
       </div>
+
+      <hr style="border-color: var(--border-subtle); margin: 20px 0;">
+      <h4 style="margin: 0 0 6px;">完整数据集保存 / 切换（§14.2）</h4>
+      <p class="hint" style="margin: 0 0 12px;">和上面的"分析结果快照"是同一套存储体系的两种粒度：上面存的是轻量摘要（过滤条件+统计+相关性Top N），这里存的是<b>完整工作集</b>（含自定义字段计算结果），用于"昨天的100条 vs 今天的100条"整体切换着看。体积较大，受浏览器 localStorage 单key约5MB限制。</p>
+      <div class="row" style="gap: 8px; align-items: center;">
+        <div class="control" style="flex: 1;">
+          <label for="datasetLabelInput">数据集名称</label>
+          <input type="text" id="datasetLabelInput" placeholder="如 昨天的数据">
+        </div>
+        <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
+          <button type="button" id="saveDatasetBtn">保存当前完整数据集</button>
+        </div>
+      </div>
+      <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
+        <table class="desc-table">
+          <thead><tr><th>数据集名称</th><th>保存时间</th><th class="num">样本数</th><th class="num">体积</th><th>操作</th></tr></thead>
+          <tbody id="datasetListBody"></tbody>
+        </table>
+      </div>
+      <div class="hint" id="datasetStatusHint" style="margin: 8px 0 0;"></div>
     </div>
   </div>
 

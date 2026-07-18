@@ -419,6 +419,49 @@ function parseBreakpoints(text) {
   return text.split(',').map(s => parseFloat(s.trim())).filter(Number.isFinite).sort((a, b) => a - b);
 }
 
+// 最优分箱阈值推荐（design doc §8.2）：简化版单变量决策树分裂思路——按分位数取候选分裂点，
+// 每个候选点把样本分两组，用现有的简化 ANOVA F 统计量（第5点分类对比已实现）衡量两组目标字段
+// 均值的区分度，选出差异最大的几个分裂点，贪心去重避免选出彼此过近、没有额外信息量的点。
+function recommendBreakpoints(field, targetField) {
+  const pairs = [];
+  for (const r of activeRows) {
+    const x = getFeature(r, field);
+    const y = getFeature(r, targetField);
+    if (isFiniteNumber(x) && isFiniteNumber(y)) pairs.push([Number(x), Number(y)]);
+  }
+  if (pairs.length < 10) return { error: '有效样本不足（<10），无法推荐断点' };
+  const sortedX = pairs.map(p => p[0]).sort((a, b) => a - b);
+  if (new Set(sortedX).size < 4) return { error: '该字段取值种类较少，建议直接手动设置断点' };
+
+  // 候选分裂点：按 5%~95% 分位数取 19 个候选（避开首尾，避免产生空分组）
+  const candidates = new Set();
+  for (let p = 5; p <= 95; p += 5) {
+    const idx = Math.floor((p / 100) * (sortedX.length - 1));
+    candidates.add(sortedX[idx]);
+  }
+  const scored = [];
+  for (const c of candidates) {
+    const groupA = [], groupB = [];
+    for (const [x, y] of pairs) (x <= c ? groupA : groupB).push(y);
+    if (groupA.length < 3 || groupB.length < 3) continue;
+    const { F } = anovaFTest([groupA, groupB]);
+    if (Number.isFinite(F)) scored.push({ c, score: F });
+  }
+  if (!scored.length) return { error: '未找到有效的候选分裂点，建议直接手动设置断点' };
+  scored.sort((a, b) => b.score - a.score);
+
+  // 贪心挑选区分度最高的最多 4 个分裂点，要求彼此间距 >= 数据整体范围的 5%，避免挑出挤在一起的重复点
+  const range = sortedX[sortedX.length - 1] - sortedX[0];
+  const minGap = range * 0.05;
+  const picked = [];
+  for (const s of scored) {
+    if (picked.length >= 4) break;
+    if (picked.every(p => Math.abs(p - s.c) >= minGap)) picked.push(s.c);
+  }
+  picked.sort((a, b) => a - b);
+  return { breakpoints: picked };
+}
+
 function binLabel(lo, hi) {
   if (lo === -Infinity) return `<${hi}`;
   if (hi === Infinity) return `>=${lo}`;

@@ -714,6 +714,21 @@
         <button id="genBinBarBtn">生成分箱柱状图</button>
       </div>
     </div>
+    <div class="row">
+      <div class="control" style="flex: 0; min-width: 140px;">
+        <label for="binRecommendTarget">推荐依据目标</label>
+        <select id="binRecommendTarget">
+          <option value="returnCurrent">returnCurrent</option>
+          <option value="returnMax">returnMax</option>
+        </select>
+      </div>
+      <div class="control" style="flex: 0; min-width: auto;">
+        <button type="button" id="binRecommendBtn" class="secondary">自动推荐断点</button>
+      </div>
+      <div class="control" style="flex: 1;">
+        <span class="hint" id="binRecommendHint" style="margin: 0;">基于当前数值字段与目标收益的区分度自动计算</span>
+      </div>
+    </div>
     <div id="binBarChart" style="width: 100%; height: 420px;"></div>
     <div class="table-scroll" style="margin-top: 10px; max-height: 240px;">
       <table class="desc-table">

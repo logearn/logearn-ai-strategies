@@ -922,6 +922,17 @@ document.getElementById('yField').addEventListener('input', updateCurrentFieldDe
 document.getElementById('yField').addEventListener('change', () => { if (matchedRows.length) plot(); });
 document.getElementById('colorField').addEventListener('change', () => { if (matchedRows.length) plot(); });
 document.getElementById('genBinBarBtn').addEventListener('click', renderBinBarChart);
+document.getElementById('binRecommendBtn').addEventListener('click', () => {
+  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  const field = document.getElementById('binField').value.trim();
+  const hintEl = document.getElementById('binRecommendHint');
+  if (!field) { hintEl.textContent = '请先填写分箱字段'; return; }
+  const target = document.getElementById('binRecommendTarget').value;
+  const result = recommendBreakpoints(field, target);
+  if (result.error) { hintEl.textContent = '⚠️ ' + result.error; return; }
+  document.getElementById('binBreakpoints').value = result.breakpoints.map(v => formatNumberSmart(v)).join(',');
+  hintEl.textContent = `基于当前数值字段与 ${target} 的区分度自动计算（已回填到断点输入框，可直接使用或手动微调）`;
+});
 initBatchTagInput();
 initBatchXImport();
 initCustomFieldPanel();

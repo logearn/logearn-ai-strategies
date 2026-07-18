@@ -104,6 +104,10 @@ function flattenCtx(ctx, catOut = null) {
   const out = {};
   if (!ctx || typeof ctx !== 'object' || Array.isArray(ctx)) return out;
   for (const k of Object.keys(ctx)) {
+    // ctx.logearn 与 signal 是同一份数据的两份拷贝：用真实快照数据核实过 65/65 条记录、121 个字段全部逐一相同。
+    // signal 已经在 buildRows 里用空前缀展开过一遍，这里如果再展开 ctx.logearn 会让每个字段都以
+    // "logearn.xxx" 的名字重复出现一次，相关性表/矩阵里会把同一个信号误判成两个独立字段，直接跳过。
+    if (k === 'logearn') continue;
     const v = ctx[k];
     if (isAddressLikeKey(k)) continue; // 地址类字段永远不参与数值特征展开
     // 对 ctx 下一级对象按原 key 作为前缀展开；标量直接保留原 key
@@ -171,7 +175,7 @@ function buildRows(calls, snapshots) {
     const returnMax = mx / init;
 
     // 同时展开 snapshot.signal 和 snapshot.ctx；
-    // ctx 下的 logearn/gmgn/kline_and_indicators 等会保留 logearn. / gmgn. / kline_and_indicators. 前缀
+    // ctx.logearn 与 signal 完全同源重复，flattenCtx 内部已跳过；ctx 下的 gmgn/kline_and_indicators 等仍保留 gmgn. / kline_and_indicators. 前缀
     const categorical = {};
     const signalFeatures = flattenObject(s.signal || {}, '', categorical);
     const ctxFeatures = flattenCtx(s.ctx || {}, categorical);
@@ -209,20 +213,15 @@ function buildRows(calls, snapshots) {
     // 筹码净压力指标：正数=上方套牢盘更多抛压大，负数=下方支撑更强（design doc §20.5）
     if (fin(chipAbove) && fin(chipBelow)) features['chip_analysis.pressure_net'] = chipAbove - chipBelow;
 
-    // 冗余字段合并（design doc §20.1/§20.3）：以下几组字段在实际数据里数值完全相同（同一个数的多份拷贝），
-    // 全部保留会让相关性矩阵/表格把同一个信号当成好几个独立信号重复计入，只保留一个规范字段名。
+    // 冗余字段合并（design doc §20.1，已用真实快照数据核实：65 条样本里 mcap/fdv/current_mcap 100% 完全相同）。
+    // 注意：gmgn.dev.top_10_holder_rate 与 gmgn.stat.top_10_holder_rate 经核实【不是】冗余字段
+    // （65 条样本里 12 条数值不同，应为不同口径的独立统计），不做合并。
     if (features['mcap'] === undefined) {
       if (features['current_mcap'] !== undefined) features['mcap'] = features['current_mcap'];
       else if (features['fdv'] !== undefined) features['mcap'] = features['fdv'];
     }
     delete features['current_mcap'];
     delete features['fdv'];
-    if (features['gmgn.dev.top_10_holder_rate'] !== undefined) {
-      if (features['gmgn.stat.top_10_holder_rate'] === undefined) {
-        features['gmgn.stat.top_10_holder_rate'] = features['gmgn.dev.top_10_holder_rate'];
-      }
-      delete features['gmgn.dev.top_10_holder_rate'];
-    }
 
     rows.push({
       id: c.id,

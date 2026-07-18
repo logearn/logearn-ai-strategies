@@ -468,6 +468,15 @@ async function importCustomFieldsFromFile(file) {
   alert(`导入完成：新增 ${importCount} 个，覆盖 ${overwriteCount} 个，重命名导入 ${renameCount} 个，跳过 ${skipCount} 个。`);
 }
 
+// 代码模板/示例库（design doc §13.4）：面对空白公式输入框，新用户不知道能写什么，
+// 用几个覆盖最常见组合模式的模板降低"从0开始想公式"这一步的门槛，占位字段名（字段A/字段B）
+// 不是合法字段，提交前的字段名校验会自然拦下并提示用户替换，不需要额外设计校验逻辑。
+const CUSTOM_FIELD_TEMPLATES = {
+  ratio: { code: "safeDiv(f['字段A'], f['字段B'])", hint: '比率类，例如"买卖比"：把字段A、字段B换成实际字段名（如 buy_wcoin_amount_d1 / sell_wcoin_amount_d1）' },
+  pct: { code: "pct(f['字段A'], f['字段A'] + f['字段B'])", hint: '占比类，例如"买方占比 = 买入金额/(买入+卖出金额)"：把字段A、字段B换成实际字段名' },
+  zscore: { code: "zscore(f['字段A'], '字段A')", hint: '归一化类，例如"把市值标准化后再比较不同量级的token"：两处字段A都要换成同一个实际字段名（如 mcap）' },
+};
+
 function initCustomFieldPanel() {
   loadCustomFields();
   renderCustomFieldList();
@@ -481,5 +490,13 @@ function initCustomFieldPanel() {
     const file = importFileInput.files[0];
     if (file) importCustomFieldsFromFile(file);
     importFileInput.value = '';
+  });
+  document.querySelectorAll('.cf-template-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tpl = CUSTOM_FIELD_TEMPLATES[btn.dataset.template];
+      if (!tpl) return;
+      document.getElementById('customFieldCode').value = tpl.code;
+      document.getElementById('cfTemplateHint').textContent = tpl.hint;
+    });
   });
 }

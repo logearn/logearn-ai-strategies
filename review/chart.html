@@ -599,6 +599,13 @@
           <input type="text" id="customFieldName" placeholder="例如 holder_per_liq" autocomplete="off">
         </div>
       </div>
+      <div class="row" style="margin-top: 8px; gap: 8px; align-items: center; flex-wrap: wrap;">
+        <span class="hint" style="margin: 0;">示例模板：</span>
+        <button type="button" class="secondary cf-template-btn" data-template="ratio">比率类</button>
+        <button type="button" class="secondary cf-template-btn" data-template="pct">占比类</button>
+        <button type="button" class="secondary cf-template-btn" data-template="zscore">归一化类</button>
+        <span class="hint" id="cfTemplateHint" style="margin: 0;"></span>
+      </div>
       <div class="row" style="margin-top: 8px;">
         <div class="control" style="flex: 1 1 100%;">
           <label for="customFieldCode">JS 代码</label>

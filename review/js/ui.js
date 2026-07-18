@@ -4,6 +4,7 @@
 let matchedRows = [];
 let activeRows = []; // 全局过滤后的工作集，无过滤时与 matchedRows 一致；相关性/散点图/总览/分箱图均基于它
 let allNumericKeys = [];
+let allCategoricalKeys = []; // 非数值分类字段（如 platform），供过滤面板和 Pro 版分组/分类分析使用
 let allCorrelations = [];
 let scatterOptions = [];
 let colorOptions = [];
@@ -199,7 +200,7 @@ function updateFilterOptions() {
   const dl = document.getElementById('filterFieldList');
   if (!dl) return;
   dl.innerHTML = '';
-  const allFields = [...ROW_LEVEL_FIELDS, ...scatterOptions];
+  const allFields = [...ROW_LEVEL_FIELDS, ...scatterOptions, ...allCategoricalKeys];
   for (const f of allFields) {
     const o = document.createElement('option');
     o.value = f;
@@ -209,7 +210,7 @@ function updateFilterOptions() {
 }
 
 function isFilterableField(field) {
-  return ROW_LEVEL_FIELDS.includes(field) || scatterOptions.includes(field);
+  return ROW_LEVEL_FIELDS.includes(field) || scatterOptions.includes(field) || allCategoricalKeys.includes(field);
 }
 
 function addFilterRow(field = '', op = '>=', threshold = '') {
@@ -529,6 +530,21 @@ async function analyze() {
     // 组装字段（DERIVED_KEYS + 自定义字段）始终加入候选列表，即使当前数据集里没有任何一行真正算出该值
     // （比如分母恰好都是 0/字段缺失），也不应该从联想框里"消失"，否则用户会误以为字段没加成功
     allNumericKeys = [...new Set([...matchedRows.flatMap(r => Object.keys(r.features)), ...DERIVED_KEYS, ...customFields.map(c => c.name)])].sort();
+
+    // 分类字段：只保留在当前数据集中"看起来像分类"的字段（去重值数量 2~50 之间）——
+    // 去重值 1 个说明是常量没有分组意义，去重值过多（比如误把接近唯一的字符串当分类字段）会让下拉列表和分组表格失去可读性
+    const catValueSets = new Map();
+    for (const r of matchedRows) {
+      if (!r.categorical) continue;
+      for (const [k, v] of Object.entries(r.categorical)) {
+        if (!catValueSets.has(k)) catValueSets.set(k, new Set());
+        catValueSets.get(k).add(v);
+      }
+    }
+    allCategoricalKeys = [...catValueSets.entries()]
+      .filter(([, set]) => set.size >= 2 && set.size <= 50)
+      .map(([k]) => k)
+      .sort();
 
     document.getElementById('filterPanel').classList.remove('hidden');
     document.getElementById('summaryPanel').classList.remove('hidden');

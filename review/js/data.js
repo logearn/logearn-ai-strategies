@@ -69,14 +69,18 @@ function num(x) {
   return Number.isFinite(n) ? n : null;
 }
 
-function flattenObject(obj, prefix = '') {
+// catOut（可选）：非数值、非空的字符串字段（比如 platform: "pump.fun"）原本会被直接丢弃——
+// 数值特征体系（out）只保留能解析成数字的值，纯分类字符串对相关性/回归毫无意义，不应该混进去。
+// 但这些分类字符串对"分组对比""分类字段分析"这类 Pro 功能是有价值的，所以单独收集到 catOut，
+// 与数值特征完全分开存放，不会污染 allNumericKeys/scatterOptions 等数值字段体系。
+function flattenObject(obj, prefix = '', catOut = null) {
   const out = {};
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return out;
   for (const k of Object.keys(obj)) {
     const v = obj[k];
     const key = prefix ? `${prefix}.${k}` : k;
     const pct = PERCENT_FRACTION_FIELDS.has(key);
-    if (isAddressLikeKey(key)) continue; // 地址类字段永远不参与数值特征展开
+    if (isAddressLikeKey(key)) continue; // 地址类字段永远不参与数值特征展开，也不当分类字段（值太发散，没有分组意义）
     if (v !== null && typeof v === 'number' && Number.isFinite(v)) {
       out[key] = pct ? v * 100 : v;
     } else if (typeof v === 'boolean') {
@@ -84,14 +88,15 @@ function flattenObject(obj, prefix = '') {
     } else if (typeof v === 'string') {
       const n = num(v);
       if (n !== null) out[key] = pct ? n * 100 : n;
+      else if (catOut && v.trim() !== '' && !looksLikeAddressString(v)) catOut[key] = v.trim();
     } else if (typeof v === 'object' && !Array.isArray(v) && v !== null) {
-      Object.assign(out, flattenObject(v, key));
+      Object.assign(out, flattenObject(v, key, catOut));
     }
   }
   return out;
 }
 
-function flattenCtx(ctx) {
+function flattenCtx(ctx, catOut = null) {
   const out = {};
   if (!ctx || typeof ctx !== 'object' || Array.isArray(ctx)) return out;
   for (const k of Object.keys(ctx)) {
@@ -99,7 +104,11 @@ function flattenCtx(ctx) {
     if (isAddressLikeKey(k)) continue; // 地址类字段永远不参与数值特征展开
     // 对 ctx 下一级对象按原 key 作为前缀展开；标量直接保留原 key
     if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
-      Object.assign(out, flattenObject(v, k));
+      Object.assign(out, flattenObject(v, k, catOut));
+    } else if (typeof v === 'string') {
+      const n = num(v);
+      if (n !== null) out[k] = n;
+      else if (catOut && v.trim() !== '' && !looksLikeAddressString(v)) catOut[k] = v.trim();
     } else {
       const n = typeof v === 'boolean' ? (v ? 1 : 0) : num(v);
       if (n !== null) out[k] = n;
@@ -159,8 +168,9 @@ function buildRows(calls, snapshots) {
 
     // 同时展开 snapshot.signal 和 snapshot.ctx；
     // ctx 下的 logearn/gmgn/kline_and_indicators 等会保留 logearn. / gmgn. / kline_and_indicators. 前缀
-    const signalFeatures = flattenObject(s.signal || {});
-    const ctxFeatures = flattenCtx(s.ctx || {});
+    const categorical = {};
+    const signalFeatures = flattenObject(s.signal || {}, '', categorical);
+    const ctxFeatures = flattenCtx(s.ctx || {}, categorical);
     const features = Object.assign({}, ctxFeatures, signalFeatures);
 
     // 优先使用 signal 里的 d1 买卖字段计算组装字段
@@ -201,7 +211,10 @@ function buildRows(calls, snapshots) {
       maxMcap: mx,
       returnCurrent,
       returnMax,
-      features
+      features,
+      // 非数值分类字段（如 platform），供"分组对比""分类字段分析"等 Pro 功能使用；
+      // 不参与 getFeature 数值体系（allNumericKeys/scatterOptions 不会包含这些 key）
+      categorical
     });
   }
   buildRows.lastSkippedByTimeDiff = skippedByTimeDiff;
@@ -254,7 +267,8 @@ function getFeature(row, field) {
   if (field === 'returnMax') return row.returnMax;
   if (field === 'token_address') return row.tokenAddress;
   if (ROW_LEVEL_FIELDS.includes(field)) return row[field];
-  return row.features[field];
+  if (row.features[field] !== undefined) return row.features[field];
+  return row.categorical ? row.categorical[field] : undefined;
 }
 
 function isNumericColumn(col) {

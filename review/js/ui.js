@@ -33,6 +33,18 @@ function updateSummary() {
   `;
 }
 
+// 相关性表里勾选的行（key 为 `${target}|${feature}`），跨搜索过滤/排序持久保留，
+// 方便先按不同关键词搜几轮、勾选好几批字段，最后一次性"加入散点图 X 轴"。
+let corrSelectedRows = new Set();
+
+function updateCorrSendToScatterBtn() {
+  const btn = document.getElementById('corrSendToScatterBtn');
+  const countEl = document.getElementById('corrSelectedCount');
+  if (!btn || !countEl) return;
+  countEl.textContent = corrSelectedRows.size;
+  btn.disabled = corrSelectedRows.size === 0;
+}
+
 function renderCorrTable() {
   const target = document.getElementById('corrTarget').value;
   const source = document.getElementById('corrSource').value;
@@ -40,6 +52,11 @@ function renderCorrTable() {
   const correction = document.getElementById('corrCorrection').value;
   const sortBy = document.getElementById('corrSortBy').value;
   const oosEnabled = document.getElementById('oosEnabled').checked;
+  const minAbsR = parseFloat(document.getElementById('corrFilterMinAbsR').value);
+  const minN = parseFloat(document.getElementById('corrFilterMinN').value);
+  const maxP = parseFloat(document.getElementById('corrFilterMaxP').value);
+  const maxAdjP = parseFloat(document.getElementById('corrFilterMaxAdjP').value);
+  const ciExcludesZero = document.getElementById('corrFilterCiExcludesZero').checked;
 
   // m 必须是当前 目标/来源 筛选下参与检验的全部字段数（不是 topN 截断后的数量），
   // 否则会系统性低估需要校正的严重程度；corrSource/corrTarget 切换时 m 会跟着重新计算。
@@ -89,11 +106,28 @@ function renderCorrTable() {
     oosWarnEl.classList.add('hidden');
   }
 
-  document.querySelector('#corrTableHead tr').innerHTML = '<th>目标</th><th>字段</th><th>中文含义</th><th>来源</th><th class="num">r</th>'
+  document.querySelector('#corrTableHead tr').innerHTML = '<th><input type="checkbox" id="corrSelectAll" title="全选当前过滤后的字段"></th><th>目标</th><th>字段</th><th>中文含义</th><th>来源</th><th class="num">r</th>'
     + (oosEnabled ? '<th class="num">训练集 r</th><th class="num">测试集 r</th>' : '')
     + '<th class="num">Spearman ρ</th><th class="num">|Δ|</th><th class="num">n</th><th class="num">p</th><th class="num">校正后 p</th><th>r 的 95% CI</th><th>操作</th>';
 
-  const filtered = fullSet.slice(0, top);
+  // 数值阈值过滤只影响表格展示范围（在 topN 截断之前过滤，避免"排名靠后但确实合格"的字段被 Top N 挡住），
+  // 不影响多重比较校正的 m（m 必须基于完整候选集，否则会系统性低估校正严重程度）。
+  // 典型用法：先点"计算置信区间"，再用这些阈值把不合格的字段筛掉，剩下的批量勾选加入散点图。
+  let threshFilteredSet = fullSet;
+  if (Number.isFinite(minAbsR) || Number.isFinite(minN) || Number.isFinite(maxP) || Number.isFinite(maxAdjP) || ciExcludesZero) {
+    threshFilteredSet = fullSet.filter(c => {
+      if (Number.isFinite(minAbsR) && !(Math.abs(c.r) >= minAbsR)) return false;
+      if (Number.isFinite(minN) && !(c.n >= minN)) return false;
+      if (Number.isFinite(maxP) && !(Number.isFinite(c.p) && c.p <= maxP)) return false;
+      if (Number.isFinite(maxAdjP) && !(Number.isFinite(c._adjP) && c._adjP <= maxAdjP)) return false;
+      if (ciExcludesZero) {
+        const ci = bootstrapCIMap.get(`${c.target}|${c.feature}`);
+        if (!ci || !Number.isFinite(ci.lo) || !Number.isFinite(ci.hi) || (ci.lo < 0 && ci.hi > 0)) return false;
+      }
+      return true;
+    });
+  }
+  const filtered = threshFilteredSet.slice(0, top);
   const tbody = document.getElementById('corrBody');
   tbody.innerHTML = filtered.map(c => {
     // 曾经 p<0.05、校正后不再显著的行：用浅灰+删除线区分，而不是直接从表格里消失——
@@ -124,8 +158,11 @@ function renderCorrTable() {
         : (smallN ? '样本量过小，置信区间估计本身可信度有限，仅供参考' : '');
       ciCell = `<td${style}${title ? ` title="${escapeHtml(title)}"` : ''}>${Number.isFinite(ci.lo) && Number.isFinite(ci.hi) ? `[${ci.lo.toFixed(2)}, ${ci.hi.toFixed(2)}]` : '-'}${crossesZero ? ' ⚠️' : ''}${smallN ? ' 🔸' : ''}</td>`;
     }
+    const rowKey = `${c.target}|${c.feature}`;
+    const checked = corrSelectedRows.has(rowKey) ? ' checked' : '';
     return `
     <tr${rowStyle}>
+      <td><input type="checkbox" class="corr-row-select" data-key="${escapeHtml(rowKey)}" data-feature="${escapeHtml(c.feature)}"${checked}></td>
       <td>${escapeHtml(c.target)}</td>
       <td>${escapeHtml(c.feature)}</td>
       <td class="ellip" title="${escapeHtml(getFieldDesc(c.feature))}">${escapeHtml(getFieldDesc(c.feature)) || '暂无备注'}</td>
@@ -143,6 +180,23 @@ function renderCorrTable() {
       </td>
     </tr>`;
   }).join('');
+  tbody.querySelectorAll('input.corr-row-select').forEach(cb => {
+    cb.addEventListener('change', () => {
+      if (cb.checked) corrSelectedRows.add(cb.dataset.key);
+      else corrSelectedRows.delete(cb.dataset.key);
+      updateCorrSendToScatterBtn();
+    });
+  });
+  const selectAllCb = document.getElementById('corrSelectAll');
+  if (selectAllCb) {
+    selectAllCb.checked = filtered.length > 0 && filtered.every(c => corrSelectedRows.has(`${c.target}|${c.feature}`));
+    selectAllCb.addEventListener('change', () => {
+      if (selectAllCb.checked) filtered.forEach(c => corrSelectedRows.add(`${c.target}|${c.feature}`));
+      else filtered.forEach(c => corrSelectedRows.delete(`${c.target}|${c.feature}`));
+      renderCorrTable();
+    });
+  }
+  updateCorrSendToScatterBtn();
   tbody.querySelectorAll('button.setX').forEach(btn => {
     btn.addEventListener('click', () => {
       const feature = btn.dataset.feature;
@@ -1188,6 +1242,22 @@ document.getElementById('corrSource').addEventListener('change', renderCorrTable
 document.getElementById('topN').addEventListener('change', renderCorrTable);
 document.getElementById('corrCorrection').addEventListener('change', renderCorrTable);
 document.getElementById('corrSortBy').addEventListener('change', renderCorrTable);
+document.getElementById('corrFilterMinAbsR').addEventListener('input', renderCorrTable);
+document.getElementById('corrFilterMinN').addEventListener('input', renderCorrTable);
+document.getElementById('corrFilterMaxP').addEventListener('input', renderCorrTable);
+document.getElementById('corrFilterMaxAdjP').addEventListener('input', renderCorrTable);
+document.getElementById('corrFilterCiExcludesZero').addEventListener('change', renderCorrTable);
+document.getElementById('corrSendToScatterBtn').addEventListener('click', () => {
+  const features = [...new Set([...corrSelectedRows].map(k => k.split('|')[1]))].filter(f => scatterOptions.includes(f));
+  const added = addFieldsToX(features);
+  corrSelectedRows.clear();
+  renderCorrTable();
+  const scatterPanel = document.getElementById('scatterPanel');
+  const scatterBody = document.getElementById('scatterBody_');
+  if (scatterBody) scatterBody.classList.remove('hidden');
+  if (scatterPanel) scatterPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  alert(`已把 ${features.length} 个字段加入散点图 X 轴（新增 ${added}，其余之前已在列表中）`);
+});
 document.getElementById('distTargetField').addEventListener('change', renderDistribution);
 document.getElementById('distLogX').addEventListener('change', renderDistribution);
 document.getElementById('distBinCount').addEventListener('change', renderDistribution);

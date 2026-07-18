@@ -335,7 +335,45 @@
       <h1>收益与快照字段关系分析</h1>
       <div class="app-subtitle">上传 calls / snapshots JSON，在浏览器本地完成匹配、收益计算、相关性分析与筛选</div>
     </div>
+    <button type="button" id="snapshotToggleBtn" class="secondary" title="保存/对比分析快照">📷 快照</button>
     <button type="button" id="themeToggleBtn" class="secondary theme-toggle-btn" title="切换深色/浅色主题">🌙 深色</button>
+  </div>
+
+  <div class="panel hidden" id="snapshotPanel">
+    <div class="panel-header-row" data-target="snapshotBody_">
+      <h3>分析快照保存 / 对比</h3>
+      <button type="button" class="collapse-toggle">▾</button>
+    </div>
+    <div class="panel-body" id="snapshotBody_">
+      <p class="hint" style="margin: -6px 0 12px;">保存当前的过滤条件 + 总览统计 + 相关性 Top 结果（不含原始数据，避免存储爆炸），方便"这批新数据跑完之后，相关性和上一批比是变强了还是变弱了"这类跨批次对比。</p>
+      <div class="row" style="gap: 8px; align-items: center;">
+        <div class="control" style="flex: 1;">
+          <label for="snapshotLabelInput">备注名</label>
+          <input type="text" id="snapshotLabelInput" placeholder="如 7月第一批数据">
+        </div>
+        <div class="control" style="flex: 0; min-width: auto; display:flex; align-items:flex-end;">
+          <button type="button" id="saveSnapshotBtn">保存当前快照</button>
+        </div>
+      </div>
+      <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
+        <table class="desc-table">
+          <thead><tr><th>选择</th><th>备注名</th><th>保存时间</th><th class="num">样本数</th><th>操作</th></tr></thead>
+          <tbody id="snapshotListBody"></tbody>
+        </table>
+      </div>
+      <div class="row" style="margin-top: 10px; gap: 8px; align-items: center;">
+        <button type="button" id="compareSnapshotsBtn" class="secondary">对比选中的 2 份快照</button>
+        <span class="hint" id="snapshotCompareHint" style="margin: 0;">勾选恰好 2 份快照后点击对比</span>
+      </div>
+      <div id="snapshotCompareWrap" class="hidden" style="margin-top: 10px;">
+        <div class="table-scroll" style="max-height: 320px;">
+          <table class="desc-table">
+            <thead><tr><th>字段</th><th class="num">快照A的r</th><th class="num">快照B的r</th><th class="num">变化量</th></tr></thead>
+            <tbody id="snapshotCompareBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="panel stacked">

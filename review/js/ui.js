@@ -1024,3 +1024,137 @@ document.getElementById('themeToggleBtn').addEventListener('click', () => {
   applyTheme(isLightTheme() ? 'dark' : 'light');
 });
 updateThemeToggleBtn();
+
+// ========== 分析快照保存 / 对比（design doc §10.1） ==========
+// 存的是"分析结果摘要"（过滤条件 + 总览统计 + 相关性 Top N），不是全量原始数据，避免存储爆炸；
+// 用于跨批次对比"这批新数据跑完之后，相关性和上一批比是变强了还是变弱了"。
+const ANALYSIS_SNAPSHOTS_STORAGE_KEY = 'chart_analysis_snapshots';
+let analysisSnapshots = [];
+const SNAPSHOT_TOP_N = 30; // 每个 target 存 Top N 个相关性结果，覆盖对比时的常见关注范围，避免整份存储过大
+
+function loadAnalysisSnapshots() {
+  try {
+    const raw = localStorage.getItem(ANALYSIS_SNAPSHOTS_STORAGE_KEY);
+    if (raw) analysisSnapshots = JSON.parse(raw) || [];
+  } catch (e) { analysisSnapshots = []; }
+}
+function saveAnalysisSnapshotsToStorage() {
+  try { localStorage.setItem(ANALYSIS_SNAPSHOTS_STORAGE_KEY, JSON.stringify(analysisSnapshots)); } catch (e) {}
+}
+
+// 把当前 #filterRows 里的有效条件行序列化成一句人类可读的描述，跟保存的快照一起存，方便事后回顾"当时用的过滤条件是什么"
+function describeCurrentFilter() {
+  const parts = [];
+  document.querySelectorAll('#filterRows .filter-row').forEach(row => {
+    const field = row.querySelector('.filter-field').value.trim();
+    const op = row.querySelector('.filter-op').value;
+    const threshold = row.querySelector('.filter-threshold').value.trim();
+    if (field && threshold !== '') parts.push(`${field} ${op} ${threshold}`);
+  });
+  return parts.length ? parts.join(' AND ') : '（无过滤条件，全量数据）';
+}
+
+function saveCurrentSnapshot() {
+  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  const label = document.getElementById('snapshotLabelInput').value.trim() || `快照 ${analysisSnapshots.length + 1}`;
+  const cur = activeRows.map(r => r.returnCurrent);
+  const mx = activeRows.map(r => r.returnMax);
+  const cs = calcStats(cur, 1);
+  const ms = calcStats(mx, 1);
+  const topByTarget = target => allCorrelations
+    .filter(c => c.target === target)
+    .slice()
+    .sort((a, b) => Math.abs(b.r) - Math.abs(a.r))
+    .slice(0, SNAPSHOT_TOP_N)
+    .map(c => ({ feature: c.feature, r: c.r, n: c.n }));
+  const snapshot = {
+    id: Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+    label,
+    savedAt: new Date().toISOString(),
+    n: activeRows.length,
+    filterDesc: describeCurrentFilter(),
+    summary: { meanCurrent: cs.mean, winRate: cs.winRate, meanMax: ms.mean, maxMax: ms.max },
+    topCorr: { returnCurrent: topByTarget('returnCurrent'), returnMax: topByTarget('returnMax') },
+  };
+  analysisSnapshots.push(snapshot);
+  saveAnalysisSnapshotsToStorage();
+  document.getElementById('snapshotLabelInput').value = '';
+  renderSnapshotList();
+}
+
+function deleteSnapshot(id) {
+  if (!confirm('确定删除这份快照？')) return;
+  analysisSnapshots = analysisSnapshots.filter(s => s.id !== id);
+  saveAnalysisSnapshotsToStorage();
+  renderSnapshotList();
+}
+
+function renderSnapshotList() {
+  const tbody = document.getElementById('snapshotListBody');
+  if (!analysisSnapshots.length) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted);">还没有保存的快照</td></tr>';
+    return;
+  }
+  tbody.innerHTML = analysisSnapshots.slice().reverse().map(s => `
+    <tr>
+      <td><input type="checkbox" class="snapshot-checkbox" data-id="${s.id}"></td>
+      <td>${escapeHtml(s.label)}</td>
+      <td>${new Date(s.savedAt).toLocaleString()}</td>
+      <td class="num">${s.n}</td>
+      <td><button type="button" class="secondary snapshot-del" data-id="${s.id}">删除</button></td>
+    </tr>
+  `).join('');
+  tbody.querySelectorAll('.snapshot-del').forEach(btn => btn.addEventListener('click', () => deleteSnapshot(btn.dataset.id)));
+  tbody.querySelectorAll('.snapshot-checkbox').forEach(cb => cb.addEventListener('change', () => {
+    // 限制最多勾选 2 份：勾选第 3 个时自动取消最早勾选的那个，避免用户困惑"为什么勾不上"
+    const checked = [...tbody.querySelectorAll('.snapshot-checkbox:checked')];
+    if (checked.length > 2) checked[0].checked = false;
+  }));
+}
+
+function compareSelectedSnapshots() {
+  const hintEl = document.getElementById('snapshotCompareHint');
+  const wrap = document.getElementById('snapshotCompareWrap');
+  const checked = [...document.querySelectorAll('.snapshot-checkbox:checked')].map(cb => cb.dataset.id);
+  if (checked.length !== 2) { hintEl.textContent = '请勾选恰好 2 份快照后再对比'; wrap.classList.add('hidden'); return; }
+  const [a, b] = checked.map(id => analysisSnapshots.find(s => s.id === id));
+  if (!a || !b) return;
+  hintEl.textContent = `对比：「${a.label}」(${a.n}条, ${a.filterDesc}) vs 「${b.label}」(${b.n}条, ${b.filterDesc})`;
+  wrap.classList.remove('hidden');
+
+  // 两份快照可能是不同 target（returnCurrent/returnMax）或字段结构不完全一致（比如数据结构升级新增字段），
+  // 用 Map 按字段名对齐，缺失的一侧显示"该快照中不存在此字段"而不是报错或留空造成误解
+  const mapA = new Map(), mapB = new Map();
+  ['returnCurrent', 'returnMax'].forEach(t => {
+    (a.topCorr[t] || []).forEach(c => mapA.set(`${t}|${c.feature}`, c.r));
+    (b.topCorr[t] || []).forEach(c => mapB.set(`${t}|${c.feature}`, c.r));
+  });
+  const allKeys = new Set([...mapA.keys(), ...mapB.keys()]);
+  const rows = [...allKeys].map(key => {
+    const [target, feature] = key.split('|');
+    const rA = mapA.has(key) ? mapA.get(key) : null;
+    const rB = mapB.has(key) ? mapB.get(key) : null;
+    const delta = (rA !== null && rB !== null) ? Math.abs(rA - rB) : NaN;
+    return { target, feature, rA, rB, delta };
+  });
+  rows.sort((x, y) => (Number.isFinite(y.delta) ? y.delta : -1) - (Number.isFinite(x.delta) ? x.delta : -1));
+
+  document.getElementById('snapshotCompareBody').innerHTML = rows.map(r => {
+    const highlight = Number.isFinite(r.delta) && r.delta >= 0.15;
+    return `
+    <tr${highlight ? ' style="background: rgba(255,159,10,0.12);"' : ''}>
+      <td>${escapeHtml(r.feature)} <span style="color:var(--text-muted)">(${escapeHtml(r.target)})</span></td>
+      <td class="num">${r.rA !== null ? r.rA.toFixed(4) : '<span style="color:var(--text-muted)">该快照中不存在此字段</span>'}</td>
+      <td class="num">${r.rB !== null ? r.rB.toFixed(4) : '<span style="color:var(--text-muted)">该快照中不存在此字段</span>'}</td>
+      <td class="num">${Number.isFinite(r.delta) ? r.delta.toFixed(4) : '-'}</td>
+    </tr>`;
+  }).join('');
+}
+
+document.getElementById('snapshotToggleBtn').addEventListener('click', () => {
+  document.getElementById('snapshotPanel').classList.toggle('hidden');
+});
+document.getElementById('saveSnapshotBtn').addEventListener('click', saveCurrentSnapshot);
+document.getElementById('compareSnapshotsBtn').addEventListener('click', compareSelectedSnapshots);
+loadAnalysisSnapshots();
+renderSnapshotList();

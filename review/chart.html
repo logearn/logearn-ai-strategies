@@ -255,6 +255,11 @@
       color: var(--text-muted); font-size: 13px; min-height: 120px;
     }
     div[id$="Chart"]:empty::before { content: '点击上方按钮生成图表后在此显示'; }
+    .field-chip-btn {
+      padding: 4px 10px; font-size: 11.5px;
+      font-family: "SF Mono", "SFMono-Regular", Consolas, monospace;
+    }
+    #fieldBrowserOriginal, #fieldBrowserAssembled { align-content: flex-start; }
     .tag-input:focus-within { border-color: var(--accent); box-shadow: 0 0 0 4px rgba(10,132,255,.25); }
     .tag-input input, .tag-input input:focus, .tag-input input:hover {
       flex: 1; min-width: 200px; background: transparent; border: none; box-shadow: none;
@@ -786,6 +791,7 @@
         <datalist id="xFieldList"></datalist>
         <div style="margin-top: 8px;">
           <button type="button" id="batchXImportToggle" class="secondary">📋 粘贴 JSON 片段快速添加</button>
+          <button type="button" id="fieldBrowserToggle" class="secondary">📚 按分组浏览字段</button>
           <button type="button" id="batchXClearBtn" class="secondary">🗑 一键清空 X</button>
           <div id="batchXImportPanel" class="hidden" style="margin-top: 8px;">
             <p class="hint" style="margin: 0 0 6px;">粘贴任意包含字段的 JSON/对象片段（严格 JSON "key": 、单引号 'key': 、不带引号的 key: 都支持；行内 // 注释、末尾逗号、外层不闭合、甚至只贴一两行 key: value 都可以），会自动提取里面的 key，按名称匹配到当前数据里已存在的字段（无需带 gmgn.stat. 等前缀），一次性加入 X 列表。</p>
@@ -795,6 +801,25 @@
             <div class="row" style="margin-top: 6px; gap: 8px; align-items: center;">
               <button type="button" id="batchXImportBtn">解析并添加到 X</button>
               <span id="batchXImportResult" class="hint"></span>
+            </div>
+          </div>
+          <div id="fieldBrowserPanel" class="hidden" style="margin-top: 8px;">
+            <p class="hint" style="margin: 0 0 6px;">点击字段名直接加入 X（和上面输入联想选中效果一样），按"原字段"/"组装字段"分组浏览，不用一个个打字联想。</p>
+            <div class="row" style="align-items: flex-start;">
+              <div class="control" style="min-width: 260px;">
+                <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                  <span>原字段（数据里可直接统计的字段）<span id="fieldBrowserOriginalCount" class="hint" style="margin:0;"></span></span>
+                  <button type="button" id="fieldBrowserAddAllOriginal" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                </label>
+                <div id="fieldBrowserOriginal" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
+              </div>
+              <div class="control" style="min-width: 260px;">
+                <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                  <span>组装字段（比率/差值等衍生字段 + 自定义字段）<span id="fieldBrowserAssembledCount" class="hint" style="margin:0;"></span></span>
+                  <button type="button" id="fieldBrowserAddAllAssembled" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                </label>
+                <div id="fieldBrowserAssembled" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
+              </div>
             </div>
           </div>
         </div>

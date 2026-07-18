@@ -779,6 +779,9 @@ function renderBatchTags() {
     chip.appendChild(btn);
     box.insertBefore(chip, input);
   }
+  // 若"按分组浏览字段"面板正打开，同步刷新其 ✓ 已选中标记，避免和标签列表状态不一致
+  const browserPanel = document.getElementById('fieldBrowserPanel');
+  if (browserPanel && !browserPanel.classList.contains('hidden')) renderFieldBrowser();
 }
 
 function tryAddBatchField() {
@@ -847,6 +850,50 @@ function initBatchXImport() {
         ambiguous.map(a => `${a.key}（${a.candidates.join(' / ')}）`).join('；');
     }
     resultEl.textContent = msg;
+  });
+}
+
+// 按分组浏览字段：把当前可选的 X 字段（scatterOptions）分成"原字段"（数据里本来就有、可直接统计的字段）
+// 和"组装字段"（DERIVED_KEYS 里的比率/差值等衍生字段 + 用户自定义字段），点击直接加入 X，
+// 不用像自动补全那样一个字一个字打拼音/英文去联想。
+// 保存最近一次分组结果，供"+ 全部加入X"按钮直接读取，不用重新计算一遍
+let fieldBrowserGroups = { original: [], assembled: [] };
+
+function addFieldsToX(fields) {
+  if (!fields.length) return;
+  if (fields.length > 20 && !confirm(`即将一次性加入 ${fields.length} 个字段到 X，会生成 ${fields.length} 张独立散点图，可能比较慢，是否继续？`)) return;
+  let added = 0;
+  for (const f of fields) {
+    if (!batchXSelected.includes(f)) { batchXSelected.push(f); added++; }
+  }
+  renderBatchTags();
+  if (matchedRows.length) plot();
+  return added;
+}
+
+function renderFieldBrowser() {
+  const originalBox = document.getElementById('fieldBrowserOriginal');
+  const assembledBox = document.getElementById('fieldBrowserAssembled');
+  if (!originalBox || !assembledBox) return;
+  const original = [], assembled = [];
+  for (const f of scatterOptions) (isAssembledField(f) ? assembled : original).push(f);
+  original.sort();
+  assembled.sort();
+  fieldBrowserGroups = { original, assembled };
+  document.getElementById('fieldBrowserOriginalCount').textContent = `（${original.length}）`;
+  document.getElementById('fieldBrowserAssembledCount').textContent = `（${assembled.length}）`;
+
+  const renderChips = fields => fields.map(f => {
+    const selected = batchXSelected.includes(f);
+    return `<button type="button" class="secondary field-chip-btn${selected ? ' active' : ''}" data-field="${escapeHtml(f)}" title="${escapeHtml(getFieldDesc(f) || '')}">${escapeHtml(f)}${selected ? ' ✓' : ''}</button>`;
+  }).join('');
+  originalBox.innerHTML = renderChips(original) || '<span class="hint" style="margin:0;">暂无</span>';
+  assembledBox.innerHTML = renderChips(assembled) || '<span class="hint" style="margin:0;">暂无</span>';
+
+  [originalBox, assembledBox].forEach(box => {
+    box.querySelectorAll('.field-chip-btn').forEach(btn => {
+      btn.addEventListener('click', () => addFieldsToX([btn.dataset.field]));
+    });
   });
 }
 
@@ -1079,6 +1126,13 @@ document.getElementById('binRecommendBtn').addEventListener('click', () => {
 initBatchTagInput();
 initBatchXImport();
 initCustomFieldPanel();
+document.getElementById('fieldBrowserToggle').addEventListener('click', () => {
+  const panel = document.getElementById('fieldBrowserPanel');
+  panel.classList.toggle('hidden');
+  if (!panel.classList.contains('hidden')) renderFieldBrowser();
+});
+document.getElementById('fieldBrowserAddAllOriginal').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.original));
+document.getElementById('fieldBrowserAddAllAssembled').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.assembled));
 document.getElementById('batchXClearBtn').addEventListener('click', () => {
   batchXSelected = [];
   renderBatchTags();

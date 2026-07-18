@@ -360,10 +360,83 @@ function testCustomFieldFromForm() {
   resultEl.textContent = `前 ${outputs.length} 行输出: [${outputs.join(', ')}]` + (errMsg ? `　⚠️ ${errMsg}` : '');
 }
 
+// 导入/导出自定义字段配置（design doc §13.2）：现在只存在 localStorage，换浏览器/设备/团队共享都会丢失，
+// 导出成 JSON 文件后可以在其他设备/给同事导入，version 字段用于以后格式升级时做向后兼容检查。
+const CUSTOM_FIELDS_CONFIG_VERSION = 1;
+
+function exportCustomFieldsToJson() {
+  if (!customFields.length) { alert('还没有自定义字段可导出'); return; }
+  const payload = { version: CUSTOM_FIELDS_CONFIG_VERSION, exportedAt: new Date().toISOString(), fields: customFields };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8;' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'custom_fields.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// 冲突处理用简单的 prompt 交互（覆盖/跳过/重命名后导入），和现有删除字段用 confirm() 的风格保持一致，
+// 不为这个低频操作单独设计一套弹窗组件
+function promptImportConflict(name) {
+  const choice = (prompt(`字段 "${name}" 已存在，如何处理？输入 overwrite（覆盖）/ skip（跳过）/ rename（重命名后导入），默认 skip`, 'skip') || '').trim().toLowerCase();
+  if (choice === 'overwrite' || choice === 'rename') return choice;
+  return 'skip';
+}
+
+async function importCustomFieldsFromFile(file) {
+  let payload;
+  try { payload = await readJson(file); } catch (e) { alert('文件解析失败：' + e.message); return; }
+  const list = Array.isArray(payload) ? payload : payload && payload.fields;
+  if (!Array.isArray(list)) { alert('文件里没有找到自定义字段列表，请确认是本工具导出的配置文件'); return; }
+  if (!Array.isArray(payload) && payload.version !== undefined && payload.version !== CUSTOM_FIELDS_CONFIG_VERSION) {
+    if (!confirm(`该配置文件版本号(${payload.version})与当前工具（v${CUSTOM_FIELDS_CONFIG_VERSION}）不一致，部分设置可能无法正确导入，是否继续？`)) return;
+  }
+  // 校验：字段名格式合法 + 公式能编译通过，两者都复用现有的校验/编译逻辑，不重新写一套
+  const valid = [];
+  const invalidMsgs = [];
+  for (const item of list) {
+    if (!item || typeof item.name !== 'string' || typeof item.code !== 'string') { invalidMsgs.push(`${item && item.name || '(未命名)'}：缺少 name/code`); continue; }
+    const trimmed = item.name.replace(/^custom\./, '');
+    if (!/^[a-zA-Z0-9_.]+$/.test(trimmed)) { invalidMsgs.push(`${item.name}：字段名含非法字符`); continue; }
+    try { compileCustomField(item.code); } catch (e) { invalidMsgs.push(`${item.name}：编译失败 - ${e.message}`); continue; }
+    valid.push({ name: item.name.startsWith('custom.') ? item.name : 'custom.' + trimmed, code: item.code });
+  }
+  if (invalidMsgs.length) alert(`以下字段校验未通过，已跳过：\n${invalidMsgs.join('\n')}`);
+  if (!valid.length) return;
+
+  let importCount = 0, skipCount = 0, overwriteCount = 0, renameCount = 0;
+  for (const item of valid) {
+    const existingIdx = customFields.findIndex(c => c.name === item.name);
+    if (existingIdx === -1) {
+      customFields.push({ name: item.name, code: item.code });
+      importCount++;
+      continue;
+    }
+    const choice = promptImportConflict(item.name);
+    if (choice === 'skip') { skipCount++; continue; }
+    if (choice === 'overwrite') { customFields[existingIdx] = { name: item.name, code: item.code }; overwriteCount++; continue; }
+    let newName = item.name + '_imported', suffix = 2;
+    while (customFields.some(c => c.name === newName)) { newName = item.name + '_imported' + suffix; suffix++; }
+    customFields.push({ name: newName, code: item.code });
+    renameCount++;
+  }
+  saveCustomFields();
+  refreshAfterCustomFieldChange();
+  alert(`导入完成：新增 ${importCount} 个，覆盖 ${overwriteCount} 个，重命名导入 ${renameCount} 个，跳过 ${skipCount} 个。`);
+}
+
 function initCustomFieldPanel() {
   loadCustomFields();
   renderCustomFieldList();
   document.getElementById('customFieldSaveBtn').addEventListener('click', saveCustomFieldFromForm);
   document.getElementById('customFieldTestBtn').addEventListener('click', testCustomFieldFromForm);
   document.getElementById('customFieldCancelBtn').addEventListener('click', cancelEditCustomField);
+  document.getElementById('exportCustomFieldsBtn').addEventListener('click', exportCustomFieldsToJson);
+  const importFileInput = document.getElementById('importCustomFieldsFile');
+  document.getElementById('importCustomFieldsBtn').addEventListener('click', () => importFileInput.click());
+  importFileInput.addEventListener('change', () => {
+    const file = importFileInput.files[0];
+    if (file) importCustomFieldsFromFile(file);
+    importFileInput.value = '';
+  });
 }

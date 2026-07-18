@@ -55,7 +55,8 @@
       --shadow: 0 2px 16px rgba(0,0,0,.08);
     }
     * { box-sizing: border-box; }
-    html { color-scheme: dark; }
+    html { color-scheme: dark; scroll-behavior: smooth; }
+    #proSubNav a.chart-tool-btn { text-decoration: none; display: inline-block; }
     html[data-theme="light"] { color-scheme: light; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -92,7 +93,9 @@
       box-shadow: var(--shadow);
       padding: 22px 24px;
       margin-bottom: 18px;
+      scroll-margin-top: 90px; /* 避开 sticky 顶栏遮挡跳转目标 */
     }
+    .section { scroll-margin-top: 90px; }
     .panel.stacked { padding: 0; }
     .panel.stacked .section { padding: 22px 24px; }
     .panel.stacked .section + .section { border-top: 1px solid var(--border-subtle); }
@@ -172,6 +175,7 @@
     .cf-card button { padding: 4px 12px; font-size: 12px; }
     .pro-section {
       padding: 16px 0; border-top: 1px solid var(--border-subtle);
+      scroll-margin-top: 90px; /* 避开 sticky 顶栏遮挡跳转目标 */
     }
     .pro-section:first-child { border-top: none; padding-top: 0; }
     .pro-section h4 { font-size: 14px; font-weight: 600; margin: 0 0 6px; color: var(--text); }
@@ -886,6 +890,16 @@
       <button type="button" class="collapse-toggle">▾</button>
     </div>
     <div class="panel-body" id="proBody_">
+      <div id="proSubNav" class="row" style="gap: 6px; margin-bottom: 16px;">
+        <a href="#proSectionCorrMatrix" class="chart-tool-btn">1.相关矩阵</a>
+        <a href="#proSectionGroupCompare" class="chart-tool-btn">2.分组对比</a>
+        <a href="#proSectionRegression" class="chart-tool-btn">3.回归</a>
+        <a href="#proSectionFeatureCombo" class="chart-tool-btn">3.5特征组合</a>
+        <a href="#proSectionTimeAnalysis" class="chart-tool-btn">4.时间分析</a>
+        <a href="#proSectionCategoryCompare" class="chart-tool-btn">5.分类对比</a>
+        <a href="#proSectionRoc" class="chart-tool-btn">6.ROC-AUC</a>
+        <a href="#proSectionSimilarCase" class="chart-tool-btn">7.相似Case</a>
+      </div>
       <div id="proContent">
 
         <div class="pro-section" id="proSectionCorrMatrix">

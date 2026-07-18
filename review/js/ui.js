@@ -579,6 +579,7 @@ function addFilterRow(field = '', op = '>=', threshold = '') {
 function refreshAnalysisViews() {
   renderFieldQuality();
   renderQualityAlerts();
+  refreshSimilarBaseOptions();
   renderDistribution();
   bootstrapCIMap.clear();
   allCorrelations = computeCorrelations(activeRows);

@@ -86,6 +86,99 @@ function makeFieldTagSelector(inputId, tagBoxId) {
   };
 }
 
+// ---------- 7. 相似 Case 检索（最近邻） ----------
+// 对选中字段做 z-score 标准化后计算基准 token 与其余 token 的欧氏距离，取 Top K 最近的作为"历史上长得像"的参考案例。
+// 缺失值处理：若某个候选行在部分字段上缺失，距离只在双方都有值的维度上计算，并按实际参与的维度数取均方根
+// 归一化（而不是直接用缺失维度补 0），避免"缺失字段多的候选因为差异项更少而显得更相似"这种偏差。
+function findSimilarCases(baseRow, fields, k) {
+  const stats = fields.map(f => {
+    const vals = [];
+    for (const r of activeRows) {
+      const v = getFeature(r, f);
+      if (isFiniteNumber(v)) vals.push(Number(v));
+    }
+    if (!vals.length) return { field: f, mean: NaN, std: NaN };
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const variance = vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length;
+    return { field: f, mean, std: Math.sqrt(variance) };
+  });
+
+  const missingInBase = [];
+  const baseVec = stats.map(s => {
+    const v = getFeature(baseRow, s.field);
+    if (!isFiniteNumber(v) || !Number.isFinite(s.std) || s.std === 0) { missingInBase.push(s.field); return null; }
+    return (Number(v) - s.mean) / s.std;
+  });
+  const usableIdx = baseVec.map((v, i) => (v !== null ? i : -1)).filter(i => i >= 0);
+  if (!usableIdx.length) return { error: '基准记录在所选字段上全部缺失（或字段在当前数据集里无变化），无法计算相似度' };
+
+  const candidates = [];
+  for (const r of activeRows) {
+    if (r === baseRow) continue;
+    let sumSq = 0, usedDims = 0;
+    for (const i of usableIdx) {
+      const s = stats[i];
+      const v = getFeature(r, s.field);
+      if (!isFiniteNumber(v)) continue;
+      const z = (Number(v) - s.mean) / s.std;
+      sumSq += (z - baseVec[i]) ** 2;
+      usedDims++;
+    }
+    if (!usedDims) continue;
+    candidates.push({ row: r, dist: Math.sqrt(sumSq / usedDims) });
+  }
+  candidates.sort((a, b) => a.dist - b.dist);
+  return { top: candidates.slice(0, k), missingInBase, usedFieldCount: usableIdx.length };
+}
+
+function findBaseRowByInput(text) {
+  const t = text.trim();
+  if (!t) return null;
+  // 精确匹配 token_address 优先，其次按 "symbol (token_address前8位…)" 展示格式或纯 symbol 匹配
+  return activeRows.find(r => r.tokenAddress === t)
+    || activeRows.find(r => `${r.symbol} (${(r.tokenAddress || '').slice(0, 8)}…)` === t)
+    || activeRows.find(r => r.symbol === t);
+}
+
+function renderSimilarCases(baseInputText, fields, k) {
+  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  const summaryEl = document.getElementById('similarSummary');
+  const tbody = document.getElementById('similarBody');
+  if (!fields.length) { summaryEl.textContent = '请至少选择 1 个相似度计算字段'; tbody.innerHTML = ''; return; }
+  const baseRow = findBaseRowByInput(baseInputText);
+  if (!baseRow) { summaryEl.textContent = '未找到匹配的基准 token，请从下拉列表中选择或检查 symbol/CA 是否正确'; tbody.innerHTML = ''; return; }
+
+  const result = findSimilarCases(baseRow, fields, Math.max(1, Math.min(100, k || 10)));
+  if (result.error) { summaryEl.textContent = '⚠️ ' + result.error; tbody.innerHTML = ''; return; }
+
+  const missingNote = result.missingInBase.length
+    ? `基准 token 的以下字段缺失，相似度计算未纳入这些维度：${result.missingInBase.join('、')}。` : '';
+  const rc = result.top.map(t => t.row.returnCurrent).filter(Number.isFinite);
+  const meanRc = rc.length ? rc.reduce((a, b) => a + b, 0) / rc.length : NaN;
+  const winRate = rc.length ? rc.filter(v => v > 1).length / rc.length : NaN;
+  summaryEl.innerHTML = `基准 token：<b>${escapeHtml(baseRow.symbol || baseRow.tokenAddress)}</b>，实际参与相似度计算的字段数：${result.usedFieldCount}/${fields.length}。`
+    + (missingNote ? `<br>${escapeHtml(missingNote)}` : '')
+    + (result.top.length ? `<br>这 ${result.top.length} 个相似 case 的 returnCurrent 均值为 ${formatNumberSmart(meanRc)}x，胜率(&gt;1x)为 ${(winRate * 100).toFixed(1)}%。<span style="color:var(--text-muted)">（历史相似性参考，不是预测）</span>` : '');
+
+  tbody.innerHTML = result.top.map(t => `
+    <tr>
+      <td>${escapeHtml(t.row.symbol || '-')}</td>
+      <td class="ellip" title="${escapeHtml(t.row.tokenAddress || '')}">${escapeHtml(t.row.tokenAddress || '-')}</td>
+      <td class="num">${t.dist.toFixed(4)}</td>
+      <td class="num">${Number.isFinite(t.row.returnCurrent) ? t.row.returnCurrent.toFixed(3) + 'x' : '-'}</td>
+      <td class="num">${Number.isFinite(t.row.returnMax) ? t.row.returnMax.toFixed(3) + 'x' : '-'}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="5" style="text-align:center; color:var(--text-muted);">无匹配结果</td></tr>';
+}
+
+function refreshSimilarBaseOptions() {
+  const list = document.getElementById('similarBaseList');
+  if (!list) return;
+  list.innerHTML = activeRows.slice(0, 2000).map(r =>
+    `<option value="${escapeHtml(`${r.symbol} (${(r.tokenAddress || '').slice(0, 8)}…)`)}"></option>`
+  ).join('');
+}
+
 // ---------- 1. 相关性矩阵 / 热力图 ----------
 function renderCorrMatrix(fields, threshold, onlyHighlight) {
   if (fields.length < 2) { alert('请至少选择 2 个字段'); return; }
@@ -1056,6 +1149,23 @@ function initProAnalytics() {
       rocBatchSelector.getSelected(),
       document.getElementById('rocTargetField').value,
       Number(document.getElementById('rocWinThreshold').value)
+    );
+  });
+
+  const similarFieldsSelector = makeFieldTagSelector('similarFieldsInput', 'similarFieldsTagBox');
+  document.getElementById('importSimilarTop10Btn').addEventListener('click', () => {
+    if (!allCorrelations.length) { alert('请先点击"分析"加载数据'); return; }
+    const seen = new Set();
+    for (const c of allCorrelations) {
+      if (seen.size >= 10) break;
+      if (!seen.has(c.feature)) { seen.add(c.feature); similarFieldsSelector.addField(c.feature); }
+    }
+  });
+  document.getElementById('genSimilarBtn').addEventListener('click', () => {
+    renderSimilarCases(
+      document.getElementById('similarBaseInput').value,
+      similarFieldsSelector.getSelected(),
+      Number(document.getElementById('similarK').value)
     );
   });
 }

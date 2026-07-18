@@ -36,6 +36,7 @@ function renderCorrTable() {
   const top = Number(document.getElementById('topN').value);
   const correction = document.getElementById('corrCorrection').value;
   const sortBy = document.getElementById('corrSortBy').value;
+  const oosEnabled = document.getElementById('oosEnabled').checked;
 
   // m 必须是当前 目标/来源 筛选下参与检验的全部字段数（不是 topN 截断后的数量），
   // 否则会系统性低估需要校正的严重程度；corrSource/corrTarget 切换时 m 会跟着重新计算。
@@ -61,6 +62,34 @@ function renderCorrTable() {
     summaryEl.textContent = `共 ${fullSet.length} 个字段参与检验，未校正时有 ${rawSigCount} 个字段 p<0.05，${methodName} 校正后仅剩 ${adjSigCount} 个仍然显著。`;
   }
 
+  // 样本外验证：按训练/测试集分别跑一遍 computeCorrelations，两组结果并排展示，
+  // 而不是只在训练集上重新拟合（重新拟合就失去了"验证"的意义）
+  let testN = 0;
+  const oosWarnEl = document.getElementById('oosWarning');
+  if (oosEnabled) {
+    const method = document.getElementById('oosSplitMethod').value;
+    const ratio = Number(document.getElementById('oosTrainRatio').value) || 0.7;
+    const { train, test } = splitTrainTest(activeRows, method, ratio, 'swapBeginTime');
+    testN = test.length;
+    const trainCorr = computeCorrelations(train);
+    const testCorr = computeCorrelations(test);
+    const trainMap = new Map(trainCorr.map(c => [`${c.target}|${c.feature}`, c]));
+    const testMap = new Map(testCorr.map(c => [`${c.target}|${c.feature}`, c]));
+    fullSet.forEach(c => {
+      const key = `${c.target}|${c.feature}`;
+      c._trainR = trainMap.get(key)?.r ?? NaN;
+      c._testR = testMap.get(key)?.r ?? NaN;
+    });
+    oosWarnEl.classList.toggle('hidden', testN >= 20);
+    if (testN < 20) oosWarnEl.textContent = `⚠️ 测试集样本过少（n=${testN} < 20），样本外验证结果仅供参考。`;
+  } else {
+    oosWarnEl.classList.add('hidden');
+  }
+
+  document.querySelector('#corrTableHead tr').innerHTML = '<th>目标</th><th>字段</th><th>中文含义</th><th>来源</th><th class="num">r</th>'
+    + (oosEnabled ? '<th class="num">训练集 r</th><th class="num">测试集 r</th>' : '')
+    + '<th class="num">Spearman ρ</th><th class="num">|Δ|</th><th class="num">n</th><th class="num">p</th><th class="num">校正后 p</th><th>操作</th>';
+
   const filtered = fullSet.slice(0, top);
   const tbody = document.getElementById('corrBody');
   tbody.innerHTML = filtered.map(c => {
@@ -71,6 +100,15 @@ function renderCorrTable() {
     // |Δ| 较大说明 Pearson r 和 Spearman ρ 明显不一致，可能存在非线性但单调的关系，提示去散点图里看形状
     const deltaFlag = Number.isFinite(c.delta) && c.delta > 0.15
       ? ` <span title="该字段的线性相关性和单调相关性差异较大，可能存在非线性关系，建议在散点图里查看具体形状（可尝试打开对数轴）">🔀</span>` : '';
+    let oosCells = '';
+    if (oosEnabled) {
+      // 衰减幅度较大（测试集 |r| 相比训练集下降超过 50%）或符号翻转 → 醒目标出，提示可能是过拟合/巧合
+      const decayed = Number.isFinite(c._trainR) && Number.isFinite(c._testR)
+        && ((Math.abs(c._trainR) > 1e-6 && Math.abs(c._testR) < Math.abs(c._trainR) * 0.5) || (Math.sign(c._trainR) !== Math.sign(c._testR) && c._trainR !== 0 && c._testR !== 0));
+      const testStyle = decayed ? ' style="color:#ff453a; font-weight:600;"' : '';
+      const testTitle = decayed ? ' title="该字段的相关性在样本外明显减弱或符号翻转，可能是过拟合/巧合，谨慎作为决策依据"' : '';
+      oosCells = `<td class="num">${Number.isFinite(c._trainR) ? c._trainR.toFixed(4) : '-'}</td><td class="num"${testStyle}${testTitle}>${Number.isFinite(c._testR) ? c._testR.toFixed(4) : '-'}${decayed ? ' ⚠️' : ''}</td>`;
+    }
     return `
     <tr${rowStyle}>
       <td>${escapeHtml(c.target)}</td>
@@ -78,6 +116,7 @@ function renderCorrTable() {
       <td class="ellip" title="${escapeHtml(getFieldDesc(c.feature))}">${escapeHtml(getFieldDesc(c.feature)) || '暂无备注'}</td>
       <td><span class="tag ${c.source}">${c.source === 'assembled' ? '组装' : '原始'}</span></td>
       <td class="num">${c.r.toFixed(4)}</td>
+      ${oosCells}
       <td class="num">${Number.isFinite(c.rho) ? c.rho.toFixed(4) : '-'}</td>
       <td class="num">${Number.isFinite(c.delta) ? c.delta.toFixed(4) : '-'}${deltaFlag}</td>
       <td class="num">${c.n}</td>
@@ -749,6 +788,9 @@ document.getElementById('corrSource').addEventListener('change', renderCorrTable
 document.getElementById('topN').addEventListener('change', renderCorrTable);
 document.getElementById('corrCorrection').addEventListener('change', renderCorrTable);
 document.getElementById('corrSortBy').addEventListener('change', renderCorrTable);
+document.getElementById('oosEnabled').addEventListener('change', renderCorrTable);
+document.getElementById('oosSplitMethod').addEventListener('change', renderCorrTable);
+document.getElementById('oosTrainRatio').addEventListener('change', renderCorrTable);
 document.getElementById('downloadCsvBtn').addEventListener('click', downloadCsv);
 document.getElementById('addFilterRow').addEventListener('click', () => addFilterRow());
 document.getElementById('applyFilter').addEventListener('click', applyFilter);

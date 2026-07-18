@@ -181,6 +181,24 @@ function pearsonPValue(r, n) {
   return 2 * (1 - normalCdf(Math.abs(zscore)));
 }
 
+// 样本外验证的训练/测试集切分：时间序列数据用随机切分容易泄露未来信息（训练集里混入了测试集"未来"的样本），
+// 默认按时间顺序切分（前 trainRatio 作训练集，后面作测试集）；随机切分模式直接洗牌后按比例切，
+// 更适合非时间序列场景（比如用户明确知道数据没有时间上的漂移，只是想看结果对随机子集是否稳健）。
+function splitTrainTest(rows, method, trainRatio, timeField) {
+  let ordered;
+  if (method === 'random') {
+    ordered = rows.slice();
+    for (let i = ordered.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [ordered[i], ordered[j]] = [ordered[j], ordered[i]];
+    }
+  } else {
+    ordered = rows.slice().sort((a, b) => (a[timeField] ?? 0) - (b[timeField] ?? 0));
+  }
+  const splitIdx = Math.round(ordered.length * trainRatio);
+  return { train: ordered.slice(0, splitIdx), test: ordered.slice(splitIdx) };
+}
+
 // 候选切点降采样：连续型字段唯一值可能有几百上千个，全量计算 ROC 每个候选点都要扫一遍全部样本，
 // 开销较大；按等距分位数降采样到 maxPoints 个候选点不会明显影响 ROC 曲线整体形状，但能大幅降低计算量，
 // 这里作为默认行为而不是可选项。

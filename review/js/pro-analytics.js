@@ -331,19 +331,40 @@ function standardize(values) {
   return { mean, std, z: std > 1e-12 ? values.map(v => (v - mean) / std) : values.map(() => 0) };
 }
 
-function renderFeatureImportance(targetField, fields) {
+// 样本外验证：测试集必须用训练集算出来的 mean/std 标准化，而不是用测试集自己的分布重新标准化——
+// 否则等于让测试集"偷看"了自己的统计信息，样本外 R² 会失去验证意义
+function standardizeWith(values, mean, std) {
+  return std > 1e-12 ? values.map(v => (v - mean) / std) : values.map(() => 0);
+}
+
+function renderFeatureImportance(targetField, fields, oosOptions) {
   if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
   if (fields.length < 1) { alert('请至少选择 1 个特征字段'); return; }
   // 完整案例：目标和全部特征都必须是有限数字才纳入回归，避免缺失值破坏矩阵运算
-  const rows = activeRows.filter(row => {
+  const completeRows = activeRows.filter(row => {
     const tv = getFeature(row, targetField);
     if (!isFiniteNumber(tv)) return false;
     return fields.every(f => isFiniteNumber(getFeature(row, f)));
   });
-  if (rows.length < fields.length + 5) {
-    alert(`完整样本数（${rows.length}）过少，无法稳定回归。请减少特征数量或检查字段是否大量缺失。`);
+  if (completeRows.length < fields.length + 5) {
+    alert(`完整样本数（${completeRows.length}）过少，无法稳定回归。请减少特征数量或检查字段是否大量缺失。`);
     return;
   }
+
+  // 样本外验证：只在训练集上拟合标准化系数（均值/标准差也来自训练集），测试集直接复用训练集的标准化参数做预测，
+  // 而不是在测试集上重新拟合一套新系数——重新拟合就失去了"验证"的意义
+  let rows = completeRows, testRows = [];
+  const oosEnabled = oosOptions && oosOptions.enabled;
+  if (oosEnabled) {
+    const split = splitTrainTest(completeRows, oosOptions.method, oosOptions.ratio, 'swapBeginTime');
+    rows = split.train;
+    testRows = split.test;
+    if (rows.length < fields.length + 5) {
+      alert(`训练集样本数（${rows.length}）过少，无法稳定回归。请调低训练集比例的切分粒度或减少特征数量。`);
+      return;
+    }
+  }
+
   const y = standardize(rows.map(r => Number(getFeature(r, targetField))));
   const constFields = [];
   const xStd = fields.map(f => {
@@ -425,12 +446,40 @@ function renderFeatureImportance(targetField, fields) {
   // 调整 R²：惩罚字段数量，避免"字段越多 R² 越高"这种虚假的模型质量提升假象
   const adjR2 = n - k - 1 > 0 ? 1 - (1 - r2) * (n - 1) / (n - k - 1) : NaN;
 
+  // 样本外 R²：用训练集拟合出的 beta + 训练集的均值/标准差，直接应用到测试集上做预测，
+  // 定义为"预测值与真实值的相关系数平方"（而不是重新在测试集上算一套 SSE/SST，那等于重新拟合）
+  let testR2 = NaN, testN = testRows.length;
+  if (oosEnabled && testRows.length >= 5) {
+    const yTestStd = standardizeWith(testRows.map(r => Number(getFeature(r, targetField))), y.mean, y.std);
+    const xTestStd = usedFields.map((f, i) => standardizeWith(testRows.map(r => Number(getFeature(r, f))), usedX[i].mean, usedX[i].std));
+    const yPred = testRows.map((_, r) => {
+      let yhat = 0;
+      for (let i = 0; i < k; i++) yhat += beta[i] * xTestStd[i][r];
+      return yhat;
+    });
+    const testR = pearson(yPred.map((p, r) => [p, yTestStd[r]]));
+    testR2 = Number.isFinite(testR) ? testR ** 2 : NaN;
+  }
+
   const result = usedFields.map((f, i) => ({ field: f, beta: beta[i], vif: vifs[i], r: univariateR[i] }));
   result.sort((a, b) => Math.abs(b.beta) - Math.abs(a.beta));
 
+  let oosHtml = '';
+  if (oosEnabled) {
+    if (testN < 20) {
+      oosHtml = `<br><span style="color:var(--warn, #ff9f0a);">⚠️ 测试集样本过少（n=${testN} < 20），样本外验证结果仅供参考。</span>`;
+    } else if (Number.isFinite(testR2)) {
+      const gap = r2 - testR2;
+      const overfitWarn = gap > 0.2 ? `<br><span style="color:var(--warn, #ff9f0a);">⚠️ 训练集 R² 与测试集 R² 差距较大（${gap.toFixed(3)}），模型可能过拟合，谨慎作为决策依据。</span>` : '';
+      oosHtml = `<br><b>训练集 R²:</b> ${r2.toFixed(4)} &nbsp; <b>测试集 R²（样本外):</b> ${testR2.toFixed(4)} &nbsp; <span style="color:var(--text-muted)">（n_train=${n}, n_test=${testN}）</span>${overfitWarn}`;
+    } else {
+      oosHtml = '<br><span style="color:var(--text-muted)">测试集上无法计算样本外 R²（可能预测值或真实值方差为 0）。</span>';
+    }
+  }
+
   document.getElementById('importanceResult').innerHTML =
     `<b>完整样本数:</b> ${n} &nbsp; <b>R²:</b> ${r2.toFixed(4)} &nbsp; <b>调整 R²:</b> ${Number.isFinite(adjR2) ? adjR2.toFixed(4) : '-'} &nbsp;
-    <span style="color:var(--text-muted)">（这 ${k} 个字段合计能解释 ${targetField} 方差的 ${(Math.max(0, adjR2 || r2) * 100).toFixed(1)}%；标准化系数：每变化 1 个标准差对目标的独立贡献，符号=方向，绝对值=强度）</span>`;
+    <span style="color:var(--text-muted)">（这 ${k} 个字段合计能解释 ${targetField} 方差的 ${(Math.max(0, adjR2 || r2) * 100).toFixed(1)}%；标准化系数：每变化 1 个标准差对目标的独立贡献，符号=方向，绝对值=强度）</span>${oosHtml}`;
 
   Plotly.newPlot('importanceChart', [{
     x: result.map(r => r.beta),
@@ -801,7 +850,11 @@ function initProAnalytics() {
 
   const importanceSelector = makeFieldTagSelector('importanceInput', 'importanceTagBox');
   document.getElementById('genImportanceBtn').addEventListener('click', () => {
-    renderFeatureImportance(document.getElementById('importanceTargetField').value, importanceSelector.getSelected());
+    renderFeatureImportance(document.getElementById('importanceTargetField').value, importanceSelector.getSelected(), {
+      enabled: document.getElementById('regOosEnabled').checked,
+      method: document.getElementById('regOosSplitMethod').value,
+      ratio: Number(document.getElementById('regOosTrainRatio').value) || 0.7
+    });
   });
 
   // 分组/分类字段用 filterFieldList（含 signalType/symbol 等分类字段 + 全部数值字段），

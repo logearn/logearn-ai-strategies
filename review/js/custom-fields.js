@@ -408,7 +408,7 @@ function testCustomFieldFromForm() {
 const CUSTOM_FIELDS_CONFIG_VERSION = 1;
 
 function exportCustomFieldsToJson() {
-  if (!customFields.length) { alert('还没有自定义字段可导出'); return; }
+  if (!customFields.length) { showToast('还没有自定义字段可导出'); return; }
   const payload = { version: CUSTOM_FIELDS_CONFIG_VERSION, exportedAt: new Date().toISOString(), fields: customFields };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8;' });
   const a = document.createElement('a');
@@ -428,9 +428,9 @@ function promptImportConflict(name) {
 
 async function importCustomFieldsFromFile(file) {
   let payload;
-  try { payload = await readJson(file); } catch (e) { alert('文件解析失败：' + e.message); return; }
+  try { payload = await readJson(file); } catch (e) { showToast('文件解析失败：' + e.message); return; }
   const list = Array.isArray(payload) ? payload : payload && payload.fields;
-  if (!Array.isArray(list)) { alert('文件里没有找到自定义字段列表，请确认是本工具导出的配置文件'); return; }
+  if (!Array.isArray(list)) { showToast('文件里没有找到自定义字段列表，请确认是本工具导出的配置文件'); return; }
   if (!Array.isArray(payload) && payload.version !== undefined && payload.version !== CUSTOM_FIELDS_CONFIG_VERSION) {
     if (!confirm(`该配置文件版本号(${payload.version})与当前工具（v${CUSTOM_FIELDS_CONFIG_VERSION}）不一致，部分设置可能无法正确导入，是否继续？`)) return;
   }
@@ -444,7 +444,7 @@ async function importCustomFieldsFromFile(file) {
     try { compileCustomField(item.code); } catch (e) { invalidMsgs.push(`${item.name}：编译失败 - ${e.message}`); continue; }
     valid.push({ name: item.name.startsWith('custom.') ? item.name : 'custom.' + trimmed, code: item.code });
   }
-  if (invalidMsgs.length) alert(`以下字段校验未通过，已跳过：\n${invalidMsgs.join('\n')}`);
+  if (invalidMsgs.length) showToast(`以下字段校验未通过，已跳过：\n${invalidMsgs.join('\n')}`);
   if (!valid.length) return;
 
   let importCount = 0, skipCount = 0, overwriteCount = 0, renameCount = 0;
@@ -465,7 +465,7 @@ async function importCustomFieldsFromFile(file) {
   }
   saveCustomFields();
   refreshAfterCustomFieldChange();
-  alert(`导入完成：新增 ${importCount} 个，覆盖 ${overwriteCount} 个，重命名导入 ${renameCount} 个，跳过 ${skipCount} 个。`);
+  showToast(`导入完成：新增 ${importCount} 个，覆盖 ${overwriteCount} 个，重命名导入 ${renameCount} 个，跳过 ${skipCount} 个。`);
 }
 
 // 代码模板/示例库（design doc §13.4）：面对空白公式输入框，新用户不知道能写什么，

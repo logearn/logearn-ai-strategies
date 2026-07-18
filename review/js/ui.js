@@ -274,7 +274,7 @@ function renderQualityAlerts() {
 // Bootstrap 置信区间：只对当前表格里可见的字段计算（而不是全部字段），把计算量控制在用户实际关心的范围内；
 // 分批 yield 主线程（复用 14.3 的分批处理思路），避免大量重抽样计算卡住页面；支持随时取消。
 async function runBootstrapCI() {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   if (bootstrapRunning) return;
 
   const target = document.getElementById('corrTarget').value;
@@ -285,7 +285,7 @@ async function runBootstrapCI() {
   const fullSet = allCorrelations.filter(c => (target === 'all' || c.target === target) && (source === 'all' || c.source === source));
   fullSet.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
   const targets = fullSet.slice(0, top);
-  if (!targets.length) { alert('当前表格没有可计算的字段'); return; }
+  if (!targets.length) { showToast('当前表格没有可计算的字段'); return; }
 
   bootstrapRunning = true;
   bootstrapCancelFlag = false;
@@ -419,7 +419,7 @@ function renderFieldQuality() {
 // 分类字段本身不参与相关性计算（pearson 只对数值有意义），提示改去 Pro 分析的分组/分类视图看
 function jumpToCorrField(field) {
   if (!scatterOptions.includes(field) && field !== 'returnCurrent' && field !== 'returnMax') {
-    alert('该字段是分类字段，不参与相关性计算；可以在下方“Pro 分析”里的“分组对比”或“分类字段分析”中查看。');
+    showToast('该字段是分类字段，不参与相关性计算；可以在下方“Pro 分析”里的“分组对比”或“分类字段分析”中查看。');
     return;
   }
   document.getElementById('corrTarget').value = 'all';
@@ -650,7 +650,7 @@ function refreshAnalysisViews() {
 }
 
 function applyFilter() {
-  if (!matchedRows.length) { alert('请先点击“分析”加载数据'); return; }
+  if (!matchedRows.length) { showToast('请先点击“分析”加载数据'); return; }
   const rowEls = document.querySelectorAll('#filterRows .filter-row');
   const conditions = [];
   const invalidFields = [];
@@ -670,17 +670,17 @@ function applyFilter() {
     conditions.push({ field, op, threshold });
   }
   if (invalidFields.length) {
-    alert('以下字段名未匹配到数据中的实际字段，已被忽略（请从下拉联想中选择）：\n' + invalidFields.join('\n'));
+    showToast('以下字段名未匹配到数据中的实际字段，已被忽略（请从下拉联想中选择）：\n' + invalidFields.join('\n'));
   }
   if (emptyThresholdFields.length) {
-    alert('以下字段的阈值为空，已被忽略：\n' + emptyThresholdFields.join('\n'));
+    showToast('以下字段的阈值为空，已被忽略：\n' + emptyThresholdFields.join('\n'));
   }
   if (!conditions.length) {
     // 没有有效条件：视为清除全局过滤，回到完整数据集
     activeRows = matchedRows;
     refreshAnalysisViews();
     if (!invalidFields.length && !emptyThresholdFields.length) {
-      alert('未输入任何条件，已重置为全部数据');
+      showToast('未输入任何条件，已重置为全部数据');
     }
     return;
   }
@@ -716,8 +716,8 @@ function applyFilter() {
 function copyFilterCAs() {
   const textarea = document.getElementById('filterCaText');
   const text = textarea.value;
-  if (!text) { alert('没有可复制的 CA'); return; }
-  navigator.clipboard.writeText(text).then(() => alert('已复制 CA 列表到剪贴板')).catch(err => alert('复制失败：' + err));
+  if (!text) { showToast('没有可复制的 CA'); return; }
+  navigator.clipboard.writeText(text).then(() => showToast('已复制 CA 列表到剪贴板')).catch(err => showToast('复制失败：' + err));
 }
 
 function clearFilter() {
@@ -758,7 +758,7 @@ function renderFilterPresetOptions() {
 
 function saveFilterPreset() {
   const name = document.getElementById('filterPresetInput').value.trim();
-  if (!name) { alert('请填写预设方案名'); return; }
+  if (!name) { showToast('请填写预设方案名'); return; }
   const conditions = [];
   document.querySelectorAll('#filterRows .filter-row').forEach(row => {
     const field = row.querySelector('.filter-field').value.trim();
@@ -766,21 +766,21 @@ function saveFilterPreset() {
     const threshold = row.querySelector('.filter-threshold').value.trim();
     if (field && threshold !== '') conditions.push({ field, op, threshold });
   });
-  if (!conditions.length) { alert('当前没有有效的过滤条件（字段+阈值都填写才算有效），无法保存'); return; }
+  if (!conditions.length) { showToast('当前没有有效的过滤条件（字段+阈值都填写才算有效），无法保存'); return; }
   filterPresets = filterPresets.filter(p => p.name !== name); // 同名覆盖
   filterPresets.push({ id: Date.now() + '_' + Math.random().toString(36).slice(2, 8), name, conditions });
   saveFilterPresetsToStorage();
   document.getElementById('filterPresetInput').value = '';
   renderFilterPresetOptions();
-  alert(`已保存预设「${name}」（${conditions.length} 个条件）`);
+  showToast(`已保存预设「${name}」（${conditions.length} 个条件）`);
 }
 
 function applyFilterPreset() {
   const id = document.getElementById('filterPresetSelect').value;
-  if (!id) { alert('请先从下拉框选择一个预设'); return; }
+  if (!id) { showToast('请先从下拉框选择一个预设'); return; }
   const preset = filterPresets.find(p => p.id === id);
   if (!preset) return;
-  if (!matchedRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!matchedRows.length) { showToast('请先点击"分析"加载数据'); return; }
 
   // 预设里的字段名如果在当前数据集里不存在（比如换了一批字段结构不同的数据），跳过无效字段行并提示，
   // 而不是应用一半报错中断（design doc §15.1 边界情况）
@@ -791,9 +791,9 @@ function applyFilterPreset() {
     else invalidFields.push(c.field);
   }
   if (invalidFields.length) {
-    alert(`以下字段在当前数据集里不存在，已跳过：\n${invalidFields.join('\n')}`);
+    showToast(`以下字段在当前数据集里不存在，已跳过：\n${invalidFields.join('\n')}`);
   }
-  if (!validConditions.length) { alert('该预设里的字段在当前数据集里全部不存在，无法应用'); return; }
+  if (!validConditions.length) { showToast('该预设里的字段在当前数据集里全部不存在，无法应用'); return; }
 
   document.querySelectorAll('#filterRows .filter-row').forEach(r => { if (r._acDestroy) r._acDestroy(); });
   document.getElementById('filterRows').innerHTML = '';
@@ -803,7 +803,7 @@ function applyFilterPreset() {
 
 function deleteFilterPreset() {
   const id = document.getElementById('filterPresetSelect').value;
-  if (!id) { alert('请先从下拉框选择一个预设'); return; }
+  if (!id) { showToast('请先从下拉框选择一个预设'); return; }
   const preset = filterPresets.find(p => p.id === id);
   if (!preset || !confirm(`确定删除预设「${preset.name}」？`)) return;
   filterPresets = filterPresets.filter(p => p.id !== id);
@@ -891,9 +891,9 @@ function initBatchXImport() {
   const resultEl = document.getElementById('batchXImportResult');
   toggleBtn.addEventListener('click', () => panel.classList.toggle('hidden'));
   importBtn.addEventListener('click', () => {
-    if (!matchedRows.length) { alert('请先点击"分析"加载数据'); return; }
+    if (!matchedRows.length) { showToast('请先点击"分析"加载数据'); return; }
     const text = textEl.value.trim();
-    if (!text) { alert('请先粘贴内容'); return; }
+    if (!text) { showToast('请先粘贴内容'); return; }
     const { matched, unmatched, ambiguous } = importXFieldsFromSnippet(text);
     const yField = getValidFieldInput('yField');
     const added = [];
@@ -921,10 +921,10 @@ function initBatchXImport() {
 let fieldBrowserGroups = { original: [], assembled: [] };
 
 function copyFieldNames(fields) {
-  if (!fields.length) { alert('该分组暂无字段'); return; }
+  if (!fields.length) { showToast('该分组暂无字段'); return; }
   navigator.clipboard.writeText(fields.join('\n'))
-    .then(() => alert(`已复制 ${fields.length} 个字段名到剪贴板（每行一个）`))
-    .catch(err => alert('复制失败：' + err));
+    .then(() => showToast(`已复制 ${fields.length} 个字段名到剪贴板（每行一个）`))
+    .catch(err => showToast('复制失败：' + err));
 }
 
 function addFieldsToX(fields) {
@@ -939,12 +939,56 @@ function addFieldsToX(fields) {
   return added;
 }
 
+// "原字段"分组的白名单：只有确实是有意义的原始业务字段才归入"原字段"，
+// 排除 _highlight_*/ai_max_*/all_signals_max_ratio.* 等内部标记或高度重复的衍生统计字段（这些改归入"组装字段"分组）。
+const ORIGINAL_FIELD_WHITELIST = new Set([
+  'amm_volume', 'buy_tx_count_d1', 'buy_wcoin_amount_d1', 'buy_wcoin_amount_h1', 'buy_wcoin_amount_m5',
+  'buyer_count_d1', 'exchange_volume', 'frequent_volume',
+  'gmgn.dev.creator_open_count', 'gmgn.dev.creator_token_balance', 'gmgn.dev.cto_flag', 'gmgn.dev.dexscr_ad',
+  'gmgn.dev.dexscr_ad_ts', 'gmgn.dev.dexscr_boost_fee', 'gmgn.dev.dexscr_trending_bar', 'gmgn.dev.dexscr_update_link',
+  'gmgn.dev.top_10_holder_rate', 'gmgn.dev.twitter_create_token_count', 'gmgn.dev.twitter_del_post_token_count',
+  'gmgn.image_dup_count', 'gmgn.launchpad_progress', 'gmgn.launchpad_status', 'gmgn.link.verify_status',
+  'gmgn.liquidity', 'gmgn.locked_ratio', 'gmgn.migration_market_cap', 'gmgn.og',
+  'gmgn.pool.base_reserve', 'gmgn.pool.base_reserve_value', 'gmgn.pool.fee_ratio', 'gmgn.pool.initial_base_reserve',
+  'gmgn.pool.initial_liquidity', 'gmgn.pool.initial_quote_reserve', 'gmgn.pool.liquidity', 'gmgn.pool.quote_reserve',
+  'gmgn.pool.quote_reserve_value',
+  'gmgn.price.buy_volume_1h', 'gmgn.price.buy_volume_1m', 'gmgn.price.buy_volume_24h', 'gmgn.price.buy_volume_5m',
+  'gmgn.price.buy_volume_6h', 'gmgn.price.buys_1h', 'gmgn.price.buys_1m', 'gmgn.price.buys_24h', 'gmgn.price.buys_5m',
+  'gmgn.price.buys_6h', 'gmgn.price.hot_level', 'gmgn.price.price', 'gmgn.price.price_1h', 'gmgn.price.price_1m',
+  'gmgn.price.price_24h', 'gmgn.price.price_5m', 'gmgn.price.price_6h',
+  'gmgn.price.sell_volume_1h', 'gmgn.price.sell_volume_1m', 'gmgn.price.sell_volume_24h', 'gmgn.price.sell_volume_5m',
+  'gmgn.price.sell_volume_6h', 'gmgn.price.sells_1h', 'gmgn.price.sells_1m', 'gmgn.price.sells_24h',
+  'gmgn.price.sells_5m', 'gmgn.price.sells_6h',
+  'gmgn.price.swaps_1h', 'gmgn.price.swaps_1m', 'gmgn.price.swaps_24h', 'gmgn.price.swaps_5m', 'gmgn.price.swaps_6h',
+  'gmgn.price.volume_1h', 'gmgn.price.volume_1m', 'gmgn.price.volume_24h', 'gmgn.price.volume_5m', 'gmgn.price.volume_6h',
+  'gmgn.stat.bot_degen_count', 'gmgn.stat.bot_degen_rate', 'gmgn.stat.creator_created_count', 'gmgn.stat.creator_hold_rate',
+  'gmgn.stat.creator_token_balance', 'gmgn.stat.degen_call_count', 'gmgn.stat.dev_team_hold_rate',
+  'gmgn.stat.fresh_wallet_rate', 'gmgn.stat.holder_count', 'gmgn.stat.private_vault_hold_rate', 'gmgn.stat.signal_count',
+  'gmgn.stat.top70_sniper_hold_rate', 'gmgn.stat.top_10_holder_rate', 'gmgn.stat.top_bot_degen_percentage',
+  'gmgn.stat.top_bundler_trader_percentage', 'gmgn.stat.top_entrapment_trader_percentage', 'gmgn.stat.top_rat_trader_percentage',
+  'gmgn.visiting_count',
+  'gmgn.wallet_tags_stat.bundler_wallets', 'gmgn.wallet_tags_stat.creator_wallets', 'gmgn.wallet_tags_stat.fresh_wallets',
+  'gmgn.wallet_tags_stat.rat_trader_wallets', 'gmgn.wallet_tags_stat.renowned_wallets', 'gmgn.wallet_tags_stat.smart_wallets',
+  'gmgn.wallet_tags_stat.sniper_wallets', 'gmgn.wallet_tags_stat.top_wallets', 'gmgn.wallet_tags_stat.whale_wallets',
+  'h1_featured_index', 'launch_time', 'launch_time_duration', 'm5_featured_index', 'max_up_duration', 'max_up_mcap',
+  'max_up_mcap_time', 'max_up_ratio', 'mcap', 'new_volume', 'old_volume', 'pool_liquidity', 'profit_usernum',
+  'scam_volume', 'sell_tx_count_d1', 'sell_wcoin_amount_d1', 'sell_wcoin_amount_h1', 'sell_wcoin_amount_m5',
+  'seller_count_d1', 'shit_volume', 'signal_max_mcap', 'signal_max_ratio', 'signal_max_time', 'signal_open_mcap',
+  'signal_open_time', 'smart_money_address_buy_count_d1', 'smart_money_address_sell_count_d1', 'smart_volume',
+  'whale_volume',
+]);
+
 function renderFieldBrowser() {
   const originalBox = document.getElementById('fieldBrowserOriginal');
   const assembledBox = document.getElementById('fieldBrowserAssembled');
   if (!originalBox || !assembledBox) return;
   const original = [], assembled = [];
-  for (const f of scatterOptions) (isAssembledField(f) ? assembled : original).push(f);
+  for (const f of scatterOptions) {
+    if (ORIGINAL_FIELD_WHITELIST.has(f)) original.push(f);
+    else if (isAssembledField(f)) assembled.push(f);
+    // 既不在白名单、也不是衍生/自定义字段（比如 _highlight_*、ai_max_* 等内部标记/噪声字段）：
+    // 两组都不显示，避免"组装字段"分组被无关字段撑大。
+  }
   original.sort();
   assembled.sort();
   fieldBrowserGroups = { original, assembled };
@@ -994,10 +1038,10 @@ function initBatchTagInput() {
 }
 
 function plotFromButton() {
-  if (!matchedRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!matchedRows.length) { showToast('请先点击"分析"加载数据'); return; }
   tryAddBatchField(); // 输入框里若残留有效字段，先补加进去
   if (!batchXSelected.length) {
-    alert('请先添加至少一个 X 指标（输入字段名联想后选中即可添加）');
+    showToast('请先添加至少一个 X 指标（输入字段名联想后选中即可添加）');
     return;
   }
   plot();
@@ -1012,7 +1056,7 @@ function downloadCsv() {
   const scope = document.querySelector('input[name="downloadCsvScope"]:checked').value;
   const rows = scope === 'all' ? matchedRows : activeRows;
   const isFiltered = scope !== 'all' && activeRows.length !== matchedRows.length;
-  if (!rows.length) { alert('当前没有数据可导出（请检查过滤条件或先点击"分析"）'); return; }
+  if (!rows.length) { showToast('当前没有数据可导出（请检查过滤条件或先点击"分析"）'); return; }
   const featureKeys = [...new Set([
     ...scatterOptions,
     ...customFields.map(c => c.name),
@@ -1081,7 +1125,7 @@ async function analyze() {
   const callsFile = document.getElementById('callsFile').files[0];
   const snapsFile = document.getElementById('snapsFile').files[0];
   if (!callsFile || !snapsFile) {
-    alert('请先选择 calls 和 snapshots JSON 文件');
+    showToast('请先选择 calls 和 snapshots JSON 文件');
     return;
   }
   const btn = document.getElementById('analyzeBtn');
@@ -1095,13 +1139,13 @@ async function analyze() {
     });
     const skipped = buildRows.lastSkippedByTimeDiff || 0;
     if (!matchedRows.length) {
-      alert('未匹配到有效样本，请检查两个 JSON 是否对应。' + (skipped ? `（另有 ${skipped} 条因 call 与最近快照时间差超过阈值被跳过）` : ''));
+      showToast('未匹配到有效样本，请检查两个 JSON 是否对应。' + (skipped ? `（另有 ${skipped} 条因 call 与最近快照时间差超过阈值被跳过）` : ''));
       return;
     }
     finalizeMatchedRows();
     document.getElementById('fileHint').textContent = `已分析完成：匹配 ${matchedRows.length} 条样本。` + (skipped ? ` 另有 ${skipped} 条因 call 与最近快照时间差超过 ${MAX_SNAPSHOT_MATCH_DIFF_SECONDS} 秒被跳过（未纳入分析）。` : '');
   } catch (err) {
-    alert('解析失败：' + err.message);
+    showToast('解析失败：' + err.message);
     console.error(err);
   } finally {
     btn.disabled = false; btn.textContent = '分析';
@@ -1114,8 +1158,8 @@ async function analyze() {
 async function appendData() {
   const callsFile = document.getElementById('callsFile').files[0];
   const snapsFile = document.getElementById('snapsFile').files[0];
-  if (!callsFile || !snapsFile) { alert('请在上方重新选择要追加的 calls 和 snapshots JSON 文件'); return; }
-  if (!matchedRows.length) { alert('请先点击"分析"加载初始数据，再用这个按钮追加后续批次'); return; }
+  if (!callsFile || !snapsFile) { showToast('请在上方重新选择要追加的 calls 和 snapshots JSON 文件'); return; }
+  if (!matchedRows.length) { showToast('请先点击"分析"加载初始数据，再用这个按钮追加后续批次'); return; }
   const btn = document.getElementById('appendDataBtn');
   const keepFirst = document.getElementById('appendKeepFirst').checked;
   btn.disabled = true; btn.textContent = '追加中...';
@@ -1124,7 +1168,7 @@ async function appendData() {
     const newRows = await buildRows(calls, snapshots, (done, total) => {
       btn.textContent = `追加中... ${done}/${total}`;
     });
-    if (!newRows.length) { alert('新文件里未匹配到有效样本，未发生合并'); return; }
+    if (!newRows.length) { showToast('新文件里未匹配到有效样本，未发生合并'); return; }
 
     const keyOf = r => `${r.tokenAddress || ''}_${r.swapBeginTime || ''}`;
     const existingByKey = new Map(matchedRows.map(r => [keyOf(r), r]));
@@ -1143,7 +1187,7 @@ async function appendData() {
     finalizeMatchedRows();
     document.getElementById('fileHint').textContent = `追加完成：新增 ${addedCount} 条，去重重复 ${overwrittenCount} 条（${keepFirst ? '已保留先导入的版本' : '已用新导入的版本覆盖'}），当前工作集共 ${matchedRows.length} 条。`;
   } catch (err) {
-    alert('追加失败：' + err.message);
+    showToast('追加失败：' + err.message);
     console.error(err);
   } finally {
     btn.disabled = false; btn.textContent = '追加数据';
@@ -1168,12 +1212,12 @@ document.getElementById('yField').addEventListener('change', () => { if (matched
 document.getElementById('colorField').addEventListener('change', () => { if (matchedRows.length) plot(); });
 document.querySelectorAll('.batch-chart-op-btn').forEach(btn => {
   btn.addEventListener('click', () => {
-    if (!batchXSelected.length) { alert('当前没有已展示的图表'); return; }
+    if (!batchXSelected.length) { showToast('当前没有已展示的图表'); return; }
     batchSetChartOption(btn.dataset.op, btn.dataset.val === 'true');
   });
 });
 document.getElementById('resetAllChartOptsBtn').addEventListener('click', () => {
-  if (!batchXSelected.length) { alert('当前没有已展示的图表'); return; }
+  if (!batchXSelected.length) { showToast('当前没有已展示的图表'); return; }
   resetAllChartOptions();
 });
 document.querySelectorAll('.export-png-btn').forEach(btn => {
@@ -1181,7 +1225,7 @@ document.querySelectorAll('.export-png-btn').forEach(btn => {
 });
 document.getElementById('genBinBarBtn').addEventListener('click', renderBinBarChart);
 document.getElementById('binRecommendBtn').addEventListener('click', () => {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   const field = document.getElementById('binField').value.trim();
   const hintEl = document.getElementById('binRecommendHint');
   if (!field) { hintEl.textContent = '请先填写分箱字段'; return; }
@@ -1256,7 +1300,7 @@ document.getElementById('corrSendToScatterBtn').addEventListener('click', () => 
   const scatterBody = document.getElementById('scatterBody_');
   if (scatterBody) scatterBody.classList.remove('hidden');
   if (scatterPanel) scatterPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  alert(`已把 ${features.length} 个字段加入散点图 X 轴（新增 ${added}，其余之前已在列表中）`);
+  showToast(`已把 ${features.length} 个字段加入散点图 X 轴（新增 ${added}，其余之前已在列表中）`);
 });
 document.getElementById('distTargetField').addEventListener('change', renderDistribution);
 document.getElementById('distLogX').addEventListener('change', renderDistribution);
@@ -1413,7 +1457,7 @@ function describeCurrentFilter() {
 }
 
 function saveCurrentSnapshot() {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   const label = document.getElementById('snapshotLabelInput').value.trim() || `快照 ${analysisSnapshots.length + 1}`;
   const cur = activeRows.map(r => r.returnCurrent);
   const mx = activeRows.map(r => r.returnMax);
@@ -1537,7 +1581,7 @@ function saveDatasetIndex() {
 }
 
 function saveCurrentDataset() {
-  if (!matchedRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!matchedRows.length) { showToast('请先点击"分析"加载数据'); return; }
   const hintEl = document.getElementById('datasetStatusHint');
   const label = document.getElementById('datasetLabelInput').value.trim() || `数据集 ${datasetIndex.length + 1}`;
   const serialized = JSON.stringify(matchedRows);
@@ -1565,10 +1609,10 @@ function switchToDataset(id) {
   if (!meta) return;
   if (matchedRows.length && !confirm(`切换到「${meta.label}」将替换当前工作集（当前未保存的过滤/自定义字段状态不会丢失，自定义字段定义本身独立存储），是否继续？`)) return;
   const raw = localStorage.getItem(DATASET_DATA_KEY_PREFIX + id);
-  if (!raw) { alert('未找到该数据集的完整数据（可能已被清除），仅保留了列表记录'); return; }
+  if (!raw) { showToast('未找到该数据集的完整数据（可能已被清除），仅保留了列表记录'); return; }
   try {
     matchedRows = JSON.parse(raw);
-  } catch (e) { alert('数据集解析失败：' + e.message); return; }
+  } catch (e) { showToast('数据集解析失败：' + e.message); return; }
   finalizeMatchedRows();
   document.getElementById('fileHint').textContent = `已切换到数据集「${meta.label}」：${matchedRows.length} 条。`;
 }
@@ -1667,7 +1711,7 @@ function getReportOptions() {
 }
 
 async function generateMarkdownReport() {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   const hintEl = document.getElementById('reportStatusHint');
   hintEl.textContent = '正在生成报告...';
   try {
@@ -1685,7 +1729,7 @@ async function generateMarkdownReport() {
 }
 
 async function generatePrintableReport() {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   const hintEl = document.getElementById('reportStatusHint');
   hintEl.textContent = '正在生成可打印页面...';
   try {

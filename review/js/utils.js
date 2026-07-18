@@ -12,6 +12,24 @@ function escapeHtml(v) {
     .replace(/'/g, '&#39;');
 }
 
+// 自定义 toast 提示，取代浏览器原生 alert()（原生弹窗样式无法定制、会阻塞整个页面交互，体验很差）。
+// 保持和 alert(message) 完全一样的调用方式（单个字符串参数），方便直接替换所有 alert( 调用点；
+// isError 仅用于左边框变红，不改变其它行为。多条消息会在右上角堆叠显示，自动 4 秒后淡出，点击可提前关闭。
+function showToast(message, isError) {
+  const container = document.getElementById('toastContainer');
+  if (!container) { console.log(message); return; } // 容器不存在时（极端情况）至少不丢信息
+  const toast = document.createElement('div');
+  toast.className = 'toast' + (isError ? ' toast-error' : '');
+  toast.textContent = String(message);
+  const remove = () => {
+    toast.classList.add('toast-fade-out');
+    setTimeout(() => toast.remove(), 250);
+  };
+  toast.addEventListener('click', remove);
+  container.appendChild(toast);
+  setTimeout(remove, 4000);
+}
+
 // 通用 CSV 下载：任意二维数组数据都能复用，不用每个面板各写一套 Blob/下载逻辑
 function downloadCsvGeneric(filename, headers, rows) {
   const lines = [headers.map(csvEscape).join(',')];

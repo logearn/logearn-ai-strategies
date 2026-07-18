@@ -129,7 +129,7 @@ function findBaseRowByInput(text) {
 }
 
 function renderSimilarCases(baseInputText, fields, k) {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   const summaryEl = document.getElementById('similarSummary');
   const tbody = document.getElementById('similarBody');
   if (!fields.length) { summaryEl.textContent = '请至少选择 1 个相似度计算字段'; tbody.innerHTML = ''; return; }
@@ -169,8 +169,8 @@ function refreshSimilarBaseOptions() {
 
 // ---------- 1. 相关性矩阵 / 热力图 ----------
 function renderCorrMatrix(fields, threshold, onlyHighlight) {
-  if (fields.length < 2) { alert('请至少选择 2 个字段'); return; }
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (fields.length < 2) { showToast('请至少选择 2 个字段'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   threshold = Number.isFinite(threshold) ? threshold : 0.8;
 
   // 边界情况 1：字段在当前 activeRows 里全部缺失；边界情况 2：字段方差为 0（所有取值相同）——
@@ -269,8 +269,8 @@ function computeGroupKey(row, groupField, breakpoints) {
 }
 
 function renderGroupCompare(groupField, breakpointsText, featureField, targetField, minSample) {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
-  if (!groupField || !featureField) { alert('请填写分组字段和特征字段'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  if (!groupField || !featureField) { showToast('请填写分组字段和特征字段'); return; }
   const breakpoints = breakpointsText ? parseBreakpoints(breakpointsText) : [];
   const threshold = Number.isFinite(minSample) && minSample > 0 ? minSample : 10;
 
@@ -298,7 +298,7 @@ function renderGroupCompare(groupField, breakpointsText, featureField, targetFie
     stats.push({ key, n: rows.length, mean, winRate, r, p, rn: pairs.length, belowThreshold });
   }
   stats.sort((a, b) => b.n - a.n);
-  if (!stats.length) { alert('没有可用的分组数据，请检查字段是否正确'); return; }
+  if (!stats.length) { showToast('没有可用的分组数据，请检查字段是否正确'); return; }
 
   // 整体（未分组）r 作为对照——辛普森悖论的判断基准
   const overallPairs = [];
@@ -419,8 +419,8 @@ function standardizeWith(values, mean, std) {
 }
 
 function renderFeatureImportance(targetField, fields, oosOptions) {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
-  if (fields.length < 1) { alert('请至少选择 1 个特征字段'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  if (fields.length < 1) { showToast('请至少选择 1 个特征字段'); return; }
   // 完整案例：目标和全部特征都必须是有限数字才纳入回归，避免缺失值破坏矩阵运算
   const completeRows = activeRows.filter(row => {
     const tv = getFeature(row, targetField);
@@ -428,7 +428,7 @@ function renderFeatureImportance(targetField, fields, oosOptions) {
     return fields.every(f => isFiniteNumber(getFeature(row, f)));
   });
   if (completeRows.length < fields.length + 5) {
-    alert(`完整样本数（${completeRows.length}）过少，无法稳定回归。请减少特征数量或检查字段是否大量缺失。`);
+    showToast(`完整样本数（${completeRows.length}）过少，无法稳定回归。请减少特征数量或检查字段是否大量缺失。`);
     return;
   }
 
@@ -441,7 +441,7 @@ function renderFeatureImportance(targetField, fields, oosOptions) {
     rows = split.train;
     testRows = split.test;
     if (rows.length < fields.length + 5) {
-      alert(`训练集样本数（${rows.length}）过少，无法稳定回归。请调低训练集比例的切分粒度或减少特征数量。`);
+      showToast(`训练集样本数（${rows.length}）过少，无法稳定回归。请调低训练集比例的切分粒度或减少特征数量。`);
       return;
     }
   }
@@ -454,16 +454,16 @@ function renderFeatureImportance(targetField, fields, oosOptions) {
     return s;
   });
   if (constFields.length) {
-    alert(`以下字段在当前数据里几乎是常数，无法参与回归，已自动剔除：${constFields.join('、')}`);
+    showToast(`以下字段在当前数据里几乎是常数，无法参与回归，已自动剔除：${constFields.join('、')}`);
   }
   const usedFields = fields.filter((f, i) => xStd[i].std >= 1e-12);
   const usedX = xStd.filter(s => s.std >= 1e-12);
-  if (!usedFields.length) { alert('所有特征都是常数，无法回归'); return; }
+  if (!usedFields.length) { showToast('所有特征都是常数，无法回归'); return; }
 
   const n = rows.length, k = usedFields.length;
   // 自变量数不能超过可用样本数（矩阵不可逆的必要条件），直接拦截
   if (k >= n) {
-    alert(`自变量数量（${k}）不能超过可用样本数（${n}），请减少字段或放宽过滤条件。`);
+    showToast(`自变量数量（${k}）不能超过可用样本数（${n}），请减少字段或放宽过滤条件。`);
     return;
   }
 
@@ -645,10 +645,10 @@ function computeFeatureInteractions(fields, ops, targetField) {
 }
 
 function renderFeatureInteractions(fields, ops, targetField) {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
-  if (fields.length < 2) { alert('请至少选择 2 个候选字段'); return; }
-  if (fields.length > 15) { alert(`候选字段数量（${fields.length}）超过上限 15 个，请减少后再运行。`); return; }
-  if (!ops.length) { alert('请至少勾选一种运算方式'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  if (fields.length < 2) { showToast('请至少选择 2 个候选字段'); return; }
+  if (fields.length > 15) { showToast(`候选字段数量（${fields.length}）超过上限 15 个，请减少后再运行。`); return; }
+  if (!ops.length) { showToast('请至少勾选一种运算方式'); return; }
 
   const warnEl = document.getElementById('interactionWarning');
   if (fields.length > 10) {
@@ -680,7 +680,7 @@ function renderFeatureInteractions(fields, ops, targetField) {
       const a = btn.dataset.a, b = btn.dataset.b, op = btn.dataset.op;
       const name = interactionFieldName(a, b, op);
       const code = interactionFieldCode(a, b, op);
-      if (customFields.some(c => c.name === name)) { alert(`字段 ${name} 已存在于组装字段库中`); return; }
+      if (customFields.some(c => c.name === name)) { showToast(`字段 ${name} 已存在于组装字段库中`); return; }
       customFields.push({ name, code });
       saveCustomFields();
       refreshAfterCustomFieldChange();
@@ -692,12 +692,12 @@ function renderFeatureInteractions(fields, ops, targetField) {
 
 // ---------- 4. 时间维度分析 ----------
 function renderTimeAnalysis(featureField, targetField, bucketCount) {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   const withTime = activeRows.filter(r => isFiniteNumber(r.swapBeginTime));
-  if (withTime.length < 10) { alert('有效的 swap_begin_time 样本太少（< 10），无法做时间分桶分析'); return; }
+  if (withTime.length < 10) { showToast('有效的 swap_begin_time 样本太少（< 10），无法做时间分桶分析'); return; }
   const times = withTime.map(r => r.swapBeginTime);
   const minT = Math.min(...times), maxT = Math.max(...times);
-  if (maxT <= minT) { alert('样本的开仓时间几乎相同，无法分桶'); return; }
+  if (maxT <= minT) { showToast('样本的开仓时间几乎相同，无法分桶'); return; }
   const n = Math.max(2, Math.min(30, Math.round(bucketCount) || 8));
   const step = (maxT - minT) / n;
   const buckets = Array.from({ length: n }, (_, i) => ({
@@ -779,29 +779,29 @@ function renderTimeAnalysis(featureField, targetField, bucketCount) {
 }
 
 function downloadTimeAnalysisCsv() {
-  if (!timeAnalysisData.length) { alert('请先生成时间分析'); return; }
+  if (!timeAnalysisData.length) { showToast('请先生成时间分析'); return; }
   const rows = timeAnalysisData.map(s => [s.label, s.n, Number.isFinite(s.winRate) ? (s.winRate * 100).toFixed(2) : '', Number.isFinite(s.mean) ? s.mean : '', Number.isFinite(s.r) ? s.r.toFixed(4) : '']);
   downloadCsvGeneric('time_analysis_buckets.csv', ['时间段', '样本数', '胜率(%)', '均值', '与特征的r'], rows);
 }
 
 // ---------- 4B. 相关性随时间漂移（滚动窗口） ----------
 function renderRollingCorrelation(featureField, targetField, windowDays, stepDays) {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
-  if (!featureField) { alert('请填写特征字段'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  if (!featureField) { showToast('请填写特征字段'); return; }
   const withTime = activeRows.filter(r => isFiniteNumber(r.swapBeginTime));
-  if (withTime.length < 10) { alert('有效的 swap_begin_time 样本太少（< 10），无法做滚动窗口相关性分析'); return; }
+  if (withTime.length < 10) { showToast('有效的 swap_begin_time 样本太少（< 10），无法做滚动窗口相关性分析'); return; }
 
   // swap_begin_time 假定为 Unix 秒；若数值明显是毫秒级（>1e12），统一换算成秒，避免窗口大小算错
   const toSec = t => (t > 1e12 ? t / 1000 : t);
   const timed = withTime.map(r => ({ row: r, t: toSec(r.swapBeginTime) })).sort((a, b) => a.t - b.t);
   const minT = timed[0].t, maxT = timed[timed.length - 1].t;
   const spanDays = (maxT - minT) / 86400;
-  if (spanDays < 1) { alert('当前样本时间跨度不足以进行有意义的时间维度分析（不足 1 天），建议放宽全局过滤条件'); return; }
+  if (spanDays < 1) { showToast('当前样本时间跨度不足以进行有意义的时间维度分析（不足 1 天），建议放宽全局过滤条件'); return; }
 
   const windowSec = Math.max(0.01, windowDays) * 86400;
   const stepSec = Math.max(0.01, stepDays) * 86400;
   const windowCount = Math.floor((maxT - minT) / stepSec) + 1;
-  if (windowCount > 200) { alert(`当前窗口/步长设置会产生 ${windowCount} 个滚动窗口，过多不利于渲染和阅读，请调大步长或窗口大小`); return; }
+  if (windowCount > 200) { showToast(`当前窗口/步长设置会产生 ${windowCount} 个滚动窗口，过多不利于渲染和阅读，请调大步长或窗口大小`); return; }
 
   const LOW_N_THRESHOLD = 10;
   const points = [];
@@ -816,7 +816,7 @@ function renderRollingCorrelation(featureField, targetField, windowDays, stepDay
     const r = pairs.length >= 5 ? pearson(pairs) : NaN;
     points.push({ end, n: pairs.length, r });
   }
-  if (!points.some(p => Number.isFinite(p.r))) { alert('每个滚动窗口内有效样本都不足 5 个，无法计算相关性，请调大窗口大小'); return; }
+  if (!points.some(p => Number.isFinite(p.r))) { showToast('每个滚动窗口内有效样本都不足 5 个，无法计算相关性，请调大窗口大小'); return; }
 
   const fmtDate = t => { const d = new Date(t * 1000); return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`; };
 
@@ -846,15 +846,15 @@ function renderRollingCorrelation(featureField, targetField, windowDays, stepDay
 }
 
 function downloadRollingCorrCsv() {
-  if (!rollingCorrData.length) { alert('请先生成滚动相关性图表'); return; }
+  if (!rollingCorrData.length) { showToast('请先生成滚动相关性图表'); return; }
   const rows = rollingCorrData.map(p => [new Date(p.end * 1000).toISOString(), p.n, Number.isFinite(p.r) ? p.r.toFixed(6) : '']);
   downloadCsvGeneric('rolling_correlation.csv', ['window_end', 'n', 'r'], rows);
 }
 
 // ---------- 5. 分类字段与收益关系（箱线图 + 胜率对比 + 显著性检验） ----------
 function renderCatAnalysis(catField, breakpointsText, valueField, sigTestEnabled) {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
-  if (!catField || !valueField) { alert('请填写分类字段和目标数值字段'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  if (!catField || !valueField) { showToast('请填写分类字段和目标数值字段'); return; }
   const breakpoints = breakpointsText ? parseBreakpoints(breakpointsText) : [];
   const groups = new Map();
   for (const row of activeRows) {
@@ -864,7 +864,7 @@ function renderCatAnalysis(catField, breakpointsText, valueField, sigTestEnabled
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(Number(vv));
   }
-  if (!groups.size) { alert('没有可用数据，请检查字段是否正确'); return; }
+  if (!groups.size) { showToast('没有可用数据，请检查字段是否正确'); return; }
   // 分类值过多（比如误把连续数值字段当分类字段）时箱线图会失去意义，这里提示但不阻断
   if (groups.size > 15) {
     if (!confirm(`检测到 ${groups.size} 个不同分类值，类别过多不利于阅读，可能不是合适的分类字段，是否继续？`)) return;
@@ -940,13 +940,13 @@ function resolveRocDirection(values, labels, directionParam) {
 }
 
 function renderRocSingle(field, targetField, winThreshold, directionParam) {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
-  if (!field) { alert('请填写候选字段'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  if (!field) { showToast('请填写候选字段'); return; }
   const { values, labels } = collectRocSamples(field, targetField, winThreshold);
-  if (values.length < 20) { alert('有效样本数过少（<20），ROC/AUC 估计不可靠，请检查字段或放宽过滤条件'); return; }
+  if (values.length < 20) { showToast('有效样本数过少（<20），ROC/AUC 估计不可靠，请检查字段或放宽过滤条件'); return; }
   const positives = labels.reduce((a, b) => a + b, 0);
   if (positives === 0 || positives === values.length) {
-    alert('当前样本全部是"赢"或全部是"输"，无法计算 ROC/AUC，请检查盈利判定阈值是否合理');
+    showToast('当前样本全部是"赢"或全部是"输"，无法计算 ROC/AUC，请检查盈利判定阈值是否合理');
     return;
   }
 
@@ -981,8 +981,8 @@ function renderRocSingle(field, targetField, winThreshold, directionParam) {
 }
 
 function renderRocBatch(fields, targetField, winThreshold) {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
-  if (!fields.length) { alert('请至少选择 1 个字段'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  if (!fields.length) { showToast('请至少选择 1 个字段'); return; }
   const results = fields.map(field => {
     const { values, labels } = collectRocSamples(field, targetField, winThreshold);
     const positives = labels.reduce((a, b) => a + b, 0);
@@ -1017,7 +1017,7 @@ function initProAnalytics() {
   // 默认预填"相关性表 Top10 字段 + returnCurrent + returnMax"——从当前已计算好的 allCorrelations 里取
   // |r| 最大的前 10 个不重复字段（allCorrelations 本身已按 |r| 降序排好，直接取前几个去重即可）
   document.getElementById('importTop10CorrBtn').addEventListener('click', () => {
-    if (!allCorrelations.length) { alert('请先点击"分析"加载数据'); return; }
+    if (!allCorrelations.length) { showToast('请先点击"分析"加载数据'); return; }
     corrMatrixSelector.addField('returnCurrent');
     corrMatrixSelector.addField('returnMax');
     const seen = new Set();
@@ -1117,7 +1117,7 @@ function initProAnalytics() {
 
   const rocBatchSelector = makeFieldTagSelector('rocBatchInput', 'rocBatchTagBox');
   document.getElementById('importRocTop10Btn').addEventListener('click', () => {
-    if (!allCorrelations.length) { alert('请先点击"分析"加载数据'); return; }
+    if (!allCorrelations.length) { showToast('请先点击"分析"加载数据'); return; }
     const seen = new Set();
     for (const c of allCorrelations) {
       if (seen.size >= 10) break;
@@ -1134,7 +1134,7 @@ function initProAnalytics() {
 
   const similarFieldsSelector = makeFieldTagSelector('similarFieldsInput', 'similarFieldsTagBox');
   document.getElementById('importSimilarTop10Btn').addEventListener('click', () => {
-    if (!allCorrelations.length) { alert('请先点击"分析"加载数据'); return; }
+    if (!allCorrelations.length) { showToast('请先点击"分析"加载数据'); return; }
     const seen = new Set();
     for (const c of allCorrelations) {
       if (seen.size >= 10) break;

@@ -255,6 +255,25 @@
       color: var(--text-muted); font-size: 13px; min-height: 120px;
     }
     div[id$="Chart"]:empty::before { content: '点击上方按钮生成图表后在此显示'; }
+    /* 自定义 toast 提示，取代浏览器原生 alert()（原生弹窗样式无法定制、会阻塞整个页面，体验很差） */
+    #toastContainer {
+      position: fixed; top: 20px; right: 20px; z-index: 10000;
+      display: flex; flex-direction: column; gap: 10px; max-width: 420px;
+      pointer-events: none;
+    }
+    .toast {
+      background: var(--surface-3); color: var(--text);
+      border: 1px solid var(--border-subtle); border-left: 3px solid var(--accent);
+      border-radius: var(--radius-sm); box-shadow: var(--shadow);
+      padding: 12px 16px; font-size: 13px; line-height: 1.5;
+      white-space: pre-wrap; word-break: break-word;
+      pointer-events: auto; cursor: pointer;
+      animation: toast-in .2s ease-out;
+    }
+    .toast.toast-error { border-left-color: #ff453a; }
+    .toast.toast-fade-out { animation: toast-out .25s ease-in forwards; }
+    @keyframes toast-in { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+    @keyframes toast-out { from { opacity: 1; } to { opacity: 0; transform: translateX(20px); } }
     .field-chip-btn {
       padding: 4px 10px; font-size: 11.5px;
       font-family: "SF Mono", "SFMono-Regular", Consolas, monospace;
@@ -1350,6 +1369,7 @@
     -> custom-fields（自定义组装字段引擎） -> ui（应用状态 + 事件绑定，必须最后加载，
     因为其顶层代码会立即调用 initCustomFieldPanel/updateThemeToggleBtn 等其它模块的函数）。
   -->
+  <div id="toastContainer"></div>
   <script src="js/utils.js"></script>
   <script src="js/dictionary.js"></script>
   <script src="js/data.js"></script>

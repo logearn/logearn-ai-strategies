@@ -88,7 +88,7 @@ function plot() {
 // useLightBg 时临时把背景/字体色切成浅色再导出，导出完成后（无论成功失败）都会切回原来的颜色，
 // 不影响页面上实际展示的图表。
 async function exportChartPng(chartDiv, filename, useLightBg) {
-  if (!chartDiv || !chartDiv.querySelector('.main-svg')) { alert('该图表还没有渲染，无法导出'); return; }
+  if (!chartDiv || !chartDiv.querySelector('.main-svg')) { showToast('该图表还没有渲染，无法导出'); return; }
   let prevColors = null;
   if (useLightBg) {
     const layout = chartDiv.layout || {};
@@ -111,7 +111,7 @@ async function exportChartPng(chartDiv, filename, useLightBg) {
     a.download = `${(filename || 'chart').replace(/[\\/:*?"<>|]/g, '_')}.png`;
     a.click();
   } catch (e) {
-    alert('导出失败：' + e.message);
+    showToast('导出失败：' + e.message);
   } finally {
     if (useLightBg && prevColors) {
       try { await Plotly.relayout(chartDiv, prevColors); } catch (e) {}
@@ -534,12 +534,12 @@ function binLabel(lo, hi) {
 }
 
 function renderBinBarChart() {
-  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   const binField = document.getElementById('binField').value.trim();
   const valueField = document.getElementById('binValueField').value.trim();
-  if (!binField || !valueField) { alert('请填写分箱字段和数值字段'); return; }
+  if (!binField || !valueField) { showToast('请填写分箱字段和数值字段'); return; }
   const breakpoints = parseBreakpoints(document.getElementById('binBreakpoints').value);
-  if (!breakpoints.length) { alert('请输入有效的分箱断点，如 -0.5,0,0.5,1'); return; }
+  if (!breakpoints.length) { showToast('请输入有效的分箱断点，如 -0.5,0,0.5,1'); return; }
   const errorType = document.getElementById('binErrorType').value;
 
   const edges = [-Infinity, ...breakpoints, Infinity];

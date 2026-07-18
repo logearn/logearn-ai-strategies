@@ -1045,6 +1045,16 @@ document.getElementById('globalSwapBtn').addEventListener('click', e => {
 document.getElementById('yField').addEventListener('input', updateCurrentFieldDesc);
 document.getElementById('yField').addEventListener('change', () => { if (matchedRows.length) plot(); });
 document.getElementById('colorField').addEventListener('change', () => { if (matchedRows.length) plot(); });
+document.querySelectorAll('.batch-chart-op-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (!batchXSelected.length) { alert('当前没有已展示的图表'); return; }
+    batchSetChartOption(btn.dataset.op, btn.dataset.val === 'true');
+  });
+});
+document.getElementById('resetAllChartOptsBtn').addEventListener('click', () => {
+  if (!batchXSelected.length) { alert('当前没有已展示的图表'); return; }
+  resetAllChartOptions();
+});
 document.getElementById('genBinBarBtn').addEventListener('click', renderBinBarChart);
 document.getElementById('binRecommendBtn').addEventListener('click', () => {
   if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }

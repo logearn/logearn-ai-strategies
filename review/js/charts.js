@@ -47,6 +47,22 @@ function getChartSettings(xField) {
   return chartSettings.get(xField);
 }
 
+// 散点图批量操作（design doc §15.2）：X 指标多选后可能同时展开 10+ 张图，逐张点开关太低效。
+// 只对"当前已展示的图表"对应的字段设置生效（不影响后续新增图表的默认值），遍历 chartSettings 批量赋值后
+// 统一调一次 plot() 重渲染，而不是每张图单独触发重渲染。批量按钮是明确的"设为开启"动作，不做 toggle 语义。
+function batchSetChartOption(opt, value) {
+  for (const xField of batchXSelected) {
+    getChartSettings(xField)[opt] = value;
+  }
+  if (matchedRows.length) plot();
+}
+function resetAllChartOptions() {
+  for (const xField of batchXSelected) {
+    chartSettings.set(xField, { logX: false, logY: false, clipOutliers: false, showConfBand: true, showBinned: false, swapped: defaultSwapped });
+  }
+  if (matchedRows.length) plot();
+}
+
 // 逐个渲染所有选中的 X 指标：每个指标一张全宽散点图，自上而下平铺，
 // 每张图自带一组功能按钮（对数轴 / 剔除离群点 / 置信区间 / 分档统计），互不影响
 function plot() {

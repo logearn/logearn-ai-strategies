@@ -777,6 +777,13 @@
       </div>
       <div class="stats" id="plotStats"></div>
     </div>
+    <div class="row" style="margin-top: 8px; gap: 8px; align-items: center; flex-wrap: wrap;">
+      <span class="hint" style="margin: 0;">批量操作（只影响当前已展示的图表，不影响后续新增图表的默认值）：</span>
+      <button type="button" class="secondary batch-chart-op-btn" data-op="logX" data-val="true">全部启用对数X</button>
+      <button type="button" class="secondary batch-chart-op-btn" data-op="showConfBand" data-val="true">全部启用置信区间</button>
+      <button type="button" class="secondary batch-chart-op-btn" data-op="showBinned" data-val="true">全部启用分档统计</button>
+      <button type="button" class="secondary" id="resetAllChartOptsBtn">重置全部为默认</button>
+    </div>
     <div class="row" style="margin-top: 10px;">
       <div class="control" style="flex: 1 1 100%;">
         <label for="searchCaInput">查找 CA（支持多个，用逗号 / 空格 / 换行分隔，命中的数据点会在下方所有图表中高亮）</label>

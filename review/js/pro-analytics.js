@@ -106,13 +106,31 @@ function renderCorrMatrix(fields) {
 }
 
 // ---------- 2. 分组对比分析 ----------
-function renderGroupCompare(groupField, featureField, targetField) {
+// 分组键计算：分类字段直接按值分组；数值字段填了断点时复用分箱柱状图的 parseBreakpoints/binLabel 做离散化分组，
+// 两种分组共用同一套后续的 r 值计算和辛普森悖论检测逻辑，不重复实现。
+function computeGroupKey(row, groupField, breakpoints) {
+  if (breakpoints && breakpoints.length) {
+    const v = getFeature(row, groupField);
+    if (!isFiniteNumber(v)) return '(空)';
+    const edges = [-Infinity, ...breakpoints, Infinity];
+    for (let i = 0; i < edges.length - 1; i++) {
+      if (Number(v) >= edges[i] && Number(v) < edges[i + 1]) return binLabel(edges[i], edges[i + 1]);
+    }
+    return '(空)';
+  }
+  const gv = getFeature(row, groupField);
+  return (gv === undefined || gv === null || gv === '') ? '(空)' : String(gv);
+}
+
+function renderGroupCompare(groupField, breakpointsText, featureField, targetField, minSample) {
   if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
   if (!groupField || !featureField) { alert('请填写分组字段和特征字段'); return; }
+  const breakpoints = breakpointsText ? parseBreakpoints(breakpointsText) : [];
+  const threshold = Number.isFinite(minSample) && minSample > 0 ? minSample : 10;
+
   const groups = new Map();
   for (const row of activeRows) {
-    const gv = getFeature(row, groupField);
-    const key = (gv === undefined || gv === null || gv === '') ? '(空)' : String(gv);
+    const key = computeGroupKey(row, groupField, breakpoints);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(row);
   }
@@ -127,12 +145,45 @@ function renderGroupCompare(groupField, featureField, targetField) {
       const fv = getFeature(r, featureField), tv = getFeature(r, targetField);
       if (isFiniteNumber(fv) && isFiniteNumber(tv)) pairs.push([Number(fv), Number(tv)]);
     }
-    const r = pairs.length >= 5 ? pearson(pairs) : NaN;
-    const p = pairs.length >= 5 ? pearsonPValue(r, pairs.length) : NaN;
-    stats.push({ key, n: rows.length, mean, winRate, r, p, rn: pairs.length });
+    // 低于最小样本量阈值的分组不计算相关性，直接标"样本不足"，避免小样本极端 r 值误导
+    const belowThreshold = pairs.length < threshold;
+    const r = (!belowThreshold && pairs.length >= 5) ? pearson(pairs) : NaN;
+    const p = Number.isFinite(r) ? pearsonPValue(r, pairs.length) : NaN;
+    stats.push({ key, n: rows.length, mean, winRate, r, p, rn: pairs.length, belowThreshold });
   }
   stats.sort((a, b) => b.n - a.n);
   if (!stats.length) { alert('没有可用的分组数据，请检查字段是否正确'); return; }
+
+  // 整体（未分组）r 作为对照——辛普森悖论的判断基准
+  const overallPairs = [];
+  for (const row of activeRows) {
+    const fv = getFeature(row, featureField), tv = getFeature(row, targetField);
+    if (isFiniteNumber(fv) && isFiniteNumber(tv)) overallPairs.push([Number(fv), Number(tv)]);
+  }
+  const overallR = overallPairs.length >= 5 ? pearson(overallPairs) : NaN;
+  document.getElementById('groupCompareOverall').innerHTML = Number.isFinite(overallR)
+    ? `<b>整体（未分组）r:</b> ${overallR.toFixed(4)} &nbsp; <span style="color:var(--text-muted)">(n=${overallPairs.length}，作为下方各分组 r 的对照基准)</span>`
+    : '';
+
+  // 伪相关识别（自动标注，不需要用户手工判断）
+  const validGroupStats = stats.filter(s => Number.isFinite(s.r));
+  const warnEl = document.getElementById('groupCompareWarning');
+  const warnings = [];
+  if (Number.isFinite(overallR) && Math.abs(overallR) >= 0.3 && validGroupStats.length && validGroupStats.every(s => Math.abs(s.r) < 0.15)) {
+    warnings.push('⚠️ 整体相关性可能是分组间均值差异导致的合成效应（辛普森悖论），单个分组内没有独立解释力。');
+  }
+  if (Number.isFinite(overallR) && validGroupStats.length) {
+    const largestGroup = validGroupStats.reduce((a, b) => (b.n > a.n ? b : a));
+    if (Math.sign(overallR) !== 0 && Math.sign(largestGroup.r) !== 0 && Math.sign(overallR) !== Math.sign(largestGroup.r)) {
+      warnings.push(`⚠️ 该分组（"${largestGroup.key}"，样本占比最大）与整体趋势方向相反，请单独核查。`);
+    }
+  }
+  if (warnings.length) {
+    warnEl.classList.remove('hidden');
+    warnEl.innerHTML = warnings.join('<br>');
+  } else {
+    warnEl.classList.add('hidden');
+  }
 
   Plotly.newPlot('groupCompareChart', [{
     x: stats.map(s => s.key),
@@ -481,8 +532,10 @@ function initProAnalytics() {
   document.getElementById('genGroupCompareBtn').addEventListener('click', () => {
     renderGroupCompare(
       document.getElementById('groupByField').value.trim(),
+      document.getElementById('groupByBreakpoints').value.trim(),
       document.getElementById('groupFeatureField').value.trim(),
-      document.getElementById('groupTargetField').value
+      document.getElementById('groupTargetField').value,
+      Number(document.getElementById('groupMinSample').value)
     );
   });
 

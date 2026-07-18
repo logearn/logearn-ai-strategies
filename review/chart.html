@@ -645,11 +645,15 @@
 
         <div class="pro-section">
           <h4>2. 分组对比分析</h4>
-          <p class="hint" style="margin: 0 0 10px;">按分类字段（如 signalType/platform）分组，对比同一特征在不同组内与收益的相关性是否一致，避免"整体相关性显著，其实只是某一类信号驱动"的伪相关。</p>
+          <p class="hint" style="margin: 0 0 10px;">按分类字段（如 signalType/platform）分组，对比同一特征在不同组内与收益的相关性是否一致，避免"整体相关性显著，其实只是某一类信号驱动"的伪相关（辛普森悖论）。分组字段也可以是数值字段，填写断点后会自动离散化分组。</p>
           <div class="row">
             <div class="control" style="position: relative;">
               <label for="groupByField">分组字段</label>
               <input type="text" id="groupByField" class="field-search" placeholder="如 signalType" autocomplete="off">
+            </div>
+            <div class="control">
+              <label for="groupByBreakpoints">分组断点（数值字段离散化，可留空）</label>
+              <input type="text" id="groupByBreakpoints" placeholder="如 0.5,1,1.5,2">
             </div>
             <div class="control" style="position: relative;">
               <label for="groupFeatureField">特征字段</label>
@@ -662,10 +666,16 @@
                 <option value="returnMax" selected>returnMax</option>
               </select>
             </div>
+            <div class="control" style="flex: 0; min-width: 120px;">
+              <label for="groupMinSample">最小样本量</label>
+              <input type="number" id="groupMinSample" value="10" min="5">
+            </div>
             <div class="control" style="flex: 0; min-width: auto;">
               <button type="button" id="genGroupCompareBtn">生成分组对比</button>
             </div>
           </div>
+          <div id="groupCompareWarning" class="hint hidden" style="margin: 10px 0; color: var(--warn, #ff9f0a);"></div>
+          <div id="groupCompareOverall" class="stats"></div>
           <div id="groupCompareChart" style="width: 100%; height: 380px;"></div>
           <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
             <table class="desc-table">

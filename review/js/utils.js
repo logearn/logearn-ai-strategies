@@ -181,6 +181,55 @@ function pearsonPValue(r, n) {
   return 2 * (1 - normalCdf(Math.abs(zscore)));
 }
 
+// 候选切点降采样：连续型字段唯一值可能有几百上千个，全量计算 ROC 每个候选点都要扫一遍全部样本，
+// 开销较大；按等距分位数降采样到 maxPoints 个候选点不会明显影响 ROC 曲线整体形状，但能大幅降低计算量，
+// 这里作为默认行为而不是可选项。
+function downsampleQuantiles(values, maxPoints) {
+  const uniq = [...new Set(values)].sort((a, b) => a - b);
+  if (uniq.length <= maxPoints) return uniq;
+  const result = [];
+  for (let i = 0; i < maxPoints; i++) {
+    const idx = Math.floor(i * (uniq.length - 1) / (maxPoints - 1));
+    result.push(uniq[idx]);
+  }
+  return [...new Set(result)];
+}
+
+// ROC 曲线 + AUC：direction='higher' 表示"字段值 >= 阈值"判定为预测阳性（更可能盈利），
+// 'lower' 表示"字段值 <= 阈值"判定为预测阳性。AUC 用梯形法则对曲线下面积做数值积分；
+// Youden's J（TPR - FPR 最大化）对应的切点作为"综合来看最优"的推荐阈值，只在真实候选阈值里找（不含人工补的端点）。
+function computeROC(values, labels, direction) {
+  const n = values.length;
+  const positives = labels.reduce((a, b) => a + b, 0);
+  const negatives = n - positives;
+  const thresholds = downsampleQuantiles(values, 100);
+  const rocPoints = thresholds.map(th => {
+    let tp = 0, fp = 0;
+    for (let i = 0; i < n; i++) {
+      const predPos = direction === 'higher' ? values[i] >= th : values[i] <= th;
+      if (predPos) { if (labels[i] === 1) tp++; else fp++; }
+    }
+    const tpr = positives > 0 ? tp / positives : 0;
+    const fpr = negatives > 0 ? fp / negatives : 0;
+    const precision = (tp + fp) > 0 ? tp / (tp + fp) : NaN;
+    return { threshold: th, tpr, fpr, precision, tp, fp };
+  });
+  let best = rocPoints[0], bestJ = -Infinity;
+  for (const p of rocPoints) {
+    const j = p.tpr - p.fpr;
+    if (j > bestJ) { bestJ = j; best = p; }
+  }
+  // AUC：加两个人工端点 (0,0)/(1,1) 闭合曲线，按 fpr（同 fpr 时按 tpr）排序后做梯形积分
+  const curvePoints = [...rocPoints, { fpr: 0, tpr: 0 }, { fpr: 1, tpr: 1 }].sort((a, b) => a.fpr - b.fpr || a.tpr - b.tpr);
+  let auc = 0;
+  for (let i = 1; i < curvePoints.length; i++) {
+    const dx = curvePoints[i].fpr - curvePoints[i - 1].fpr;
+    const avgY = (curvePoints[i].tpr + curvePoints[i - 1].tpr) / 2;
+    auc += dx * avgY;
+  }
+  return { points: rocPoints, auc, best, positives, negatives };
+}
+
 // Welch's t 检验：不假设两组方差相等，比标准 t 检验更稳健，适合分类字段两组均值对比场景。
 // p 值用正态近似（大样本近似，简化处理，n 较小时结果仅供参考）；自由度用 Welch–Satterthwaite 近似，仅用于展示参考。
 function welchTTest(a, b) {

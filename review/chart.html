@@ -838,6 +838,63 @@
           </div>
         </div>
 
+        <div class="pro-section">
+          <h4>6. 阈值优化（ROC-AUC 分析）</h4>
+          <p class="hint" style="margin: 0 0 10px;">直接回答"这个字段能不能把赢家和输家分开"，以及"分界点定在哪里精确率/召回率最优"，比相关系数更直接服务于筛选决策落地。与相关性排序是互补关系：相关性看整体线性/单调关联强度，AUC 专门衡量二分类筛选能力。</p>
+          <div class="row">
+            <div class="control" style="position: relative;">
+              <label for="rocField">候选字段</label>
+              <input type="text" id="rocField" class="field-search" placeholder="如 top_10_holder_rate" autocomplete="off">
+            </div>
+            <div class="control" style="flex: 0; min-width: 140px;">
+              <label for="rocTargetField">目标</label>
+              <select id="rocTargetField">
+                <option value="returnCurrent">returnCurrent</option>
+                <option value="returnMax" selected>returnMax</option>
+              </select>
+            </div>
+            <div class="control" style="flex: 0; min-width: 160px;">
+              <label for="rocWinThreshold">盈利判定阈值（目标 &gt; 该值算赢）</label>
+              <input type="number" id="rocWinThreshold" value="1" step="0.1">
+            </div>
+            <div class="control" style="flex: 0; min-width: 160px;">
+              <label for="rocDirection">方向</label>
+              <select id="rocDirection">
+                <option value="auto" selected>自动检测</option>
+                <option value="higher">字段越大越可能盈利</option>
+                <option value="lower">字段越小越可能盈利</option>
+              </select>
+            </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="genRocBtn">生成 ROC 曲线</button>
+            </div>
+          </div>
+          <div id="rocSummary" class="hint" style="margin: 10px 0;"></div>
+          <div id="rocChart" style="width: 100%; height: 420px;"></div>
+
+          <h5 style="margin: 20px 0 6px;">批量对比（按 AUC 排序）</h5>
+          <div class="row">
+            <div class="control" style="flex: 1 1 100%; position: relative;">
+              <label for="rocBatchInput">候选字段（可多选）</label>
+              <div class="tag-input" id="rocBatchTagBox">
+                <input type="text" id="rocBatchInput" placeholder="输入字段名联想，选中自动添加..." autocomplete="off">
+              </div>
+            </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="importRocTop10Btn">导入相关性表 Top10</button>
+            </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="genRocBatchBtn">批量计算 AUC</button>
+            </div>
+          </div>
+          <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
+            <table class="desc-table">
+              <thead><tr><th>字段</th><th class="num">样本数</th><th class="num">AUC</th><th>方向</th><th class="num">推荐阈值</th><th class="num">精确率</th><th class="num">召回率</th></tr></thead>
+              <tbody id="rocBatchBody"></tbody>
+            </table>
+          </div>
+        </div>
+
       </div>
     </div>
   </div>

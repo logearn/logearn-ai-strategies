@@ -680,6 +680,96 @@ function renderCatAnalysis(catField, breakpointsText, valueField, sigTestEnabled
   }
 }
 
+// ---------- 6. 阈值优化（ROC-AUC 分析） ----------
+function collectRocSamples(field, targetField, winThreshold) {
+  const values = [], labels = [];
+  for (const row of activeRows) {
+    const fv = getFeature(row, field);
+    const tv = getFeature(row, targetField);
+    if (isFiniteNumber(fv) && isFiniteNumber(tv)) {
+      values.push(Number(fv));
+      labels.push(Number(tv) > winThreshold ? 1 : 0);
+    }
+  }
+  return { values, labels };
+}
+
+// 自动检测方向：先按"越大越可能盈利"算一次 AUC，如果 < 0.5 说明方向反了，直接翻转方向重新计算
+// （等价于取 1-AUC，但重新算一次能顺带拿到翻转方向下真实的最优切点/精确率/召回率，逻辑更直观）
+function resolveRocDirection(values, labels, directionParam) {
+  if (directionParam !== 'auto') return { direction: directionParam, roc: computeROC(values, labels, directionParam) };
+  const higherRoc = computeROC(values, labels, 'higher');
+  if (higherRoc.auc >= 0.5) return { direction: 'higher', roc: higherRoc };
+  return { direction: 'lower', roc: computeROC(values, labels, 'lower') };
+}
+
+function renderRocSingle(field, targetField, winThreshold, directionParam) {
+  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!field) { alert('请填写候选字段'); return; }
+  const { values, labels } = collectRocSamples(field, targetField, winThreshold);
+  if (values.length < 20) { alert('有效样本数过少（<20），ROC/AUC 估计不可靠，请检查字段或放宽过滤条件'); return; }
+  const positives = labels.reduce((a, b) => a + b, 0);
+  if (positives === 0 || positives === values.length) {
+    alert('当前样本全部是"赢"或全部是"输"，无法计算 ROC/AUC，请检查盈利判定阈值是否合理');
+    return;
+  }
+
+  const { direction, roc } = resolveRocDirection(values, labels, directionParam);
+  const { points, auc, best, positives: P, negatives: N } = roc;
+  const precision = Number.isFinite(best.precision) ? best.precision : 0;
+  const recall = best.tpr;
+
+  Plotly.newPlot('rocChart', [
+    {
+      x: points.map(p => p.fpr), y: points.map(p => p.tpr),
+      mode: 'lines+markers', type: 'scatter', name: 'ROC 曲线',
+      line: { color: '#0a84ff' }
+    },
+    {
+      x: [0, 1], y: [0, 1], mode: 'lines', type: 'scatter', name: '随机猜测基准 (AUC=0.5)',
+      line: { dash: 'dash', color: '#98989d' }
+    },
+    {
+      x: [best.fpr], y: [best.tpr], mode: 'markers', type: 'scatter', name: 'Youden 最优点',
+      marker: { color: '#30d158', size: 12, symbol: 'star' }
+    }
+  ], darkLayout({
+    title: `${field} 判定 "${targetField} > ${winThreshold}" 的 ROC 曲线（方向：${direction === 'higher' ? '越大越可能盈利' : '越小越可能盈利'}）`,
+    xaxis: { title: 'FPR（假阳性率）', range: [0, 1] },
+    yaxis: { title: 'TPR（真阳性率）', range: [0, 1] },
+    margin: { t: 50 }
+  }), { responsive: true });
+
+  document.getElementById('rocSummary').innerHTML =
+    `该字段 AUC=${auc.toFixed(3)}，作为筛选条件时建议阈值设为 <b>${formatNumberSmart(best.threshold)}</b>（${direction === 'higher' ? `${escapeHtml(field)} ≥ 该值` : `${escapeHtml(field)} ≤ 该值`}），此时能筛出 <b>${(recall * 100).toFixed(1)}%</b> 的赢家（召回率），同时预测为"赢"的样本里有 <b>${(precision * 100).toFixed(1)}%</b> 真的赢了（精确率）。<span style="color:var(--text-muted)">（正样本 n=${P}，负样本 n=${N}）</span>`;
+}
+
+function renderRocBatch(fields, targetField, winThreshold) {
+  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!fields.length) { alert('请至少选择 1 个字段'); return; }
+  const results = fields.map(field => {
+    const { values, labels } = collectRocSamples(field, targetField, winThreshold);
+    const positives = labels.reduce((a, b) => a + b, 0);
+    if (values.length < 20 || positives === 0 || positives === values.length) {
+      return { field, n: values.length, auc: NaN };
+    }
+    const { direction, roc } = resolveRocDirection(values, labels, 'auto');
+    return { field, n: values.length, auc: roc.auc, direction, threshold: roc.best.threshold, precision: roc.best.precision, recall: roc.best.tpr };
+  });
+  results.sort((a, b) => (Number.isFinite(b.auc) ? b.auc : 0) - (Number.isFinite(a.auc) ? a.auc : 0));
+  document.getElementById('rocBatchBody').innerHTML = results.map(r => `
+    <tr>
+      <td>${escapeHtml(r.field)}</td>
+      <td class="num">${r.n}</td>
+      <td class="num">${Number.isFinite(r.auc) ? r.auc.toFixed(4) : '样本不足/单一类别'}</td>
+      <td>${r.direction ? (r.direction === 'higher' ? '越大越好' : '越小越好') : '-'}</td>
+      <td class="num">${Number.isFinite(r.threshold) ? formatNumberSmart(r.threshold) : '-'}</td>
+      <td class="num">${Number.isFinite(r.precision) ? (r.precision * 100).toFixed(1) + '%' : '-'}</td>
+      <td class="num">${Number.isFinite(r.recall) ? (r.recall * 100).toFixed(1) + '%' : '-'}</td>
+    </tr>
+  `).join('');
+}
+
 // ---------- 初始化：解锁开关 + 各 section 的输入联想/按钮绑定 ----------
 function initProAnalytics() {
   loadProUnlockState();
@@ -769,6 +859,35 @@ function initProAnalytics() {
       document.getElementById('catBreakpoints').value.trim(),
       document.getElementById('catValueField').value.trim(),
       document.getElementById('catSigTest').checked
+    );
+  });
+
+  attachAutocomplete(document.getElementById('rocField'), document.getElementById('rocField'), 'xFieldList', v => {
+    document.getElementById('rocField').value = v;
+  });
+  document.getElementById('genRocBtn').addEventListener('click', () => {
+    renderRocSingle(
+      document.getElementById('rocField').value.trim(),
+      document.getElementById('rocTargetField').value,
+      Number(document.getElementById('rocWinThreshold').value),
+      document.getElementById('rocDirection').value
+    );
+  });
+
+  const rocBatchSelector = makeFieldTagSelector('rocBatchInput', 'rocBatchTagBox');
+  document.getElementById('importRocTop10Btn').addEventListener('click', () => {
+    if (!allCorrelations.length) { alert('请先点击"分析"加载数据'); return; }
+    const seen = new Set();
+    for (const c of allCorrelations) {
+      if (seen.size >= 10) break;
+      if (!seen.has(c.feature)) { seen.add(c.feature); rocBatchSelector.addField(c.feature); }
+    }
+  });
+  document.getElementById('genRocBatchBtn').addEventListener('click', () => {
+    renderRocBatch(
+      rocBatchSelector.getSelected(),
+      document.getElementById('rocTargetField').value,
+      Number(document.getElementById('rocWinThreshold').value)
     );
   });
 }

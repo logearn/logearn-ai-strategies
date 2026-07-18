@@ -719,7 +719,8 @@
 
         <div class="pro-section">
           <h4>4. 时间维度分析</h4>
-          <p class="hint" style="margin: 0 0 10px;">按开仓时间（swap_begin_time）分桶，查看胜率/均值/与特征的相关性是否随时间漂移，判断策略是否随市场环境变化而失效。</p>
+          <p class="hint" style="margin: 0 0 10px;">子视图 A：按开仓时间（swap_begin_time）分桶，查看胜率/均值/与特征的相关性是否随时间漂移。子视图 B：用滚动窗口串联出相关性随时间变化的连续曲线，判断策略是否随市场环境变化而失效。</p>
+          <h5 style="margin: 6px 0;">子视图 A：分桶统计</h5>
           <div class="row">
             <div class="control" style="position: relative;">
               <label for="timeFeatureField">特征字段（可选，留空只看胜率/均值）</label>
@@ -739,7 +740,11 @@
             <div class="control" style="flex: 0; min-width: auto;">
               <button type="button" id="genTimeAnalysisBtn">生成时间分析</button>
             </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="downloadTimeAnalysisCsvBtn">下载 CSV</button>
+            </div>
           </div>
+          <div id="timeAnalysisSummary" class="hint" style="margin: 10px 0;"></div>
           <div id="timeAnalysisChart" style="width: 100%; height: 380px;"></div>
           <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
             <table class="desc-table">
@@ -747,6 +752,37 @@
               <tbody id="timeAnalysisBody"></tbody>
             </table>
           </div>
+
+          <h5 style="margin: 20px 0 6px;">子视图 B：相关性随时间漂移（滚动窗口）</h5>
+          <div class="row">
+            <div class="control" style="position: relative;">
+              <label for="rollingFeatureField">特征字段</label>
+              <input type="text" id="rollingFeatureField" class="field-search" placeholder="如 top_10_holder_rate" autocomplete="off">
+            </div>
+            <div class="control" style="flex: 0; min-width: 140px;">
+              <label for="rollingTargetField">目标</label>
+              <select id="rollingTargetField">
+                <option value="returnCurrent">returnCurrent</option>
+                <option value="returnMax" selected>returnMax</option>
+              </select>
+            </div>
+            <div class="control" style="flex: 0; min-width: 110px;">
+              <label for="rollingWindowDays">窗口（天）</label>
+              <input type="number" id="rollingWindowDays" value="7" min="0.1" step="0.5">
+            </div>
+            <div class="control" style="flex: 0; min-width: 110px;">
+              <label for="rollingStepDays">步长（天）</label>
+              <input type="number" id="rollingStepDays" value="1" min="0.05" step="0.5">
+            </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="genRollingCorrBtn">生成滚动相关性</button>
+            </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="downloadRollingCorrCsvBtn">下载 CSV</button>
+            </div>
+          </div>
+          <div id="rollingCorrNote" class="hint" style="margin: 10px 0;"></div>
+          <div id="rollingCorrChart" style="width: 100%; height: 380px;"></div>
         </div>
 
         <div class="pro-section">

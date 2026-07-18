@@ -5,6 +5,9 @@
 
 const PRO_UNLOCK_STORAGE_KEY = 'chart_pro_unlocked';
 let proUnlocked = false;
+// 时间维度分析（子视图 A 分桶统计 / 子视图 B 滚动窗口相关性）最近一次生成的数据，供 CSV 导出复用
+let timeAnalysisData = [];
+let rollingCorrData = [];
 
 function loadProUnlockState() {
   try { proUnlocked = localStorage.getItem(PRO_UNLOCK_STORAGE_KEY) === '1'; } catch (e) { proUnlocked = false; }
@@ -457,6 +460,97 @@ function renderTimeAnalysis(featureField, targetField, bucketCount) {
       <td class="num">${Number.isFinite(s.r) ? s.r.toFixed(4) : '-'}</td>
     </tr>
   `).join('');
+
+  timeAnalysisData = stats;
+  // 自动检测最近的桶相比历史均值胜率是否明显下降——用最后 20%（至少 1 个）的桶 vs 其余桶做对比
+  const summaryEl = document.getElementById('timeAnalysisSummary');
+  const withWinRate = stats.filter(s => Number.isFinite(s.winRate));
+  const recentCount = Math.max(1, Math.round(withWinRate.length * 0.2));
+  if (withWinRate.length - recentCount >= 2) {
+    const recent = withWinRate.slice(-recentCount);
+    const earlier = withWinRate.slice(0, -recentCount);
+    const recentAvg = recent.reduce((a, s) => a + s.winRate, 0) / recent.length;
+    const earlierAvg = earlier.reduce((a, s) => a + s.winRate, 0) / earlier.length;
+    const dropPct = (earlierAvg - recentAvg) * 100;
+    summaryEl.textContent = dropPct > 10
+      ? `⚠️ 最近 ${recentCount} 个时间桶的胜率（${(recentAvg * 100).toFixed(1)}%）相比此前均值（${(earlierAvg * 100).toFixed(1)}%）下降了 ${dropPct.toFixed(1)} 个百分点，策略可能正在失效，建议结合具体时间段核查。`
+      : '';
+  } else {
+    summaryEl.textContent = '';
+  }
+}
+
+function downloadTimeAnalysisCsv() {
+  if (!timeAnalysisData.length) { alert('请先生成时间分析'); return; }
+  const rows = timeAnalysisData.map(s => [s.label, s.n, Number.isFinite(s.winRate) ? (s.winRate * 100).toFixed(2) : '', Number.isFinite(s.mean) ? s.mean : '', Number.isFinite(s.r) ? s.r.toFixed(4) : '']);
+  downloadCsvGeneric('time_analysis_buckets.csv', ['时间段', '样本数', '胜率(%)', '均值', '与特征的r'], rows);
+}
+
+// ---------- 4B. 相关性随时间漂移（滚动窗口） ----------
+function renderRollingCorrelation(featureField, targetField, windowDays, stepDays) {
+  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (!featureField) { alert('请填写特征字段'); return; }
+  const withTime = activeRows.filter(r => isFiniteNumber(r.swapBeginTime));
+  if (withTime.length < 10) { alert('有效的 swap_begin_time 样本太少（< 10），无法做滚动窗口相关性分析'); return; }
+
+  // swap_begin_time 假定为 Unix 秒；若数值明显是毫秒级（>1e12），统一换算成秒，避免窗口大小算错
+  const toSec = t => (t > 1e12 ? t / 1000 : t);
+  const timed = withTime.map(r => ({ row: r, t: toSec(r.swapBeginTime) })).sort((a, b) => a.t - b.t);
+  const minT = timed[0].t, maxT = timed[timed.length - 1].t;
+  const spanDays = (maxT - minT) / 86400;
+  if (spanDays < 1) { alert('当前样本时间跨度不足以进行有意义的时间维度分析（不足 1 天），建议放宽全局过滤条件'); return; }
+
+  const windowSec = Math.max(0.01, windowDays) * 86400;
+  const stepSec = Math.max(0.01, stepDays) * 86400;
+  const windowCount = Math.floor((maxT - minT) / stepSec) + 1;
+  if (windowCount > 200) { alert(`当前窗口/步长设置会产生 ${windowCount} 个滚动窗口，过多不利于渲染和阅读，请调大步长或窗口大小`); return; }
+
+  const LOW_N_THRESHOLD = 10;
+  const points = [];
+  for (let start = minT; start <= maxT; start += stepSec) {
+    const end = start + windowSec;
+    const pairs = [];
+    for (const { row, t } of timed) {
+      if (t < start || t >= end) continue;
+      const fv = getFeature(row, featureField), tv = getFeature(row, targetField);
+      if (isFiniteNumber(fv) && isFiniteNumber(tv)) pairs.push([Number(fv), Number(tv)]);
+    }
+    const r = pairs.length >= 5 ? pearson(pairs) : NaN;
+    points.push({ end, n: pairs.length, r });
+  }
+  if (!points.some(p => Number.isFinite(p.r))) { alert('每个滚动窗口内有效样本都不足 5 个，无法计算相关性，请调大窗口大小'); return; }
+
+  const fmtDate = t => { const d = new Date(t * 1000); return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`; };
+
+  Plotly.newPlot('rollingCorrChart', [{
+    x: points.map(p => fmtDate(p.end)),
+    y: points.map(p => Number.isFinite(p.r) ? p.r : null),
+    type: 'scatter', mode: 'lines+markers',
+    marker: {
+      color: '#0a84ff',
+      size: points.map(p => p.n < LOW_N_THRESHOLD ? 6 : 9),
+      opacity: points.map(p => p.n < LOW_N_THRESHOLD ? 0.35 : 1),
+      symbol: points.map(p => p.n < LOW_N_THRESHOLD ? 'circle-open' : 'circle')
+    },
+    line: { color: '#0a84ff' },
+    text: points.map(p => `n=${p.n}`),
+    hovertemplate: '%{x}<br>r=%{y:.4f}<br>%{text}<extra></extra>'
+  }], darkLayout({
+    title: `${featureField} 与 ${targetField} 的滚动窗口相关性（窗口=${windowDays}天，步长=${stepDays}天）`,
+    yaxis: { title: 'r', range: [-1, 1] },
+    margin: { t: 50 }
+  }), { responsive: true });
+
+  document.getElementById('rollingCorrNote').textContent =
+    `空心/半透明点表示该窗口样本数 < ${LOW_N_THRESHOLD}（低置信度：这段的 r 值本身不稳定，不代表真实趋势变化，不要把波动误读成"信号真的变了"）。`;
+
+  rollingCorrData = points;
+}
+
+function downloadRollingCorrCsv() {
+  if (!rollingCorrData.length) { alert('请先生成滚动相关性图表'); return; }
+  const rows = rollingCorrData.map(p => [new Date(p.end * 1000).toISOString(), p.n, Number.isFinite(p.r) ? p.r.toFixed(6) : '']);
+  downloadCsvGeneric('rolling_correlation.csv', ['window_end', 'n', 'r'], rows);
 }
 
 // ---------- 5. 分类字段与收益关系（箱线图 + 胜率对比 + 显著性检验） ----------
@@ -570,6 +664,20 @@ function initProAnalytics() {
       Number(document.getElementById('timeBucketCount').value)
     );
   });
+  document.getElementById('downloadTimeAnalysisCsvBtn').addEventListener('click', downloadTimeAnalysisCsv);
+
+  attachAutocomplete(document.getElementById('rollingFeatureField'), document.getElementById('rollingFeatureField'), 'xFieldList', v => {
+    document.getElementById('rollingFeatureField').value = v;
+  });
+  document.getElementById('genRollingCorrBtn').addEventListener('click', () => {
+    renderRollingCorrelation(
+      document.getElementById('rollingFeatureField').value.trim(),
+      document.getElementById('rollingTargetField').value,
+      Number(document.getElementById('rollingWindowDays').value),
+      Number(document.getElementById('rollingStepDays').value)
+    );
+  });
+  document.getElementById('downloadRollingCorrCsvBtn').addEventListener('click', downloadRollingCorrCsv);
 
   attachAutocomplete(document.getElementById('catField'), document.getElementById('catField'), 'filterFieldList', v => {
     document.getElementById('catField').value = v;

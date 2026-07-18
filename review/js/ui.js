@@ -9,6 +9,9 @@ let allCorrelations = [];
 let scatterOptions = [];
 let colorOptions = [];
 let highlightCAs = new Set(); // 查找 CA：命中的地址在所有散点图里高亮显示，支持多个
+const bootstrapCIMap = new Map(); // `${target}|${feature}` -> { lo, hi, n }；activeRows 变化时清空，避免用旧数据集的区间误导
+let bootstrapRunning = false;
+let bootstrapCancelFlag = false;
 
 function updateSummary() {
   if (!activeRows.length) {
@@ -88,7 +91,7 @@ function renderCorrTable() {
 
   document.querySelector('#corrTableHead tr').innerHTML = '<th>目标</th><th>字段</th><th>中文含义</th><th>来源</th><th class="num">r</th>'
     + (oosEnabled ? '<th class="num">训练集 r</th><th class="num">测试集 r</th>' : '')
-    + '<th class="num">Spearman ρ</th><th class="num">|Δ|</th><th class="num">n</th><th class="num">p</th><th class="num">校正后 p</th><th>操作</th>';
+    + '<th class="num">Spearman ρ</th><th class="num">|Δ|</th><th class="num">n</th><th class="num">p</th><th class="num">校正后 p</th><th>r 的 95% CI</th><th>操作</th>';
 
   const filtered = fullSet.slice(0, top);
   const tbody = document.getElementById('corrBody');
@@ -109,6 +112,18 @@ function renderCorrTable() {
       const testTitle = decayed ? ' title="该字段的相关性在样本外明显减弱或符号翻转，可能是过拟合/巧合，谨慎作为决策依据"' : '';
       oosCells = `<td class="num">${Number.isFinite(c._trainR) ? c._trainR.toFixed(4) : '-'}</td><td class="num"${testStyle}${testTitle}>${Number.isFinite(c._testR) ? c._testR.toFixed(4) : '-'}${decayed ? ' ⚠️' : ''}</td>`;
     }
+    // Bootstrap 置信区间：跨零（lo<0<hi）说明"该字段与收益实际无关"的可能性不能排除，点估计值可能只是运气
+    const ci = bootstrapCIMap.get(`${c.target}|${c.feature}`);
+    let ciCell = '<td>-</td>';
+    if (ci) {
+      const crossesZero = Number.isFinite(ci.lo) && Number.isFinite(ci.hi) && ci.lo < 0 && ci.hi > 0;
+      const smallN = ci.n < 20;
+      const style = crossesZero ? ' style="color:#ff453a; font-weight:600;"' : '';
+      const title = crossesZero
+        ? '置信区间跨零，不能排除该字段与收益实际无关的可能，点估计值可能只是运气'
+        : (smallN ? '样本量过小，置信区间估计本身可信度有限，仅供参考' : '');
+      ciCell = `<td${style}${title ? ` title="${escapeHtml(title)}"` : ''}>${Number.isFinite(ci.lo) && Number.isFinite(ci.hi) ? `[${ci.lo.toFixed(2)}, ${ci.hi.toFixed(2)}]` : '-'}${crossesZero ? ' ⚠️' : ''}${smallN ? ' 🔸' : ''}</td>`;
+    }
     return `
     <tr${rowStyle}>
       <td>${escapeHtml(c.target)}</td>
@@ -122,6 +137,7 @@ function renderCorrTable() {
       <td class="num">${c.n}</td>
       <td class="num">${Number.isFinite(c.p) ? c.p.toFixed(4) : '-'}</td>
       <td class="num">${Number.isFinite(c._adjP) ? c._adjP.toFixed(4) : '-'}</td>
+      ${ciCell}
       <td>
         <button class="setX" data-feature="${escapeHtml(c.feature)}" data-target="${escapeHtml(c.target)}">设 X,Y</button>
       </td>
@@ -137,6 +153,58 @@ function renderCorrTable() {
       plot();
     });
   });
+}
+
+// Bootstrap 置信区间：只对当前表格里可见的字段计算（而不是全部字段），把计算量控制在用户实际关心的范围内；
+// 分批 yield 主线程（复用 14.3 的分批处理思路），避免大量重抽样计算卡住页面；支持随时取消。
+async function runBootstrapCI() {
+  if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
+  if (bootstrapRunning) return;
+
+  const target = document.getElementById('corrTarget').value;
+  const source = document.getElementById('corrSource').value;
+  const top = Number(document.getElementById('topN').value);
+  const B = Math.max(100, Math.min(2000, Number(document.getElementById('bootstrapResamples').value) || 500));
+
+  const fullSet = allCorrelations.filter(c => (target === 'all' || c.target === target) && (source === 'all' || c.source === source));
+  fullSet.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
+  const targets = fullSet.slice(0, top);
+  if (!targets.length) { alert('当前表格没有可计算的字段'); return; }
+
+  bootstrapRunning = true;
+  bootstrapCancelFlag = false;
+  const btn = document.getElementById('computeBootstrapCIBtn');
+  const cancelBtn = document.getElementById('cancelBootstrapCIBtn');
+  const progressEl = document.getElementById('bootstrapProgress');
+  btn.disabled = true;
+  cancelBtn.classList.remove('hidden');
+  progressEl.classList.remove('hidden');
+
+  const CHUNK_SIZE = 3; // 每处理 3 个字段就让出一次主线程，兼顾响应性和总耗时
+  for (let i = 0; i < targets.length; i++) {
+    if (bootstrapCancelFlag) { progressEl.textContent = `已取消（完成 ${i}/${targets.length}）`; break; }
+    const c = targets[i];
+    const pairs = [];
+    for (const row of activeRows) {
+      const xv = getFeature(row, c.feature), yv = getFeature(row, c.target);
+      if (isFiniteNumber(xv) && isFiniteNumber(yv)) pairs.push([xv, yv]);
+    }
+    const n = pairs.length;
+    const { lo, hi } = n >= 2 ? bootstrapPearsonCI(pairs, B) : { lo: NaN, hi: NaN };
+    bootstrapCIMap.set(`${c.target}|${c.feature}`, { lo, hi, n });
+
+    if (i % CHUNK_SIZE === CHUNK_SIZE - 1 || i === targets.length - 1) {
+      progressEl.textContent = `正在计算置信区间 ${i + 1} / ${targets.length}（${Math.round(((i + 1) / targets.length) * 100)}%）...`;
+      renderCorrTable();
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  }
+
+  bootstrapRunning = false;
+  btn.disabled = false;
+  cancelBtn.classList.add('hidden');
+  if (!bootstrapCancelFlag) progressEl.textContent = `已完成 ${targets.length} 个字段的置信区间计算（重抽样 ${B} 次）。`;
+  renderCorrTable();
 }
 
 // 字段质量总览：遍历数值/分类字段，统计覆盖率（有值样本占比）和唯一值数量——
@@ -419,6 +487,7 @@ function addFilterRow(field = '', op = '>=', threshold = '') {
 function refreshAnalysisViews() {
   renderFieldQuality();
   renderDistribution();
+  bootstrapCIMap.clear();
   allCorrelations = computeCorrelations(activeRows);
   renderCorrTable();
   updateSummary();
@@ -792,6 +861,8 @@ document.getElementById('corrSortBy').addEventListener('change', renderCorrTable
 document.getElementById('distTargetField').addEventListener('change', renderDistribution);
 document.getElementById('distLogX').addEventListener('change', renderDistribution);
 document.getElementById('distBinCount').addEventListener('change', renderDistribution);
+document.getElementById('computeBootstrapCIBtn').addEventListener('click', runBootstrapCI);
+document.getElementById('cancelBootstrapCIBtn').addEventListener('click', () => { bootstrapCancelFlag = true; });
 document.getElementById('oosEnabled').addEventListener('change', renderCorrTable);
 document.getElementById('oosSplitMethod').addEventListener('change', renderCorrTable);
 document.getElementById('oosTrainRatio').addEventListener('change', renderCorrTable);

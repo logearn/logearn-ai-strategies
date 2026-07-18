@@ -98,6 +98,24 @@ function linearRegression(pairs) {
   return { slope, intercept };
 }
 
+// Bootstrap 置信区间：对 (x,y) 数据对做 B 次有放回重抽样（每次抽样规模等于原始 n），
+// 每次重新算 pearson r，得到 r 的经验分布，取第 2.5%/97.5% 分位数作为 95% CI。
+// 不引入新的随机数生成器/统计库，直接用 Math.random() + 现有 pearson()/percentile()。
+function bootstrapPearsonCI(pairs, B) {
+  const n = pairs.length;
+  if (n < 2) return { lo: NaN, hi: NaN };
+  const rs = [];
+  for (let b = 0; b < B; b++) {
+    const sample = new Array(n);
+    for (let i = 0; i < n; i++) sample[i] = pairs[Math.floor(Math.random() * n)];
+    const r = pearson(sample);
+    if (Number.isFinite(r)) rs.push(r);
+  }
+  if (!rs.length) return { lo: NaN, hi: NaN };
+  rs.sort((a, b) => a - b);
+  return { lo: percentile(rs, 0.025), hi: percentile(rs, 0.975) };
+}
+
 function percentile(sortedArr, p) {
   if (!sortedArr.length) return NaN;
   const idx = (sortedArr.length - 1) * p;

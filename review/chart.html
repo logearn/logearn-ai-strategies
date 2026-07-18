@@ -175,8 +175,6 @@
     }
     .pro-section:first-child { border-top: none; padding-top: 0; }
     .pro-section h4 { font-size: 14px; font-weight: 600; margin: 0 0 6px; color: var(--text); }
-    #proLockedNotice { text-align: center; padding: 20px 0; }
-    #proUnlockBtn { background: linear-gradient(135deg, #bf5af2, #0a84ff); }
     label input[type=checkbox] { accent-color: var(--accent); margin-right: 6px; vertical-align: -2px; }
     .checkbox-control label {
       display: flex; align-items: center; font-size: 13px; color: var(--text); margin-bottom: 0;
@@ -315,6 +313,25 @@
     .ac-item-desc { font-size: 11px; color: var(--text-muted); margin-top: 2px; line-height: 1.4; }
     .ac-empty { padding: 10px; font-size: 12px; color: var(--text-muted); text-align: center; }
     .filter-field.invalid { box-shadow: 0 0 0 2px var(--red) inset; }
+    #navMenuPanel {
+      position: absolute; top: calc(100% + 6px); right: 0; z-index: 200;
+      width: 280px; max-height: 70vh; overflow-y: auto;
+      background: var(--surface-2); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm); box-shadow: 0 16px 40px rgba(0,0,0,.45);
+      padding: 8px;
+    }
+    #navMenuPanel .nav-group-title {
+      font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em;
+      padding: 8px 10px 4px;
+    }
+    #navMenuPanel .nav-item {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 13px; color: var(--text);
+    }
+    #navMenuPanel .nav-item:hover { background: var(--surface-3); }
+    #navMenuPanel .nav-item.disabled { color: var(--text-muted); cursor: not-allowed; }
+    #navMenuPanel .nav-item.disabled:hover { background: none; }
+    #navMenuPanel .nav-item-badge { font-size: 10px; color: var(--text-muted); }
     ::-webkit-scrollbar { width: 10px; height: 10px; }
     ::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 5px; border: 2px solid var(--surface); }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -334,6 +351,10 @@
     <div>
       <h1>收益与快照字段关系分析</h1>
       <div class="app-subtitle">上传 calls / snapshots JSON，在浏览器本地完成匹配、收益计算、相关性分析与筛选</div>
+    </div>
+    <div style="position: relative;">
+      <button type="button" id="navMenuBtn" class="secondary" title="跳转到指定分析面板">☰ 导航</button>
+      <div id="navMenuPanel" class="hidden"></div>
     </div>
     <button type="button" id="snapshotToggleBtn" class="secondary" title="保存/对比分析快照">📷 快照</button>
     <button type="button" id="reportToggleBtn" class="secondary" title="一键生成分析报告">📄 报告</button>
@@ -802,7 +823,7 @@
 
   <div id="plotStack"></div>
 
-  <div class="panel" id="binBarPanel">
+  <div class="panel hidden" id="binBarPanel">
     <div class="panel-header-row" data-target="binBarBody_">
       <h3>分箱柱状图（按区间分箱后看均值±误差棒，推荐用于分布不均匀的数据）</h3>
       <button type="button" class="collapse-toggle">▾</button>
@@ -861,17 +882,13 @@
 
   <div class="panel hidden" id="proPanel">
     <div class="panel-header-row" data-target="proBody_">
-      <h3>🔒 Pro 分析</h3>
+      <h3>进阶分析</h3>
       <button type="button" class="collapse-toggle">▾</button>
     </div>
     <div class="panel-body" id="proBody_">
-      <div id="proLockedNotice">
-        <p class="hint" style="margin: 0 0 10px;">解锁后可用：相关性矩阵热力图、分组对比分析、多元回归特征重要性、时间维度分析、分类字段箱线图。</p>
-        <button type="button" id="proUnlockBtn">🔓 解锁 Pro 分析功能</button>
-      </div>
-      <div id="proContent" class="hidden">
+      <div id="proContent">
 
-        <div class="pro-section">
+        <div class="pro-section" id="proSectionCorrMatrix">
           <h4>1. 相关性矩阵 / 热力图</h4>
           <p class="hint" style="margin: 0 0 10px;">选中若干字段，查看两两 Pearson r 热力图，快速发现高度共线的字段（避免把两个高度相关的字段都当成独立的"强特征"）。点击非对角线格子可直接把这两个字段设为散点图的 X/Y 并跳转查看具体分布。</p>
           <div class="row">
@@ -906,7 +923,7 @@
           </div>
         </div>
 
-        <div class="pro-section">
+        <div class="pro-section" id="proSectionGroupCompare">
           <h4>2. 分组对比分析</h4>
           <p class="hint" style="margin: 0 0 10px;">按分类字段（如 signalType/platform）分组，对比同一特征在不同组内与收益的相关性是否一致，避免"整体相关性显著，其实只是某一类信号驱动"的伪相关（辛普森悖论）。分组字段也可以是数值字段，填写断点后会自动离散化分组。</p>
           <div class="row">
@@ -948,7 +965,7 @@
           </div>
         </div>
 
-        <div class="pro-section">
+        <div class="pro-section" id="proSectionRegression">
           <h4>3. 特征重要性（多元线性回归，标准化系数）</h4>
           <p class="hint" style="margin: 0 0 10px;">选择目标和若干特征，对标准化后的数据做普通最小二乘（OLS）回归，系数反映"控制其他变量后该字段每变化 1 个标准差对目标的独立贡献"，比单变量 r 更能剔除共线字段的虚假重要性。注意：字段间高度共线时系数会不稳定，建议先用上方相关性矩阵排查。</p>
           <div class="row">
@@ -998,7 +1015,7 @@
           </div>
         </div>
 
-        <div class="pro-section">
+        <div class="pro-section" id="proSectionFeatureCombo">
           <h4>3.5 特征组合探索（组合生成器）</h4>
           <p class="hint" style="margin: 0 0 10px;">两个字段的比值/差值/乘积有时比单独任何一个都更有解释力。多选候选字段（建议不超过 10 个，超过 15 个不允许运行），勾选要尝试的运算方式，只展示比原始两个字段单独的 r 都更强（提升 ≥ 0.05）的组合。</p>
           <div class="row">
@@ -1042,7 +1059,7 @@
           </div>
         </div>
 
-        <div class="pro-section">
+        <div class="pro-section" id="proSectionTimeAnalysis">
           <h4>4. 时间维度分析</h4>
           <p class="hint" style="margin: 0 0 10px;">子视图 A：按开仓时间（swap_begin_time）分桶，查看胜率/均值/与特征的相关性是否随时间漂移。子视图 B：用滚动窗口串联出相关性随时间变化的连续曲线，判断策略是否随市场环境变化而失效。</p>
           <h5 style="margin: 6px 0;">子视图 A：分桶统计</h5>
@@ -1110,7 +1127,7 @@
           <div id="rollingCorrChart" style="width: 100%; height: 380px;"></div>
         </div>
 
-        <div class="pro-section">
+        <div class="pro-section" id="proSectionCategoryCompare">
           <h4>5. 分类字段与收益关系</h4>
           <p class="hint" style="margin: 0 0 10px;">按分类字段（如 signalType/platform）分组，展示目标数值字段的箱线图分布 + 胜率对比表，专门分析分类变量而不是只用它做散点图颜色。分类字段也可以是数值字段，填写断点后会自动离散化分组。</p>
           <div class="row">
@@ -1145,7 +1162,7 @@
           </div>
         </div>
 
-        <div class="pro-section">
+        <div class="pro-section" id="proSectionRoc">
           <h4>6. 阈值优化（ROC-AUC 分析）</h4>
           <p class="hint" style="margin: 0 0 10px;">直接回答"这个字段能不能把赢家和输家分开"，以及"分界点定在哪里精确率/召回率最优"，比相关系数更直接服务于筛选决策落地。与相关性排序是互补关系：相关性看整体线性/单调关联强度，AUC 专门衡量二分类筛选能力。</p>
           <div class="row">
@@ -1202,7 +1219,7 @@
           </div>
         </div>
 
-        <div class="pro-section">
+        <div class="pro-section" id="proSectionSimilarCase">
           <h4>7. 相似 Case 检索（最近邻）</h4>
           <p class="hint" style="margin: 0 0 10px;">面对一个基准 token，检索历史上"长得像"的其它 token（在选定字段的标准化空间里欧氏距离最近），看它们后来的收益表现。这是历史相似性参考，不是预测，请结合具体情况判断。</p>
           <div class="row">

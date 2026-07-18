@@ -951,6 +951,7 @@ function finalizeMatchedRows() {
   document.getElementById('corrPanel').classList.remove('hidden');
   document.getElementById('customFieldPanel').classList.remove('hidden');
   document.getElementById('scatterPanel').classList.remove('hidden');
+  document.getElementById('binBarPanel').classList.remove('hidden');
   document.getElementById('proPanel').classList.remove('hidden');
   document.getElementById('downloadWrap').classList.remove('hidden');
   document.getElementById('appendWrap').classList.remove('hidden');
@@ -1170,6 +1171,76 @@ document.getElementById('themeToggleBtn').addEventListener('click', () => {
   applyTheme(isLightTheme() ? 'dark' : 'light');
 });
 updateThemeToggleBtn();
+
+// ========== 导航跳转菜单（UX 优化）==========
+// 页面已经涨到 10+ 个顶层面板 + 进阶分析区域下 8 个子模块，找一个功能得不断滚动，
+// 这里加一个轻量的跳转菜单，覆盖所有面板，点击直接展开对应折叠体并滚动过去。
+const NAV_ITEMS = [
+  { group: '数据管理', label: '数据源 / 追加数据', panelId: null, targetId: 'sourceBody' },
+  { group: '数据管理', label: '分析快照 / 完整数据集', panelId: 'snapshotPanel', targetId: 'snapshotPanel' },
+  { group: '数据管理', label: '一键生成分析报告', panelId: 'reportPanel', targetId: 'reportPanel' },
+  { group: '数据总览', label: '全局条件过滤 & 预设方案', panelId: 'filterPanel', targetId: 'filterPanel' },
+  { group: '数据总览', label: '总览统计', panelId: 'summaryPanel', targetId: 'summaryPanel' },
+  { group: '数据总览', label: '收益分布', panelId: 'distPanel', targetId: 'distPanel' },
+  { group: '数据总览', label: '字段质量总览', panelId: 'fieldQualityPanel', targetId: 'fieldQualityPanel' },
+  { group: '数据总览', label: '异常值 / 数据质量报警', panelId: 'qualityAlertPanel', targetId: 'qualityAlertPanel' },
+  { group: '相关性与特征', label: '字段与收益相关性', panelId: 'corrPanel', targetId: 'corrPanel' },
+  { group: '相关性与特征', label: '自定义组装字段', panelId: 'customFieldPanel', targetId: 'customFieldPanel' },
+  { group: '图表', label: '散点图分析', panelId: 'scatterPanel', targetId: 'scatterPanel' },
+  { group: '图表', label: '分箱柱状图', panelId: 'binBarPanel', targetId: 'binBarPanel' },
+  { group: '进阶分析', label: '1. 相关性矩阵 / 热力图', panelId: 'proPanel', targetId: 'proSectionCorrMatrix' },
+  { group: '进阶分析', label: '2. 分组对比分析', panelId: 'proPanel', targetId: 'proSectionGroupCompare' },
+  { group: '进阶分析', label: '3. 特征重要性（回归）', panelId: 'proPanel', targetId: 'proSectionRegression' },
+  { group: '进阶分析', label: '3.5 特征组合探索', panelId: 'proPanel', targetId: 'proSectionFeatureCombo' },
+  { group: '进阶分析', label: '4. 时间维度分析', panelId: 'proPanel', targetId: 'proSectionTimeAnalysis' },
+  { group: '进阶分析', label: '5. 分类字段与收益关系', panelId: 'proPanel', targetId: 'proSectionCategoryCompare' },
+  { group: '进阶分析', label: '6. 阈值优化（ROC-AUC）', panelId: 'proPanel', targetId: 'proSectionRoc' },
+  { group: '进阶分析', label: '7. 相似 Case 检索', panelId: 'proPanel', targetId: 'proSectionSimilarCase' },
+];
+
+function renderNavMenu() {
+  const panel = document.getElementById('navMenuPanel');
+  let html = '';
+  let lastGroup = null;
+  NAV_ITEMS.forEach((item, i) => {
+    if (item.group !== lastGroup) { html += `<div class="nav-group-title">${escapeHtml(item.group)}</div>`; lastGroup = item.group; }
+    const gatePanel = item.panelId ? document.getElementById(item.panelId) : null;
+    const locked = gatePanel && gatePanel.classList.contains('hidden');
+    html += `<div class="nav-item${locked ? ' disabled' : ''}" data-idx="${i}">${escapeHtml(item.label)}${locked ? '<span class="nav-item-badge">需先加载数据</span>' : ''}</div>`;
+  });
+  panel.innerHTML = html;
+  panel.querySelectorAll('.nav-item:not(.disabled)').forEach(el => {
+    el.addEventListener('click', () => navigateTo(NAV_ITEMS[+el.dataset.idx]));
+  });
+}
+
+function navigateTo(item) {
+  const target = document.getElementById(item.targetId);
+  if (!target) return;
+  // 找到需要展开的折叠体：可能是 target 自身、target 内部的子元素、或者 target 所在的外层折叠体（进阶分析子模块场景）
+  const body = target.classList.contains('panel-body') ? target
+    : target.querySelector('.panel-body') || target.closest('.panel-body');
+  if (body && body.classList.contains('hidden')) {
+    body.classList.remove('hidden');
+    const header = document.querySelector(`.panel-header-row[data-target="${body.id}"]`);
+    if (header) { const t = header.querySelector('.collapse-toggle'); if (t) t.classList.remove('collapsed'); }
+  }
+  target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  document.getElementById('navMenuPanel').classList.add('hidden');
+}
+
+const navMenuBtn = document.getElementById('navMenuBtn');
+const navMenuPanel = document.getElementById('navMenuPanel');
+navMenuBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  renderNavMenu(); // 每次打开时重新渲染，保证"需先加载数据"的锁定状态是最新的
+  navMenuPanel.classList.toggle('hidden');
+});
+document.addEventListener('click', e => {
+  if (!navMenuPanel.classList.contains('hidden') && !navMenuPanel.contains(e.target) && e.target !== navMenuBtn) {
+    navMenuPanel.classList.add('hidden');
+  }
+});
 
 // ========== 分析快照保存 / 对比（design doc §10.1） ==========
 // 存的是"分析结果摘要"（过滤条件 + 总览统计 + 相关性 Top N），不是全量原始数据，避免存储爆炸；

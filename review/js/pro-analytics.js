@@ -1,24 +1,12 @@
 // ========== Pro 分析功能：相关性矩阵 / 分组对比 / 特征重要性(OLS) / 时间维度 / 分类字段分析 ==========
 // 必须最后加载：复用 ui.js（activeRows/scatterOptions/attachAutocomplete/getFeature 等）
 // 和 charts.js（darkLayout/palette）里已经定义好的状态与函数。
-// 所有功能默认锁定，点击"解锁 Pro 分析功能"后才展示（本地开关，无真实付费校验）。
+// 之前这里有一层"解锁 Pro 分析功能"的软门控，但本地开关本身没有真实付费校验，只会增加使用摩擦，
+// 已去掉，所有分析功能直接可用（UX 优化：取消/简化 Pro 解锁墙）。
 
-const PRO_UNLOCK_STORAGE_KEY = 'chart_pro_unlocked';
-let proUnlocked = false;
 // 时间维度分析（子视图 A 分桶统计 / 子视图 B 滚动窗口相关性）最近一次生成的数据，供 CSV 导出复用
 let timeAnalysisData = [];
 let rollingCorrData = [];
-
-function loadProUnlockState() {
-  try { proUnlocked = localStorage.getItem(PRO_UNLOCK_STORAGE_KEY) === '1'; } catch (e) { proUnlocked = false; }
-}
-function saveProUnlockState() {
-  try { localStorage.setItem(PRO_UNLOCK_STORAGE_KEY, proUnlocked ? '1' : '0'); } catch (e) {}
-}
-function applyProUnlockUi() {
-  document.getElementById('proLockedNotice').classList.toggle('hidden', proUnlocked);
-  document.getElementById('proContent').classList.toggle('hidden', !proUnlocked);
-}
 
 // ---------- 通用多选字段标签输入（复用 X 指标联想 datalist） ----------
 // 与 ui.js 的 batchXSelected 标签输入是同一套交互模式，但服务于本文件内独立的字段列表（相关性矩阵/回归特征），
@@ -1018,16 +1006,8 @@ function renderRocBatch(fields, targetField, winThreshold) {
   `).join('');
 }
 
-// ---------- 初始化：解锁开关 + 各 section 的输入联想/按钮绑定 ----------
+// ---------- 初始化：各 section 的输入联想/按钮绑定 ----------
 function initProAnalytics() {
-  loadProUnlockState();
-  applyProUnlockUi();
-  document.getElementById('proUnlockBtn').addEventListener('click', () => {
-    proUnlocked = true;
-    saveProUnlockState();
-    applyProUnlockUi();
-  });
-
   const corrMatrixSelector = makeFieldTagSelector('corrMatrixInput', 'corrMatrixTagBox');
   document.getElementById('genCorrMatrixBtn').addEventListener('click', () => renderCorrMatrix(
     corrMatrixSelector.getSelected(),

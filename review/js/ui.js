@@ -888,20 +888,24 @@ function plotFromButton() {
   plot();
 }
 
-// CSV 导出跟随当前工作集（design doc §15.3）：之前导出的是全量 matchedRows，忽略了顶部"全局条件过滤"，
-// 用户过滤掉的记录依然会被导出，容易造成"导出的数据和界面上看到的分析结果不一致"的误解，改成导出 activeRows。
-// 同时列集合显式并入 customFields 的字段名，避免某个自定义字段对所有行都算不出值（比如公式依赖的原始字段
-// 在这批数据里全部缺失）时，因为 flatMap 扫不到任何一行有这个 key 而整列从 CSV 里消失、用户却毫无察觉。
+// CSV 导出跟随当前工作集（design doc §15.3）：提供"导出过滤后数据（activeRows）"/"导出全部数据（matchedRows）"
+// 二选一开关，默认选中前者（更符合"导出我正在看的这份结果"的直觉）。
+// 列集合从字段注册表（scatterOptions 并入 customFields 全部字段名）取全集，而不是从行数据反推——
+// 即使某个自定义字段对所有行都算不出值（比如公式写错，或依赖的字段普遍缺失），也要在 CSV 里出现这一列
+// （值留空），让"字段存在"和"字段有值"这两件事在导出结果里能被区分开来。
 function downloadCsv() {
-  if (!activeRows.length) { alert('当前没有数据可导出（请检查过滤条件或先点击"分析"）'); return; }
+  const scope = document.querySelector('input[name="downloadCsvScope"]:checked').value;
+  const rows = scope === 'all' ? matchedRows : activeRows;
+  const isFiltered = scope !== 'all' && activeRows.length !== matchedRows.length;
+  if (!rows.length) { alert('当前没有数据可导出（请检查过滤条件或先点击"分析"）'); return; }
   const featureKeys = [...new Set([
-    ...activeRows.flatMap(r => Object.keys(r.features)),
+    ...scatterOptions,
     ...customFields.map(c => c.name),
-  ])].sort();
-  const categoricalKeys = [...new Set(activeRows.flatMap(r => Object.keys(r.categorical || {})))].sort();
+  ])].filter(f => f !== 'returnCurrent' && f !== 'returnMax' && !ROW_LEVEL_FIELDS.includes(f)).sort();
+  const categoricalKeys = [...new Set(rows.flatMap(r => Object.keys(r.categorical || {})))].sort();
   const cols = ['id','symbol','tokenAddress','signalType','initialMcap','currentMcap','maxMcap','returnCurrent','returnMax', ...featureKeys, ...categoricalKeys];
   const lines = [cols.map(csvEscape).join(',')];
-  for (const r of activeRows) {
+  for (const r of rows) {
     const row = cols.map(c => {
       if (c === 'id') return r.id;
       if (c === 'symbol') return r.symbol;
@@ -916,7 +920,8 @@ function downloadCsv() {
   const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'returns_features.csv';
+  // 文件名带上是否过滤、导出行数，事后从文件名就能分辨这份导出对应的是哪种口径（design doc §15.3 边界情况）
+  a.download = `returns_features_${isFiltered ? 'filtered' : 'all'}_${rows.length}rows.csv`;
   a.click();
   URL.revokeObjectURL(a.href);
 }

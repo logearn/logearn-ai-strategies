@@ -440,7 +440,13 @@
           <div class="control hidden" id="appendWrap" style="flex: 0; min-width: auto;">
             <button id="appendDataBtn" class="secondary" title="把上面选中的新文件合并进当前工作集，而不是整体替换">追加数据</button>
           </div>
-          <div class="control hidden" id="downloadWrap" style="flex: 0; min-width: auto;">
+          <div class="control hidden" id="downloadWrap" style="flex: 0; min-width: auto; display:flex; align-items:flex-end; gap: 10px;">
+            <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; white-space:nowrap;">
+              <input type="radio" name="downloadCsvScope" id="downloadCsvScopeFiltered" value="filtered" checked> 导出过滤后数据
+            </label>
+            <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; white-space:nowrap;">
+              <input type="radio" name="downloadCsvScope" id="downloadCsvScopeAll" value="all"> 导出全部数据
+            </label>
             <button id="downloadCsvBtn" class="secondary">下载 CSV</button>
           </div>
         </div>

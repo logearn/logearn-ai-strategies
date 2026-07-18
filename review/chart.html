@@ -809,14 +809,20 @@
               <div class="control" style="min-width: 260px;">
                 <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
                   <span>原字段（数据里可直接统计的字段）<span id="fieldBrowserOriginalCount" class="hint" style="margin:0;"></span></span>
-                  <button type="button" id="fieldBrowserAddAllOriginal" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                  <span style="display:flex; gap:6px;">
+                    <button type="button" id="fieldBrowserCopyOriginal" class="secondary" style="padding:3px 10px; font-size:11px;">📋 复制字段名</button>
+                    <button type="button" id="fieldBrowserAddAllOriginal" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                  </span>
                 </label>
                 <div id="fieldBrowserOriginal" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
               </div>
               <div class="control" style="min-width: 260px;">
                 <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
                   <span>组装字段（比率/差值等衍生字段 + 自定义字段）<span id="fieldBrowserAssembledCount" class="hint" style="margin:0;"></span></span>
-                  <button type="button" id="fieldBrowserAddAllAssembled" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                  <span style="display:flex; gap:6px;">
+                    <button type="button" id="fieldBrowserCopyAssembled" class="secondary" style="padding:3px 10px; font-size:11px;">📋 复制字段名</button>
+                    <button type="button" id="fieldBrowserAddAllAssembled" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                  </span>
                 </label>
                 <div id="fieldBrowserAssembled" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
               </div>

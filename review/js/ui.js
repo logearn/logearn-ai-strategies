@@ -859,6 +859,13 @@ function initBatchXImport() {
 // 保存最近一次分组结果，供"+ 全部加入X"按钮直接读取，不用重新计算一遍
 let fieldBrowserGroups = { original: [], assembled: [] };
 
+function copyFieldNames(fields) {
+  if (!fields.length) { alert('该分组暂无字段'); return; }
+  navigator.clipboard.writeText(fields.join('\n'))
+    .then(() => alert(`已复制 ${fields.length} 个字段名到剪贴板（每行一个）`))
+    .catch(err => alert('复制失败：' + err));
+}
+
 function addFieldsToX(fields) {
   if (!fields.length) return;
   if (fields.length > 20 && !confirm(`即将一次性加入 ${fields.length} 个字段到 X，会生成 ${fields.length} 张独立散点图，可能比较慢，是否继续？`)) return;
@@ -1133,6 +1140,8 @@ document.getElementById('fieldBrowserToggle').addEventListener('click', () => {
 });
 document.getElementById('fieldBrowserAddAllOriginal').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.original));
 document.getElementById('fieldBrowserAddAllAssembled').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.assembled));
+document.getElementById('fieldBrowserCopyOriginal').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.original));
+document.getElementById('fieldBrowserCopyAssembled').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.assembled));
 document.getElementById('batchXClearBtn').addEventListener('click', () => {
   batchXSelected = [];
   renderBatchTags();

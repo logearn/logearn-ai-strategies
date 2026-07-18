@@ -78,6 +78,68 @@ function giniCoefficient(arr, field) {
 const AGGREGATE_FN_NAMES = ['countWhere', 'avgField', 'sumField', 'maxField', 'minField', 'giniCoefficient'];
 const AGGREGATE_FNS = [countWhere, avgField, sumField, maxField, minField, giniCoefficient];
 
+// 公共函数库（design doc §13.1）：把用户重复手写的"避免除以0"这类边界判断收进几个白名单函数，
+// 降低自定义字段的上手门槛，不需要每次都自己拼 `b !== 0 ? a/b : null` 这种条件判断。
+// b 为 0/缺失时返回 null 而不是 Infinity/NaN，避免这类"坏值"悄悄混进后续统计
+function safeDiv(a, b) {
+  const an = Number(a), bn = Number(b);
+  if (!Number.isFinite(an) || !Number.isFinite(bn) || bn === 0) return null;
+  return an / bn;
+}
+// 占比类组合专用，等价于 safeDiv(a, b) * 100，语义比裸写乘除更清楚
+function pct(a, b) {
+  const v = safeDiv(a, b);
+  return v === null ? null : v * 100;
+}
+// 把值限制在区间内，防止个别极端值把后续相关性/图表拉爆；min/max 任一非有限数时视为该侧不限制
+function clamp(x, min, max) {
+  const xn = Number(x);
+  if (!Number.isFinite(xn)) return null;
+  let v = xn;
+  if (Number.isFinite(min) && v < min) v = min;
+  if (Number.isFinite(max) && v > max) v = max;
+  return v;
+}
+// log(1+x)，给长尾分布字段（mcap/volume等）做压缩变换时常用；x <= -1 时 log 无意义，返回 null
+function log1p(x) {
+  const xn = Number(x);
+  if (!Number.isFinite(xn) || xn <= -1) return null;
+  return Math.log1p(xn);
+}
+const PURE_FN_NAMES = ['safeDiv', 'pct', 'clamp', 'log1p'];
+const PURE_FNS = [safeDiv, pct, clamp, log1p];
+
+// zscore(x, field)：把 x 按 field 这个字段在当前 rows（同一批 applyCustomFields 调用范围内）里的
+// 均值/标准差做标准化，公式里不用自己现算全数据集的均值方差。因为依赖当前数据集，不能是纯函数，
+// 每次 applyCustomFields/试算调用时用 buildZscoreFn(rows) 现场构造一个绑定了该批 rows 的闭包函数。
+function buildZscoreFn(rows) {
+  const statsCache = new Map();
+  function fieldStats(field) {
+    if (statsCache.has(field)) return statsCache.get(field);
+    const vals = [];
+    for (const r of rows) {
+      const v = r.features[field];
+      if (Number.isFinite(v)) vals.push(v);
+    }
+    let stat = { mean: NaN, std: NaN };
+    if (vals.length) {
+      const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+      const variance = vals.reduce((a, b) => a + (b - mean) * (b - mean), 0) / vals.length;
+      stat = { mean, std: Math.sqrt(variance) };
+    }
+    statsCache.set(field, stat);
+    return stat;
+  }
+  return function zscore(x, field) {
+    const xn = Number(x);
+    const { mean, std } = fieldStats(field);
+    if (!Number.isFinite(xn) || !Number.isFinite(mean) || !Number.isFinite(std) || std === 0) return null;
+    return (xn - mean) / std;
+  };
+}
+// 公式编译时需要知道全部可调用函数名（含动态构造的 zscore），聚合函数 + 公共函数 + zscore 三组合并
+const CUSTOM_FN_NAMES = [...AGGREGATE_FN_NAMES, ...PURE_FN_NAMES, 'zscore'];
+
 function loadCustomFields() {
   try {
     const raw = localStorage.getItem(CUSTOM_FIELDS_STORAGE_KEY);
@@ -92,14 +154,16 @@ function saveCustomFields() {
 }
 
 // 编译用户代码：没有 return 关键字时按单表达式处理，自动包一层 return (...)
-// 额外注入 countWhere/avgField/sumField/maxField/minField/giniCoefficient 六个聚合函数作为形参，
-// 公式里可以直接按函数名调用，比如 countWhere(row.arrays.holders, h => h.amount_percentage > 1)
+// 额外注入聚合函数（countWhere/avgField/...）+ 公共函数库（safeDiv/pct/clamp/log1p，design doc §13.1）+
+// zscore 作为形参，公式里可以直接按函数名调用，比如 safeDiv(f['a'], f['b']) 或 countWhere(row.arrays.holders, ...)
 function compileCustomField(code) {
   const body = /\breturn\b/.test(code) ? code : `return (\n${code}\n);`;
-  return new Function('f', 'row', ...AGGREGATE_FN_NAMES, `"use strict";\n${body}`);
+  return new Function('f', 'row', ...CUSTOM_FN_NAMES, `"use strict";\n${body}`);
 }
-function invokeCustomField(fn, features, meta) {
-  return fn(features, meta, ...AGGREGATE_FNS);
+// zscoreFn：由调用方（applyCustomFields/试算）用 buildZscoreFn(rows) 现场构造并传入，
+// 因为 zscore 依赖当前这批行的均值/标准差，不能像其它函数一样是固定不变的纯函数
+function invokeCustomField(fn, features, meta, zscoreFn) {
+  return fn(features, meta, ...AGGREGATE_FNS, ...PURE_FNS, zscoreFn);
 }
 
 function customRowMeta(r) {
@@ -115,6 +179,7 @@ function customRowMeta(r) {
 // 对所有行按定义顺序计算全部自定义字段；写入 row.features，供图表/过滤/相关性直接使用
 function applyCustomFields(rows) {
   customFieldStats.clear();
+  const zscoreFn = buildZscoreFn(rows);
   for (const cf of customFields) {
     const stat = { ok: 0, err: 0, total: rows.length, firstError: '', min: Infinity, max: -Infinity };
     let fn = null;
@@ -123,7 +188,7 @@ function applyCustomFields(rows) {
     if (fn) {
       for (const r of rows) {
         try {
-          const v = invokeCustomField(fn, r.features, customRowMeta(r));
+          const v = invokeCustomField(fn, r.features, customRowMeta(r), zscoreFn);
           if (typeof v === 'number' && Number.isFinite(v)) {
             r.features[cf.name] = v;
             stat.ok++;
@@ -280,11 +345,12 @@ function testCustomFieldFromForm() {
   catch (e) { resultEl.textContent = '❌ 编译失败: ' + e.message; return; }
   const rows = activeRows.length ? activeRows : matchedRows;
   if (!rows.length) { resultEl.textContent = '✅ 编译通过（还没有数据，点"分析"后可试算）'; return; }
+  const zscoreFn = buildZscoreFn(rows);
   const outputs = [];
   let errMsg = '';
   for (const r of rows.slice(0, 5)) {
     try {
-      const v = invokeCustomField(fn, r.features, customRowMeta(r));
+      const v = invokeCustomField(fn, r.features, customRowMeta(r), zscoreFn);
       outputs.push(typeof v === 'number' && Number.isFinite(v) ? formatNumberSmart(v) : String(v));
     } catch (e) {
       outputs.push('<err>');

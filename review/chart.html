@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>收益与快照字段关系分析</title>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <style>
+    :root {
+      --accent: #0a84ff;          /* Apple Blue (dark mode) */
+      --accent-hover: #409cff;
+      --accent-soft: rgba(10,132,255,.15);
+      --text: #f5f5f7;
+      --text-muted: #86868b;
+      --bg: #161617;              /* apple.com dark 背景 */
+      --surface: #1d1d1f;         /* 卡片 */
+      --surface-2: #2c2c2e;       /* 输入框 / 内嵌控件 */
+      --surface-3: #3a3a3c;       /* hover 态 */
+      --border: rgba(255,255,255,.10);
+      --border-subtle: rgba(255,255,255,.06);
+      --header-bg: rgba(22,22,23,.72);
+      --row-hover: rgba(255,255,255,.04);
+      --placeholder: #6e6e73;
+      --chip-bg: rgba(10,132,255,.16);
+      --chip-border: rgba(10,132,255,.35);
+      --chip-text: #6cb2ff;
+      --chip-remove-bg: rgba(10,132,255,.35);
+      --chip-remove-text: #cfe4ff;
+      --radius: 18px;
+      --radius-sm: 10px;
+      --shadow: 0 2px 16px rgba(0,0,0,.35);
+      --green: #30d158;
+      --red: #ff453a;
+    }
+    [data-theme="light"] {
+      --accent: #0a84ff;
+      --accent-hover: #0071e3;
+      --accent-soft: rgba(10,132,255,.10);
+      --text: #1d1d1f;
+      --text-muted: #6e6e73;
+      --bg: #f5f5f7;              /* apple.com light 背景 */
+      --surface: #ffffff;         /* 卡片 */
+      --surface-2: #f0f0f2;       /* 输入框 / 内嵌控件 */
+      --surface-3: #e4e4e7;       /* hover 态 */
+      --border: rgba(0,0,0,.10);
+      --border-subtle: rgba(0,0,0,.08);
+      --header-bg: rgba(245,245,247,.78);
+      --row-hover: rgba(0,0,0,.035);
+      --placeholder: #8e8e93;
+      --chip-bg: rgba(10,132,255,.10);
+      --chip-border: rgba(10,132,255,.30);
+      --chip-text: #0764c9;
+      --chip-remove-bg: rgba(10,132,255,.16);
+      --chip-remove-text: #0a5cbf;
+      --shadow: 0 2px 16px rgba(0,0,0,.08);
+    }
+    * { box-sizing: border-box; }
+    html { color-scheme: dark; }
+    html[data-theme="light"] { color-scheme: light; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+      margin: 0; padding: 0 24px 40px;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.47;
+      -webkit-font-smoothing: antialiased;
+    }
+    .app-container { max-width: 1320px; margin: 0 auto; }
+    .app-header {
+      position: sticky; top: 0; z-index: 100;
+      margin: 0 -24px 24px; padding: 16px 24px 14px;
+      background: var(--header-bg);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
+    }
+    .theme-toggle-btn { flex: 0 0 auto; margin-top: 2px; }
+    h1 {
+      font-size: 24px; font-weight: 600; margin: 0 0 2px 0; letter-spacing: -.022em;
+      color: var(--text);
+    }
+    .app-subtitle { font-size: 13px; color: var(--text-muted); letter-spacing: -.01em; }
+    h3 {
+      font-size: 17px; font-weight: 600; margin: 0 0 14px 0; color: var(--text);
+      letter-spacing: -.022em;
+    }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 22px 24px;
+      margin-bottom: 18px;
+    }
+    .panel.stacked { padding: 0; }
+    .panel.stacked .section { padding: 22px 24px; }
+    .panel.stacked .section + .section { border-top: 1px solid var(--border-subtle); }
+    .panel-header-row {
+      display: flex; align-items: center; justify-content: space-between;
+      cursor: pointer; user-select: none; gap: 12px;
+    }
+    .panel-header-row h3 { margin: 0; }
+    .collapse-toggle {
+      flex: 0 0 auto; background: none; border: none; color: var(--text-muted);
+      cursor: pointer; width: 28px; height: 28px; border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; transition: background .15s ease, color .15s ease, transform .2s ease;
+    }
+    .collapse-toggle:hover { background: var(--surface-2); color: var(--text); }
+    .collapse-toggle.collapsed { transform: rotate(-90deg); }
+    .panel-body { margin-top: 16px; }
+    .panel-body.hidden { display: none; }
+    .row { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
+    .control { display: flex; flex-direction: column; min-width: 160px; flex: 1; }
+    .control label {
+      font-size: 12px; color: var(--text-muted); margin-bottom: 7px; font-weight: 500;
+      letter-spacing: -.01em;
+    }
+    .control label[title] { cursor: help; }
+    .filter-row {
+      display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap;
+      padding: 10px 12px; background: var(--surface-2); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+    }
+    .filter-row .field-search { min-width: 180px; }
+    .filter-row input[type=number] { width: 120px; }
+    .filter-row select { width: 90px; }
+    select, input[type=file], input[type=text].field-search, input[type=text], input[type=number] {
+      padding: 8px 12px; font-size: 13.5px;
+      border: 1px solid transparent; border-radius: var(--radius-sm);
+      background: var(--surface-2); color: var(--text);
+      transition: border-color .18s ease, box-shadow .18s ease, background .18s ease;
+    }
+    .filter-row select, .filter-row input { background: var(--surface); }
+    select:hover, input[type=file]:hover, input[type=text]:hover { background: var(--surface-3); }
+    select:focus, input[type=text]:focus, input[type=number]:focus {
+      outline: none; background: var(--surface-2);
+      border-color: var(--accent); box-shadow: 0 0 0 4px rgba(10,132,255,.25);
+    }
+    input[type=text].field-search { width: 100%; min-width: 220px; }
+    input::placeholder, textarea::placeholder { color: var(--placeholder); }
+    button {
+      padding: 8px 18px; font-size: 13.5px; font-weight: 500;
+      background: var(--accent); color: #fff; border: none; cursor: pointer;
+      border-radius: 980px; white-space: nowrap; letter-spacing: -.01em;
+      transition: background .18s ease, transform .1s ease, opacity .18s ease;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:active { transform: scale(.97); }
+    button:disabled { background: var(--surface-3); color: var(--text-muted); cursor: not-allowed; }
+    button.secondary {
+      background: var(--surface-2); color: var(--accent);
+    }
+    button.secondary:hover { background: var(--surface-3); }
+    button.secondary.active {
+      background: var(--accent); color: #fff;
+    }
+    button.secondary.active:hover { background: var(--accent-hover); }
+    .cf-card {
+      background: var(--surface-2); border-radius: 12px; padding: 10px 14px; margin-bottom: 8px;
+    }
+    .cf-card .cf-head { display: flex; align-items: center; gap: 8px; }
+    .cf-card .cf-name { font-weight: 600; font-size: 13px; flex: 1; word-break: break-all; }
+    .cf-card .cf-code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+      color: var(--text-muted); margin-top: 4px; white-space: pre-wrap; word-break: break-all;
+    }
+    .cf-card .cf-stat { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+    .cf-card .cf-stat.err { color: #e05252; }
+    .cf-card button { padding: 4px 12px; font-size: 12px; }
+    .pro-section {
+      padding: 16px 0; border-top: 1px solid var(--border-subtle);
+    }
+    .pro-section:first-child { border-top: none; padding-top: 0; }
+    .pro-section h4 { font-size: 14px; font-weight: 600; margin: 0 0 6px; color: var(--text); }
+    #proLockedNotice { text-align: center; padding: 20px 0; }
+    #proUnlockBtn { background: linear-gradient(135deg, #bf5af2, #0a84ff); }
+    label input[type=checkbox] { accent-color: var(--accent); margin-right: 6px; vertical-align: -2px; }
+    .checkbox-control label {
+      display: flex; align-items: center; font-size: 13px; color: var(--text); margin-bottom: 0;
+      padding: 8px 14px; border-radius: 980px; background: var(--surface-2);
+      cursor: pointer; white-space: nowrap; user-select: none;
+      transition: background .18s ease;
+    }
+    .checkbox-control label:hover { background: var(--surface-3); }
+    .checkbox-control label:has(input:checked) {
+      background: var(--accent-soft); color: var(--accent);
+    }
+    .hint { font-size: 12px; color: var(--text-muted); margin-top: 8px; letter-spacing: -.01em; }
+    .stats {
+      font-size: 13px; color: var(--text); margin-left: auto; padding: 6px 0;
+    }
+    .stats b { color: var(--accent); font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    th, td { border-bottom: 1px solid var(--border-subtle); padding: 9px 12px; text-align: left; }
+    th {
+      background: var(--surface-2); color: var(--text-muted); font-weight: 500; font-size: 12px;
+      letter-spacing: -.01em; position: sticky; top: 0; z-index: 1;
+    }
+    tbody tr { transition: background .12s ease; }
+    tbody tr:hover { background: var(--row-hover); }
+    tbody tr:last-child td { border-bottom: none; }
+    .table-scroll {
+      border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);
+      overflow: auto; background: var(--surface);
+    }
+    .table-scroll table { font-size: 12px; }
+    .num { font-family: "SF Mono", "SFMono-Regular", Consolas, monospace; text-align: right; font-size: 11.5px; }
+    .tag {
+      display: inline-block; padding: 3px 10px; border-radius: 980px; font-size: 11px;
+      font-weight: 500; letter-spacing: -.01em;
+    }
+    .tag.original { background: rgba(48,209,88,.18); color: var(--green); }
+    .tag.assembled { background: rgba(255,69,58,.18); color: var(--red); }
+    .tag-input {
+      display: flex; flex-wrap: wrap; gap: 7px; align-items: center;
+      padding: 8px 10px; min-height: 44px;
+      background: var(--surface-2); border: 1px solid var(--border-subtle); border-radius: 12px;
+      transition: border-color .18s ease, box-shadow .18s ease;
+    }
+    .hidden { display: none; }
+    .field-desc {
+      font-size: 12.5px; color: var(--text); background: var(--accent-soft);
+      padding: 12px 16px; border-radius: var(--radius-sm); margin-top: 12px; line-height: 1.6;
+    }
+    .field-desc b { color: var(--accent); }
+    .field-desc.empty { color: var(--text-muted); background: var(--surface-2); }
+    .desc-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .desc-table th, .desc-table td { border-bottom: 1px solid var(--border-subtle); padding: 7px 12px; text-align: left; }
+    .desc-table th { background: var(--surface-2); }
+    .desc-table td:first-child { font-family: "SF Mono", "SFMono-Regular", Consolas, monospace; color: var(--text); vertical-align: top; font-size: 11.5px; }
+    .desc-table td:last-child { color: var(--text-muted); }
+    details summary { cursor: pointer; font-size: 13px; color: var(--accent); user-select: none; font-weight: 500; }
+    .ellip { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    textarea {
+      font-family: "SF Mono", "SFMono-Regular", Consolas, monospace; font-size: 12px;
+      border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 12px; resize: vertical;
+      background: var(--surface-2); color: var(--text);
+    }
+    textarea:hover { background: var(--surface-3); }
+    textarea:focus { outline: none; background: var(--surface-2); border-color: var(--accent); box-shadow: 0 0 0 4px rgba(10,132,255,.25); }
+    #binBarChart { border-radius: var(--radius-sm); overflow: hidden; }
+    .tag-input:focus-within { border-color: var(--accent); box-shadow: 0 0 0 4px rgba(10,132,255,.25); }
+    .tag-input input, .tag-input input:focus, .tag-input input:hover {
+      flex: 1; min-width: 200px; background: transparent; border: none; box-shadow: none;
+      padding: 5px 4px; font-size: 13px; color: var(--text); outline: none;
+    }
+    .tag-chip {
+      display: inline-flex; align-items: center; gap: 7px;
+      background: var(--chip-bg); color: var(--chip-text);
+      border: 1px solid var(--chip-border);
+      padding: 5px 8px 5px 13px; border-radius: 980px; font-size: 12.5px; font-weight: 500;
+      max-width: 340px; line-height: 1.2;
+    }
+    .tag-chip .chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tag-chip .chip-remove {
+      all: unset; cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
+      width: 17px; height: 17px; border-radius: 50%; font-size: 13px; line-height: 1;
+      color: var(--chip-remove-text); background: var(--chip-remove-bg);
+      transition: background .15s ease;
+    }
+    .tag-chip .chip-remove:hover { background: var(--accent); color: #fff; }
+    .plot-card {
+      background: var(--surface); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius); box-shadow: var(--shadow);
+      margin-bottom: 18px; padding: 10px 10px 4px; overflow: hidden;
+    }
+    .plot-chart { width: 100%; height: 520px; }
+    .plot-caption { padding: 4px 14px 10px; }
+    .chart-controls { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 6px 4px; }
+    .plot-title-bar {
+      display: flex; align-items: center; gap: 10px; padding: 12px 14px 0;
+    }
+    .plot-title-text {
+      font-size: 15px; font-weight: 600; color: var(--text); letter-spacing: -.01em;
+      user-select: text; cursor: text; word-break: break-all;
+    }
+    .plot-title-bar .chart-tool-btn { flex: 0 0 auto; font-size: 11.5px; padding: 5px 12px; }
+    .chart-opt {
+      display: flex; align-items: center; font-size: 12px; color: var(--text);
+      padding: 6px 12px; border-radius: 980px; background: var(--surface-2);
+      cursor: pointer; white-space: nowrap; user-select: none;
+      transition: background .18s ease;
+    }
+    .chart-opt:hover { background: var(--surface-3); }
+    .chart-opt:has(input:checked) { background: var(--accent-soft); color: var(--accent); }
+    .chart-opt input[type=checkbox] { accent-color: var(--accent); margin-right: 6px; vertical-align: -2px; }
+    .chart-tool-btn {
+      padding: 6px 14px; border-radius: 980px; background: var(--surface-2); color: var(--text);
+      font-size: 12px; font-weight: 500; border: none; cursor: pointer; white-space: nowrap;
+      transition: background .18s ease, color .18s ease;
+    }
+    .chart-tool-btn:hover { background: var(--surface-3); }
+    .chart-tool-btn.active { background: var(--accent); color: #fff; }
+    .chart-tool-btn.danger { margin-left: auto; }
+    .chart-tool-btn.danger:hover { background: var(--red); color: #fff; }
+    .autocomplete-panel {
+      position: fixed; z-index: 1000;
+      max-height: 320px; overflow-y: auto;
+      background: var(--surface-2); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm); box-shadow: 0 16px 40px rgba(0,0,0,.55);
+      padding: 6px;
+    }
+    .ac-item { padding: 8px 10px; border-radius: 8px; cursor: pointer; }
+    .ac-item:hover, .ac-item.active { background: var(--surface-3); }
+    .ac-item-title {
+      font-size: 12.5px; font-weight: 500; color: var(--text);
+      font-family: "SF Mono", "SFMono-Regular", Consolas, monospace;
+    }
+    .ac-item-desc { font-size: 11px; color: var(--text-muted); margin-top: 2px; line-height: 1.4; }
+    .ac-empty { padding: 10px; font-size: 12px; color: var(--text-muted); text-align: center; }
+    .filter-field.invalid { box-shadow: 0 0 0 2px var(--red) inset; }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 5px; border: 2px solid var(--surface); }
+    ::-webkit-scrollbar-track { background: transparent; }
+  </style>
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem('chartTheme');
+        if (saved === 'light') document.documentElement.setAttribute('data-theme', 'light');
+      } catch (e) {}
+    })();
+  </script>
+</head>
+<body>
+  <div class="app-container">
+  <div class="app-header">
+    <div>
+      <h1>收益与快照字段关系分析</h1>
+      <div class="app-subtitle">上传 calls / snapshots JSON，在浏览器本地完成匹配、收益计算、相关性分析与筛选</div>
+    </div>
+    <button type="button" id="themeToggleBtn" class="secondary theme-toggle-btn" title="切换深色/浅色主题">🌙 深色</button>
+  </div>
+
+  <div class="panel stacked">
+    <div class="section">
+      <div class="panel-header-row" data-target="sourceBody">
+        <h3>数据源</h3>
+        <button type="button" class="collapse-toggle">▾</button>
+      </div>
+      <div class="panel-body" id="sourceBody">
+        <div class="row">
+          <div class="control" style="flex: 2;">
+            <label for="callsFile">calls JSON（如 calls_*.json）</label>
+            <input type="file" id="callsFile" accept=".json">
+          </div>
+          <div class="control" style="flex: 2;">
+            <label for="snapsFile">snapshots JSON（如 snapshots_*.json）</label>
+            <input type="file" id="snapsFile" accept=".json">
+          </div>
+          <div class="control" style="flex: 0; min-width: auto;">
+            <button id="analyzeBtn">分析</button>
+          </div>
+          <div class="control hidden" id="downloadWrap" style="flex: 0; min-width: auto;">
+            <button id="downloadCsvBtn" class="secondary">下载 CSV</button>
+          </div>
+        </div>
+        <div class="hint" id="fileHint">请选择 calls 和 snapshots 两个 JSON 文件，页面会在浏览器里完成匹配、计算收益和相关性。</div>
+      </div>
+    </div>
+
+    <div class="section hidden" id="filterPanel">
+      <div class="panel-header-row" data-target="filterBody_">
+        <h3>全局条件过滤 &amp; 筛选 CA</h3>
+        <button type="button" class="collapse-toggle">▾</button>
+      </div>
+      <div class="panel-body" id="filterBody_">
+        <p class="hint">决定下方所有分析使用的数据源：不设置过滤条件时，使用左侧加载的完整数据；设置并点击"筛选 CA"后，下方总览 / 相关性 / 散点图 / 分箱图全部改为基于过滤后的数据源计算。支持多个条件同时满足（AND），支持全部字段：数值字段用 &gt; &lt; &gt;= &lt;= == !=（如 mcap &gt; 120000），字符串字段（symbol / tokenAddress / signalType）用 == != 包含 不包含。字段名必须从输入框下拉联想中选择（这样才能保证与数据中实际字段一致），手打拼错的字段名会被判定为无效并提示。点击"清除"恢复为完整数据源。</p>
+        <datalist id="filterFieldList"></datalist>
+        <div id="filterRows"></div>
+        <div class="row" style="margin-top: 10px;">
+          <button id="addFilterRow" class="secondary">添加条件</button>
+          <button id="applyFilter">筛选 CA</button>
+          <button id="copyFilterCAs" class="secondary">复制 CA</button>
+          <button id="clearFilter" class="secondary">清除</button>
+        </div>
+        <div id="filterStats" class="stats" style="margin-top: 10px;"></div>
+        <div class="table-scroll" style="margin-top: 10px; max-height: 300px;">
+          <table class="desc-table">
+            <thead>
+              <tr><th>symbol</th><th>token_address (CA)</th><th class="num">returnCurrent</th><th class="num">匹配值</th></tr>
+            </thead>
+            <tbody id="filterBody"></tbody>
+          </table>
+        </div>
+        <textarea id="filterCaText" rows="4" style="width:100%; margin-top:8px; display:none;"></textarea>
+      </div>
+    </div>
+
+    <div class="section hidden" id="summaryPanel">
+      <div class="panel-header-row" data-target="summaryText">
+        <h3>总览统计</h3>
+        <button type="button" class="collapse-toggle">▾</button>
+      </div>
+      <div class="panel-body" id="summaryText"></div>
+    </div>
+  </div>
+
+  <div class="panel hidden" id="corrPanel">
+    <div class="panel-header-row" data-target="corrBody_">
+      <h3>字段与收益相关性</h3>
+      <button type="button" class="collapse-toggle">▾</button>
+    </div>
+    <div class="panel-body" id="corrBody_">
+      <div class="row" style="margin-bottom: 10px;">
+        <div class="control" style="flex: 0; min-width: auto;">
+          <label for="corrTarget">目标</label>
+          <select id="corrTarget">
+            <option value="all">全部</option>
+            <option value="returnCurrent">returnCurrent</option>
+            <option value="returnMax" selected>returnMax</option>
+          </select>
+        </div>
+        <div class="control" style="flex: 0; min-width: auto;">
+          <label for="corrSource">来源</label>
+          <select id="corrSource">
+            <option value="all">全部</option>
+            <option value="original">原始字段</option>
+            <option value="assembled">组装字段</option>
+          </select>
+        </div>
+        <div class="control" style="flex: 0; min-width: auto;">
+          <label for="topN">Top</label>
+          <select id="topN">
+            <option value="20" selected>20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="99999">全部</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>目标</th><th>字段</th><th>中文含义</th><th>来源</th><th class="num">r</th><th class="num">n</th><th>操作</th></tr>
+          </thead>
+          <tbody id="corrBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel hidden" id="customFieldPanel">
+    <div class="panel-header-row" data-target="customFieldBody_">
+      <h3>⚙️ 自定义组装字段（JS）</h3>
+      <button type="button" class="collapse-toggle">▾</button>
+    </div>
+    <div class="panel-body" id="customFieldBody_">
+      <p class="hint" style="margin: -6px 0 12px;">用 JS 代码自己组装新字段：<code>f</code> 是当前行全部扁平化字段（如 <code>f['pool_liquidity']</code>），<code>row</code> 是行元信息（<code>row.returnMax</code> / <code>row.returnCurrent</code> / <code>row.symbol</code> / <code>row.token_address</code>）。支持单表达式（如 <code>f['mcap'] / f['pool_liquidity']</code>）或带 <code>return</code> 的函数体。返回有限数值才会写入该行，返回 null/undefined/NaN 视为该行无值。后定义的字段可以引用先定义的自定义字段。定义保存在浏览器本地（localStorage），刷新不丢失。</p>
+      <div id="customFieldList"></div>
+      <div class="row" style="margin-top: 10px;">
+        <div class="control" style="flex: 1;">
+          <label for="customFieldName">字段名（自动加 custom. 前缀）</label>
+          <input type="text" id="customFieldName" placeholder="例如 holder_per_liq" autocomplete="off">
+        </div>
+      </div>
+      <div class="row" style="margin-top: 8px;">
+        <div class="control" style="flex: 1 1 100%;">
+          <label for="customFieldCode">JS 代码</label>
+          <textarea id="customFieldCode" rows="5" style="width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;" placeholder="f['buy_wcoin_amount_d1'] / (f['pool_liquidity'] || 1)
+// 或写函数体：
+// const a = f['chip_analysis.above_percent'];
+// if (a === undefined) return null;
+// return a * 2;"></textarea>
+        </div>
+      </div>
+      <div class="row" style="margin-top: 8px; gap: 8px; align-items: center;">
+        <button type="button" id="customFieldTestBtn" class="secondary">测试运行</button>
+        <button type="button" id="customFieldSaveBtn">保存字段</button>
+        <button type="button" id="customFieldCancelBtn" class="secondary hidden">取消编辑</button>
+        <span id="customFieldResult" class="hint"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel hidden" id="scatterPanel">
+    <div class="panel-header-row" data-target="scatterBody_">
+      <h3>散点图分析</h3>
+      <button type="button" class="collapse-toggle">▾</button>
+    </div>
+    <div class="panel-body" id="scatterBody_">
+    <p class="hint" style="margin: -6px 0 12px;">X 指标支持多选：输入联想、选中自动加为标签，点 × 删除。每个选中的指标生成一张独立散点图，自上而下平铺展示；对数轴 / 剔除离群点 / 置信区间 / 分档统计等选项已下沉到每张图内单独设置。</p>
+    <div class="row">
+      <div class="control" style="flex: 1 1 100%; position: relative;">
+        <label for="batchXInput">横坐标 (X，可多选)</label>
+        <div class="tag-input" id="batchXTagBox">
+          <input type="text" id="batchXInput" placeholder="输入字段名或中文含义搜索，选中自动添加..." autocomplete="off">
+        </div>
+        <datalist id="xFieldList"></datalist>
+        <div style="margin-top: 8px;">
+          <button type="button" id="batchXImportToggle" class="secondary">📋 粘贴 JSON 片段快速添加</button>
+          <button type="button" id="batchXClearBtn" class="secondary">🗑 一键清空 X</button>
+          <div id="batchXImportPanel" class="hidden" style="margin-top: 8px;">
+            <p class="hint" style="margin: 0 0 6px;">粘贴任意包含字段的 JSON/对象片段（严格 JSON "key": 、单引号 'key': 、不带引号的 key: 都支持；行内 // 注释、末尾逗号、外层不闭合、甚至只贴一两行 key: value 都可以），会自动提取里面的 key，按名称匹配到当前数据里已存在的字段（无需带 gmgn.stat. 等前缀），一次性加入 X 列表。</p>
+            <textarea id="batchXImportText" rows="6" style="width: 100%;" placeholder='例如粘贴：
+"top_10_holder_rate": "0.154", // 前10大持有人占比
+"fresh_wallet_rate": "0.0817"  // 新钱包持仓占比'></textarea>
+            <div class="row" style="margin-top: 6px; gap: 8px; align-items: center;">
+              <button type="button" id="batchXImportBtn">解析并添加到 X</button>
+              <span id="batchXImportResult" class="hint"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="control" style="position: relative;">
+        <label for="yField">纵坐标 (Y)</label>
+        <input type="text" id="yField" class="field-search" placeholder="输入字段名或中文含义搜索..." autocomplete="off">
+        <datalist id="yFieldList"></datalist>
+      </div>
+      <div class="control" style="position: relative;">
+        <label for="colorField">颜色</label>
+        <input type="text" id="colorField" class="field-search" placeholder="留空=无颜色，或搜索字段..." autocomplete="off">
+        <datalist id="colorFieldList"></datalist>
+      </div>
+      <div class="control" style="flex: 0; min-width: auto;">
+        <button id="plotBtn">绘图</button>
+      </div>
+      <div class="control" style="flex: 0; min-width: auto;">
+        <button type="button" id="globalSwapBtn" class="secondary active" title="开启时：X轴=returnMax，Y轴=上面选择的指标；关闭时恢复默认">⇄ 坐标对换</button>
+      </div>
+      <div class="stats" id="plotStats"></div>
+    </div>
+    <div class="row" style="margin-top: 10px;">
+      <div class="control" style="flex: 1 1 100%;">
+        <label for="searchCaInput">查找 CA（支持多个，用逗号 / 空格 / 换行分隔，命中的数据点会在下方所有图表中高亮）</label>
+        <textarea id="searchCaInput" rows="2" placeholder="粘贴一个或多个 token 地址..." style="width: 100%;"></textarea>
+      </div>
+    </div>
+    </div>
+  </div>
+
+  <div id="plotStack"></div>
+
+  <div class="panel" id="binBarPanel">
+    <div class="panel-header-row" data-target="binBarBody_">
+      <h3>分箱柱状图（按区间分箱后看均值±误差棒，推荐用于分布不均匀的数据）</h3>
+      <button type="button" class="collapse-toggle">▾</button>
+    </div>
+    <div class="panel-body" id="binBarBody_">
+    <p class="hint">把分箱字段（如 returnCurrent）按自定义区间切分，计算每个区间内数值字段的均值和误差棒（标准差 或 95% 置信区间）。</p>
+    <div class="row">
+      <div class="control" style="position: relative;">
+        <label for="binField">分箱字段（如 returnCurrent）</label>
+        <input type="text" id="binField" class="field-search" placeholder="输入字段名..." autocomplete="off">
+      </div>
+      <div class="control" style="position: relative;">
+        <label for="binValueField">数值字段（求均值，如 top_entrapment_trader_percentage）</label>
+        <input type="text" id="binValueField" class="field-search" placeholder="输入字段名..." autocomplete="off">
+      </div>
+      <div class="control">
+        <label for="binBreakpoints">分箱断点（逗号分隔）</label>
+        <input type="text" id="binBreakpoints" value="0.5,1,1.5,2">
+      </div>
+      <div class="control" style="flex: 0; min-width: 140px;">
+        <label for="binErrorType">误差棒类型</label>
+        <select id="binErrorType">
+          <option value="std">标准差</option>
+          <option value="ci95">95% 置信区间</option>
+        </select>
+      </div>
+      <div class="control" style="flex: 0; min-width: auto;">
+        <button id="genBinBarBtn">生成分箱柱状图</button>
+      </div>
+    </div>
+    <div id="binBarChart" style="width: 100%; height: 420px;"></div>
+    <div class="table-scroll" style="margin-top: 10px; max-height: 240px;">
+      <table class="desc-table">
+        <thead><tr><th>区间</th><th class="num">样本数</th><th class="num">均值</th><th class="num">标准差</th><th class="num">95% CI</th></tr></thead>
+        <tbody id="binBarBody"></tbody>
+      </table>
+    </div>
+    </div>
+  </div>
+
+  <div class="panel hidden" id="proPanel">
+    <div class="panel-header-row" data-target="proBody_">
+      <h3>🔒 Pro 分析</h3>
+      <button type="button" class="collapse-toggle">▾</button>
+    </div>
+    <div class="panel-body" id="proBody_">
+      <div id="proLockedNotice">
+        <p class="hint" style="margin: 0 0 10px;">解锁后可用：相关性矩阵热力图、分组对比分析、多元回归特征重要性、时间维度分析、分类字段箱线图。</p>
+        <button type="button" id="proUnlockBtn">🔓 解锁 Pro 分析功能</button>
+      </div>
+      <div id="proContent" class="hidden">
+
+        <div class="pro-section">
+          <h4>1. 相关性矩阵 / 热力图</h4>
+          <p class="hint" style="margin: 0 0 10px;">选中若干字段，查看两两 Pearson r 热力图，快速发现高度共线的字段（避免把两个高度相关的字段都当成独立的"强特征"）。</p>
+          <div class="row">
+            <div class="control" style="flex: 1 1 100%; position: relative;">
+              <label for="corrMatrixInput">选择字段（可多选）</label>
+              <div class="tag-input" id="corrMatrixTagBox">
+                <input type="text" id="corrMatrixInput" placeholder="输入字段名联想，选中自动添加..." autocomplete="off">
+              </div>
+            </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="genCorrMatrixBtn">生成矩阵</button>
+            </div>
+          </div>
+          <div id="corrMatrixChart" style="width: 100%; height: 480px;"></div>
+        </div>
+
+        <div class="pro-section">
+          <h4>2. 分组对比分析</h4>
+          <p class="hint" style="margin: 0 0 10px;">按分类字段（如 signalType/platform）分组，对比同一特征在不同组内与收益的相关性是否一致，避免"整体相关性显著，其实只是某一类信号驱动"的伪相关。</p>
+          <div class="row">
+            <div class="control" style="position: relative;">
+              <label for="groupByField">分组字段</label>
+              <input type="text" id="groupByField" class="field-search" placeholder="如 signalType" autocomplete="off">
+            </div>
+            <div class="control" style="position: relative;">
+              <label for="groupFeatureField">特征字段</label>
+              <input type="text" id="groupFeatureField" class="field-search" placeholder="要检验的特征" autocomplete="off">
+            </div>
+            <div class="control" style="flex: 0; min-width: 140px;">
+              <label for="groupTargetField">目标</label>
+              <select id="groupTargetField">
+                <option value="returnCurrent">returnCurrent</option>
+                <option value="returnMax" selected>returnMax</option>
+              </select>
+            </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="genGroupCompareBtn">生成分组对比</button>
+            </div>
+          </div>
+          <div id="groupCompareChart" style="width: 100%; height: 380px;"></div>
+          <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
+            <table class="desc-table">
+              <thead><tr><th>分组</th><th class="num">样本数</th><th class="num">均值</th><th class="num">胜率</th><th class="num">与目标的 r</th><th class="num">p</th></tr></thead>
+              <tbody id="groupCompareBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="pro-section">
+          <h4>3. 特征重要性（多元线性回归，标准化系数）</h4>
+          <p class="hint" style="margin: 0 0 10px;">选择目标和若干特征，对标准化后的数据做普通最小二乘（OLS）回归，系数反映"控制其他变量后该字段每变化 1 个标准差对目标的独立贡献"，比单变量 r 更能剔除共线字段的虚假重要性。注意：字段间高度共线时系数会不稳定，建议先用上方相关性矩阵排查。</p>
+          <div class="row">
+            <div class="control" style="flex: 0; min-width: 140px;">
+              <label for="importanceTargetField">目标</label>
+              <select id="importanceTargetField">
+                <option value="returnCurrent">returnCurrent</option>
+                <option value="returnMax" selected>returnMax</option>
+              </select>
+            </div>
+            <div class="control" style="flex: 1 1 100%; position: relative;">
+              <label for="importanceInput">特征字段（可多选，建议 2~15 个）</label>
+              <div class="tag-input" id="importanceTagBox">
+                <input type="text" id="importanceInput" placeholder="输入字段名联想，选中自动添加..." autocomplete="off">
+              </div>
+            </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="genImportanceBtn">运行回归</button>
+            </div>
+          </div>
+          <div id="importanceResult" class="stats"></div>
+          <div id="importanceChart" style="width: 100%; height: 380px;"></div>
+        </div>
+
+        <div class="pro-section">
+          <h4>4. 时间维度分析</h4>
+          <p class="hint" style="margin: 0 0 10px;">按开仓时间（swap_begin_time）分桶，查看胜率/均值/与特征的相关性是否随时间漂移，判断策略是否随市场环境变化而失效。</p>
+          <div class="row">
+            <div class="control" style="position: relative;">
+              <label for="timeFeatureField">特征字段（可选，留空只看胜率/均值）</label>
+              <input type="text" id="timeFeatureField" class="field-search" placeholder="如 top_10_holder_rate" autocomplete="off">
+            </div>
+            <div class="control" style="flex: 0; min-width: 140px;">
+              <label for="timeTargetField">目标</label>
+              <select id="timeTargetField">
+                <option value="returnCurrent">returnCurrent</option>
+                <option value="returnMax" selected>returnMax</option>
+              </select>
+            </div>
+            <div class="control" style="flex: 0; min-width: 120px;">
+              <label for="timeBucketCount">分桶数</label>
+              <input type="number" id="timeBucketCount" value="8" min="2" max="30">
+            </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="genTimeAnalysisBtn">生成时间分析</button>
+            </div>
+          </div>
+          <div id="timeAnalysisChart" style="width: 100%; height: 380px;"></div>
+          <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
+            <table class="desc-table">
+              <thead><tr><th>时间段</th><th class="num">样本数</th><th class="num">胜率</th><th class="num">均值</th><th class="num">与特征的 r</th></tr></thead>
+              <tbody id="timeAnalysisBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="pro-section">
+          <h4>5. 分类字段与收益关系</h4>
+          <p class="hint" style="margin: 0 0 10px;">按分类字段（如 signalType/platform）分组，展示目标数值字段的箱线图分布 + 胜率对比表，专门分析分类变量而不是只用它做散点图颜色。</p>
+          <div class="row">
+            <div class="control" style="position: relative;">
+              <label for="catField">分类字段</label>
+              <input type="text" id="catField" class="field-search" placeholder="如 signalType" autocomplete="off">
+            </div>
+            <div class="control" style="position: relative;">
+              <label for="catValueField">目标数值字段</label>
+              <input type="text" id="catValueField" class="field-search" placeholder="如 returnMax" autocomplete="off">
+            </div>
+            <div class="control" style="flex: 0; min-width: auto;">
+              <button type="button" id="genCatAnalysisBtn">生成分类分析</button>
+            </div>
+          </div>
+          <div id="catAnalysisChart" style="width: 100%; height: 420px;"></div>
+          <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
+            <table class="desc-table">
+              <thead><tr><th>分类</th><th class="num">样本数</th><th class="num">均值</th><th class="num">中位数</th><th class="num">胜率</th></tr></thead>
+              <tbody id="catAnalysisBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!--
+    脚本按依赖顺序加载（均为传统全局脚本，非 ES module，避免 file:// 协议下的 CORS 限制）：
+    utils（纯函数） -> dictionary（字段中文词典） -> data（展开/匹配/相关性） -> charts（Plotly 渲染）
+    -> custom-fields（自定义组装字段引擎） -> ui（应用状态 + 事件绑定，必须最后加载，
+    因为其顶层代码会立即调用 initCustomFieldPanel/updateThemeToggleBtn 等其它模块的函数）。
+  -->
+  <script src="js/utils.js"></script>
+  <script src="js/dictionary.js"></script>
+  <script src="js/data.js"></script>
+  <script src="js/charts.js"></script>
+  <script src="js/custom-fields.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/pro-analytics.js"></script>
+  </div>
+</body>
+</html>

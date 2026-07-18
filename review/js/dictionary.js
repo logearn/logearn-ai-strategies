@@ -176,6 +176,9 @@ const FIELD_DESC = {
   'avg_buy_amount': '平均每笔买入金额',
   'avg_sell_amount': '平均每笔卖出金额',
   'chip_analysis.above_below_ratio': '筹码上下比例 = chip_analysis.above_percent / chip_analysis.below_percent（越高=当前价上方套牢盘相对下方支撑盘越多，抛压风险越大）',
+  'buy_tx_per_buyer': '人均买入笔数 = buy_tx_count_d1 / buyer_count_d1（越高=可能是少数人/机器人在刷单，而不是很多真实用户参与）',
+  'smart_money_net_buy_count': '聪明钱净买入地址数 = smart_money_address_buy_count_d1 - smart_money_address_sell_count_d1',
+  'chip_analysis.pressure_net': '筹码净压力指标 = chip_analysis.above_percent - chip_analysis.below_percent（正数=上方套牢盘更多抛压大，负数=下方支撑更强）',
 };
 
 // 数据源/前缀说明

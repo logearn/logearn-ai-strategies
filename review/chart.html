@@ -458,6 +458,23 @@
     </div>
   </div>
 
+  <div class="panel hidden" id="qualityAlertPanel">
+    <div class="panel-header-row" data-target="qualityAlertBody_">
+      <h3 id="qualityAlertTitle">异常值 / 数据质量报警</h3>
+      <button type="button" class="collapse-toggle collapsed">▾</button>
+    </div>
+    <div class="panel-body hidden" id="qualityAlertBody_">
+      <p class="hint" style="margin: -6px 0 12px;">命中规则不代表数据一定是错的（也可能是极端但真实的市场情况），文案用"可能存在问题"而不是"错误"，请人工核查后再决定是否排除。</p>
+      <div class="table-scroll" style="max-height: 320px;">
+        <table class="desc-table">
+          <thead><tr><th>symbol</th><th>token_address</th><th>命中的规则</th></tr></thead>
+          <tbody id="qualityAlertBody"></tbody>
+        </table>
+      </div>
+      <button type="button" id="excludeQualityAlertsBtn" class="hidden" style="margin-top: 10px;">从工作集中排除这些记录</button>
+    </div>
+  </div>
+
   <div class="panel hidden" id="corrPanel">
     <div class="panel-header-row" data-target="corrBody_">
       <h3>字段与收益相关性</h3>

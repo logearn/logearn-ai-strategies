@@ -155,6 +155,68 @@ function renderCorrTable() {
   });
 }
 
+// 异常值/数据质量报警（design doc §6.2）：内置一组硬编码规则，命中不代表数据一定是错的
+// （也可能是极端但真实的市场情况），文案用"可能存在问题"而不是"错误"。
+function computeQualityAlerts(rows) {
+  const alerts = [];
+  for (const r of rows) {
+    const reasons = [];
+    const rc = r.returnCurrent, rm = r.returnMax;
+    if (Number.isFinite(rc) && rc <= 0) reasons.push(`returnCurrent(${rc.toFixed(2)}x) ≤ 0，收益倍数理论上应该 > 0`);
+    if (Number.isFinite(rm) && rm <= 0) reasons.push(`returnMax(${rm.toFixed(2)}x) ≤ 0，收益倍数理论上应该 > 0`);
+    if (Number.isFinite(rc) && Number.isFinite(rm) && rm < rc) {
+      reasons.push(`returnMax(${rm.toFixed(2)}x) 小于 returnCurrent(${rc.toFixed(2)}x)，逻辑矛盾（期间最大值不应小于当前值）`);
+    }
+    // m5 窗口买卖金额量级异常：design doc §20.1 发现的真实数据笔误案例（少写小数点导致量级相差几个数量级）
+    const buyM5 = getFeature(r, 'buy_wcoin_amount_m5'), sellM5 = getFeature(r, 'sell_wcoin_amount_m5');
+    if (isFiniteNumber(buyM5) && isFiniteNumber(sellM5) && buyM5 > 0 && sellM5 > 0) {
+      const ratio = Math.max(buyM5, sellM5) / Math.min(buyM5, sellM5);
+      if (ratio > 1000) reasons.push(`buy_wcoin_amount_m5(${buyM5}) 与 sell_wcoin_amount_m5(${sellM5}) 量级相差 ${ratio.toFixed(0)} 倍，疑似小数点错误`);
+    }
+    // 筹码上下占比之和应接近100%，明显偏离说明分类没有穷尽或有计算误差（design doc §20.5）
+    const above = getFeature(r, 'chip_analysis.above_percent'), below = getFeature(r, 'chip_analysis.below_percent');
+    if (isFiniteNumber(above) && isFiniteNumber(below)) {
+      const sum = above + below;
+      if (Math.abs(sum - 100) > 15) reasons.push(`chip_analysis.above_percent + below_percent = ${sum.toFixed(1)}%，明显偏离 100%`);
+    }
+    for (const field of ['pool_liquidity', 'buyer_count_d1', 'seller_count_d1']) {
+      const v = getFeature(r, field);
+      if (isFiniteNumber(v) && v < 0) reasons.push(`${field}(${v}) 为负数，该字段语义上不应为负`);
+    }
+    if (reasons.length) alerts.push({ row: r, reasons });
+  }
+  return alerts;
+}
+
+function renderQualityAlerts() {
+  const panel = document.getElementById('qualityAlertPanel');
+  const titleEl = document.getElementById('qualityAlertTitle');
+  const tbody = document.getElementById('qualityAlertBody');
+  const excludeBtn = document.getElementById('excludeQualityAlertsBtn');
+  if (!panel) return;
+  if (!activeRows.length) { panel.classList.add('hidden'); return; }
+  panel.classList.remove('hidden');
+
+  const alerts = computeQualityAlerts(activeRows);
+  titleEl.textContent = alerts.length ? `⚠️ 异常值 / 数据质量报警（发现 ${alerts.length} 条可能存在数据问题的记录）` : '异常值 / 数据质量报警（未发现问题）';
+  excludeBtn.classList.toggle('hidden', alerts.length === 0);
+  tbody.innerHTML = alerts.map(a => `
+    <tr>
+      <td>${escapeHtml(a.row.symbol || '-')}</td>
+      <td class="ellip" title="${escapeHtml(a.row.tokenAddress || '')}">${escapeHtml(a.row.tokenAddress || '-')}</td>
+      <td>${a.reasons.map(r => escapeHtml(r)).join('<br>')}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="3" style="text-align:center; color:var(--text-muted);">未发现可能存在问题的记录</td></tr>';
+
+  excludeBtn.onclick = () => {
+    const flaggedIds = new Set(alerts.map(a => a.row.id));
+    if (!flaggedIds.size) return;
+    if (!confirm(`确定要从当前工作集中排除这 ${flaggedIds.size} 条记录吗？（不会修改原始文件，只影响当前分析）`)) return;
+    activeRows = activeRows.filter(r => !flaggedIds.has(r.id));
+    refreshAnalysisViews();
+  };
+}
+
 // Bootstrap 置信区间：只对当前表格里可见的字段计算（而不是全部字段），把计算量控制在用户实际关心的范围内；
 // 分批 yield 主线程（复用 14.3 的分批处理思路），避免大量重抽样计算卡住页面；支持随时取消。
 async function runBootstrapCI() {
@@ -486,6 +548,7 @@ function addFilterRow(field = '', op = '>=', threshold = '') {
 // 数据集（activeRows）变化后统一刷新下游视图：字段质量 / 相关性 / 总览 / 散点图
 function refreshAnalysisViews() {
   renderFieldQuality();
+  renderQualityAlerts();
   renderDistribution();
   bootstrapCIMap.clear();
   allCorrelations = computeCorrelations(activeRows);

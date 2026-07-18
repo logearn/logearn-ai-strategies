@@ -11,6 +11,10 @@ const DERIVED_KEYS = [
   'avg_buy_amount',
   'avg_sell_amount',
   'chip_analysis.above_below_ratio',
+  // 设计文档 §20 新增组装字段
+  'buy_tx_per_buyer',
+  'smart_money_net_buy_count',
+  'chip_analysis.pressure_net',
 ];
 
 // 以下字段原始值是 0-1 的小数比例（比如 "0.0331" 实际代表 3.31%），
@@ -198,6 +202,27 @@ function buildRows(calls, snapshots) {
     if (fin(buy) && fin(buyers) && buyers !== 0) features['avg_buy_amount'] = buy / buyers;
     if (fin(sell) && fin(sellers) && sellers !== 0) features['avg_sell_amount'] = sell / sellers;
     if (fin(chipAbove) && fin(chipBelow) && chipBelow !== 0) features['chip_analysis.above_below_ratio'] = chipAbove / chipBelow;
+    // 人均买入笔数：衡量是不是少数人/机器人在刷单，而不是很多真实用户参与（design doc §20.1）
+    if (fin(buyTx) && fin(buyers) && buyers !== 0) features['buy_tx_per_buyer'] = buyTx / buyers;
+    // 聪明钱净买入地址数（design doc §20.1）
+    if (fin(smartBuy) && fin(smartSell)) features['smart_money_net_buy_count'] = smartBuy - smartSell;
+    // 筹码净压力指标：正数=上方套牢盘更多抛压大，负数=下方支撑更强（design doc §20.5）
+    if (fin(chipAbove) && fin(chipBelow)) features['chip_analysis.pressure_net'] = chipAbove - chipBelow;
+
+    // 冗余字段合并（design doc §20.1/§20.3）：以下几组字段在实际数据里数值完全相同（同一个数的多份拷贝），
+    // 全部保留会让相关性矩阵/表格把同一个信号当成好几个独立信号重复计入，只保留一个规范字段名。
+    if (features['mcap'] === undefined) {
+      if (features['current_mcap'] !== undefined) features['mcap'] = features['current_mcap'];
+      else if (features['fdv'] !== undefined) features['mcap'] = features['fdv'];
+    }
+    delete features['current_mcap'];
+    delete features['fdv'];
+    if (features['gmgn.dev.top_10_holder_rate'] !== undefined) {
+      if (features['gmgn.stat.top_10_holder_rate'] === undefined) {
+        features['gmgn.stat.top_10_holder_rate'] = features['gmgn.dev.top_10_holder_rate'];
+      }
+      delete features['gmgn.dev.top_10_holder_rate'];
+    }
 
     rows.push({
       id: c.id,

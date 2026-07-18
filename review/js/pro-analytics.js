@@ -459,14 +459,14 @@ function renderTimeAnalysis(featureField, targetField, bucketCount) {
   `).join('');
 }
 
-// ---------- 5. 分类字段与收益关系（箱线图 + 胜率对比） ----------
-function renderCatAnalysis(catField, valueField) {
+// ---------- 5. 分类字段与收益关系（箱线图 + 胜率对比 + 显著性检验） ----------
+function renderCatAnalysis(catField, breakpointsText, valueField, sigTestEnabled) {
   if (!activeRows.length) { alert('请先点击"分析"加载数据'); return; }
   if (!catField || !valueField) { alert('请填写分类字段和目标数值字段'); return; }
+  const breakpoints = breakpointsText ? parseBreakpoints(breakpointsText) : [];
   const groups = new Map();
   for (const row of activeRows) {
-    const gv = getFeature(row, catField);
-    const key = (gv === undefined || gv === null || gv === '') ? '(空)' : String(gv);
+    const key = computeGroupKey(row, catField, breakpoints);
     const vv = getFeature(row, valueField);
     if (!isFiniteNumber(vv)) continue;
     if (!groups.has(key)) groups.set(key, []);
@@ -474,8 +474,8 @@ function renderCatAnalysis(catField, valueField) {
   }
   if (!groups.size) { alert('没有可用数据，请检查字段是否正确'); return; }
   // 分类值过多（比如误把连续数值字段当分类字段）时箱线图会失去意义，这里提示但不阻断
-  if (groups.size > 30) {
-    if (!confirm(`检测到 ${groups.size} 个不同分类值，可能不是合适的分类字段，是否继续？`)) return;
+  if (groups.size > 15) {
+    if (!confirm(`检测到 ${groups.size} 个不同分类值，类别过多不利于阅读，可能不是合适的分类字段，是否继续？`)) return;
   }
 
   const entries = [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
@@ -488,19 +488,40 @@ function renderCatAnalysis(catField, valueField) {
     margin: { t: 50 }
   }), { responsive: true });
 
+  // 样本数 < 5 的分类不纳入显著性检验（避免极小样本拉低整体检验的可靠性），
+  // 汇总表里仍展示这些分类，但均值/中位数标注"样本过少，仅供参考"
+  const MIN_SIG_N = 5;
   const rows = entries.map(([key, vals]) => {
     const stats = calcStats(vals, 1);
-    return { key, n: stats.count, mean: stats.mean, median: stats.median, winRate: stats.winRate };
+    return { key, n: stats.count, mean: stats.mean, median: stats.median, winRate: stats.winRate, vals, tooFew: stats.count < MIN_SIG_N };
   });
   document.getElementById('catAnalysisBody').innerHTML = rows.map(s => `
     <tr>
       <td>${escapeHtml(s.key)}</td>
       <td class="num">${s.n}</td>
-      <td class="num">${formatNumberSmart(s.mean)}</td>
+      <td class="num">${formatNumberSmart(s.mean)}${s.tooFew ? ' <span style="color:var(--text-muted)">(样本过少，仅供参考)</span>' : ''}</td>
       <td class="num">${formatNumberSmart(s.median)}</td>
       <td class="num">${(s.winRate * 100).toFixed(1)}%</td>
     </tr>
   `).join('');
+
+  const summaryEl = document.getElementById('catAnalysisSummary');
+  const validGroups = rows.filter(s => !s.tooFew);
+  if (!sigTestEnabled || validGroups.length < 2) {
+    summaryEl.textContent = sigTestEnabled ? '有效分组（样本数≥5）不足 2 个，无法进行显著性检验。' : '';
+    return;
+  }
+  if (validGroups.length === 2) {
+    const { t, df, p, mean1, mean2 } = welchTTest(validGroups[0].vals, validGroups[1].vals);
+    const higher = mean1 >= mean2 ? validGroups[0].key : validGroups[1].key;
+    summaryEl.innerHTML = `${escapeHtml(catField)} 两组间收益差异${p < 0.05 ? '<b style="color:var(--accent)">显著</b>' : '不显著'}（Welch's t=${t.toFixed(3)}, df≈${Number.isFinite(df) ? df.toFixed(1) : '-'}, p=${p.toExponential(2)}），其中 "${escapeHtml(higher)}" 组均值更高。<span style="color:var(--text-muted)">（p 值为大样本正态近似，样本量较小时结果仅供参考）</span>`;
+  } else {
+    const { F, p, df1, df2 } = anovaFTest(validGroups.map(g => g.vals));
+    const topGroup = validGroups.reduce((a, b) => (b.mean > a.mean ? b : a));
+    summaryEl.innerHTML = Number.isFinite(p)
+      ? `${escapeHtml(catField)} 各组间收益差异${p < 0.05 ? '<b style="color:var(--accent)">显著</b>' : '不显著'}（简化 ANOVA F=${F.toFixed(3)}, df=(${df1},${df2}), p=${p.toExponential(2)}），其中 "${escapeHtml(topGroup.key)}" 组均值最高。<span style="color:var(--text-muted)">（简化版检验，p 值为近似值，不追求和专业统计软件完全一致，仅供方向参考）</span>`
+      : '有效样本不足，无法计算 ANOVA。';
+  }
 }
 
 // ---------- 初始化：解锁开关 + 各 section 的输入联想/按钮绑定 ----------
@@ -557,7 +578,12 @@ function initProAnalytics() {
     document.getElementById('catValueField').value = v;
   });
   document.getElementById('genCatAnalysisBtn').addEventListener('click', () => {
-    renderCatAnalysis(document.getElementById('catField').value.trim(), document.getElementById('catValueField').value.trim());
+    renderCatAnalysis(
+      document.getElementById('catField').value.trim(),
+      document.getElementById('catBreakpoints').value.trim(),
+      document.getElementById('catValueField').value.trim(),
+      document.getElementById('catSigTest').checked
+    );
   });
 }
 

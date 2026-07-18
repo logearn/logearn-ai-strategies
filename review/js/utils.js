@@ -169,6 +169,58 @@ function pearsonPValue(r, n) {
   return 2 * (1 - normalCdf(Math.abs(zscore)));
 }
 
+// Welch's t 检验：不假设两组方差相等，比标准 t 检验更稳健，适合分类字段两组均值对比场景。
+// p 值用正态近似（大样本近似，简化处理，n 较小时结果仅供参考）；自由度用 Welch–Satterthwaite 近似，仅用于展示参考。
+function welchTTest(a, b) {
+  const n1 = a.length, n2 = b.length;
+  const mean1 = a.reduce((s, v) => s + v, 0) / n1;
+  const mean2 = b.reduce((s, v) => s + v, 0) / n2;
+  const var1 = n1 > 1 ? a.reduce((s, v) => s + (v - mean1) ** 2, 0) / (n1 - 1) : 0;
+  const var2 = n2 > 1 ? b.reduce((s, v) => s + (v - mean2) ** 2, 0) / (n2 - 1) : 0;
+  const se2 = var1 / n1 + var2 / n2;
+  const se = Math.sqrt(se2);
+  const t = se > 1e-12 ? (mean1 - mean2) / se : 0;
+  const df = se2 > 1e-12 && n1 > 1 && n2 > 1
+    ? se2 ** 2 / ((var1 / n1) ** 2 / (n1 - 1) + (var2 / n2) ** 2 / (n2 - 1))
+    : NaN;
+  const p = 2 * (1 - normalCdf(Math.abs(t)));
+  return { t, df, p, mean1, mean2 };
+}
+
+// Wilson-Hilferty 近似：把卡方分布 CDF 用正态分布近似，避免引入专门的卡方分布实现
+function chiSquareCdfApprox(x, k) {
+  if (x <= 0) return 0;
+  const term = Math.pow(x / k, 1 / 3);
+  const z = (term - (1 - 2 / (9 * k))) / Math.sqrt(2 / (9 * k));
+  return normalCdf(z);
+}
+
+// 简化单因素 ANOVA：算组间/组内方差得到 F 统计量，再用 F ≈ chi²(df1)/df1（df2 较大时的近似）
+// 配合 Wilson-Hilferty 换算成正态近似求 p 值——不追求和专业统计软件完全一致，
+// 目标是给用户一个大致的显著性方向感，文案上需要明确这是简化版。
+function anovaFTest(groups) {
+  const k = groups.length;
+  const allValues = groups.flat();
+  const N = allValues.length;
+  const grandMean = allValues.reduce((s, v) => s + v, 0) / N;
+  let ssBetween = 0, ssWithin = 0;
+  for (const g of groups) {
+    const n = g.length;
+    const mean = g.reduce((s, v) => s + v, 0) / n;
+    ssBetween += n * (mean - grandMean) ** 2;
+    for (const v of g) ssWithin += (v - mean) ** 2;
+  }
+  const df1 = k - 1;
+  const df2 = N - k;
+  if (df1 <= 0 || df2 <= 0) return { F: NaN, p: NaN, df1, df2 };
+  const msBetween = ssBetween / df1;
+  const msWithin = ssWithin / df2;
+  const F = msWithin > 1e-12 ? msBetween / msWithin : Infinity;
+  const chi2Approx = df1 * F;
+  const p = Number.isFinite(chi2Approx) ? 1 - chiSquareCdfApprox(chi2Approx, df1) : 0;
+  return { F, p, df1, df2 };
+}
+
 // 多重比较校正：同时检验 m 个假设时，单个 p<0.05 的"显著性"含义会被稀释——
 // 纯靠运气也会有约 5% 的字段显示 p<0.05，需要校正后才能判断"真正显著"的字段数量。
 // Bonferroni：最简单但偏保守，等价于把显著性阈值除以 m。

@@ -697,7 +697,14 @@
             </div>
           </div>
           <div id="importanceResult" class="stats"></div>
+          <div id="importanceWarning" class="hint hidden" style="margin-top: 10px; color: var(--warn, #ff9f0a);"></div>
           <div id="importanceChart" style="width: 100%; height: 380px;"></div>
+          <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
+            <table class="desc-table">
+              <thead><tr><th>字段</th><th class="num">β（标准化系数）</th><th class="num">单变量 r（对照）</th><th class="num">VIF</th><th>共线性</th></tr></thead>
+              <tbody id="importanceCoefBody"></tbody>
+            </table>
+          </div>
         </div>
 
         <div class="pro-section">

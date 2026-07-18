@@ -160,22 +160,51 @@ function renderGroupCompare(groupField, featureField, targetField) {
 }
 
 // ---------- 3. 特征重要性（多元线性回归，标准化系数） ----------
-// 高斯消元（带部分选主元）求解线性方程组 A x = b，A 为 n x n；ridge 微小正则避免共线导致矩阵奇异时崩溃
-function solveLinearSystem(A, b, ridge = 1e-8) {
+// 高斯消元（带部分选主元）求解线性方程组 A x = b，A 为 n x n。
+// 不再用 ridge 微小正则"悄悄掩盖"共线问题——矩阵（近）奇异时直接返回 null，
+// 让调用方明确知道"这组特征算不出稳定的系数"，而不是输出一个看似精确、实则没有意义的数字。
+function solveLinearSystem(A, b) {
   const n = A.length;
-  const M = A.map((row, i) => [...row.map((v, j) => v + (i === j ? ridge : 0)), b[i]]);
+  if (n === 0) return [];
+  const scale = Math.max(...A.map((row, i) => Math.abs(row[i]))) || 1;
+  const M = A.map((row, i) => [...row, b[i]]);
   for (let col = 0; col < n; col++) {
     let pivot = col;
     for (let r = col + 1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[pivot][col])) pivot = r;
     [M[col], M[pivot]] = [M[pivot], M[col]];
-    if (Math.abs(M[col][col]) < 1e-12) continue; // 奇异，跳过（ridge 通常已避免这种情况）
+    if (Math.abs(M[col][col]) < 1e-9 * scale) return null; // 矩阵（近）奇异，无法稳定求解
     for (let r = 0; r < n; r++) {
       if (r === col) continue;
       const factor = M[r][col] / M[col][col];
       for (let c = col; c <= n; c++) M[r][c] -= factor * M[col][c];
     }
   }
-  return M.map((row, i) => Math.abs(row[i]) > 1e-12 ? row[n] / row[i] : 0);
+  return M.map((row, i) => row[n] / row[i]);
+}
+
+// 简易 VIF（方差膨胀因子）：对每个自变量，用它对其余自变量做回归得到 R²ᵢ，VIF = 1 / (1 - R²ᵢ)。
+// VIF 越大说明该字段能被其余字段线性解释的程度越高，共线性越严重；
+// 如果其余字段之间本身就高度共线导致这个子回归也解不出来，直接视为 VIF = Infinity（共线性已经严重到无法量化的程度）。
+function computeVIFs(usedX, n) {
+  return usedX.map((xi, i) => {
+    const others = usedX.filter((_, j) => j !== i);
+    const kk = others.length;
+    const XtX = Array.from({ length: kk }, (_, a) => Array.from({ length: kk }, (_, b) => {
+      let s = 0; for (let r = 0; r < n; r++) s += others[a].z[r] * others[b].z[r]; return s;
+    }));
+    const Xty = others.map(o => { let s = 0; for (let r = 0; r < n; r++) s += o.z[r] * xi.z[r]; return s; });
+    const solved = solveLinearSystem(XtX, Xty);
+    if (!solved) return Infinity;
+    let sse = 0, sst = 0;
+    for (let r = 0; r < n; r++) {
+      let yhat = 0;
+      for (let a = 0; a < kk; a++) yhat += solved[a] * others[a].z[r];
+      sse += (xi.z[r] - yhat) ** 2;
+      sst += xi.z[r] ** 2;
+    }
+    const r2i = sst > 0 ? 1 - sse / sst : 0;
+    return r2i >= 0.999999 ? Infinity : 1 / (1 - r2i);
+  });
 }
 
 function standardize(values) {
@@ -214,6 +243,27 @@ function renderFeatureImportance(targetField, fields) {
   if (!usedFields.length) { alert('所有特征都是常数，无法回归'); return; }
 
   const n = rows.length, k = usedFields.length;
+  // 自变量数不能超过可用样本数（矩阵不可逆的必要条件），直接拦截
+  if (k >= n) {
+    alert(`自变量数量（${k}）不能超过可用样本数（${n}），请减少字段或放宽过滤条件。`);
+    return;
+  }
+
+  // VIF 无论最终整体回归是否成功都先算好——如果整体矩阵奇异，VIF 表本身就是诊断"哪里出了问题"的关键线索
+  const vifs = computeVIFs(usedX, n);
+  // 单变量 r：在与多元回归完全相同的样本子集（listwise deletion 之后的 rows）上计算，
+  // 才能和 β 系数公平对照，回答"哪些字段单看显著、放一起就消失"
+  const univariateR = usedX.map(xi => pearson(xi.z.map((zx, r) => [zx, y.z[r]])));
+
+  const warnEl = document.getElementById('importanceWarning');
+  const coefBody = document.getElementById('importanceCoefBody');
+  const vifBadge = vif => {
+    if (!Number.isFinite(vif)) return '🔴 无法求解';
+    if (vif > 10) return `🔴 严重 (${vif.toFixed(1)})`;
+    if (vif > 5) return `🟡 中等 (${vif.toFixed(1)})`;
+    return `🟢 正常 (${vif.toFixed(1)})`;
+  };
+
   // 正规方程 X'X beta = X'y（X 含标准化特征，无截距列——标准化后截距理论上≈0，省略以简化）
   const XtX = Array.from({ length: k }, (_, i) => Array.from({ length: k }, (_, j) => {
     let s = 0;
@@ -227,6 +277,26 @@ function renderFeatureImportance(targetField, fields) {
   });
   const beta = solveLinearSystem(XtX, Xty);
 
+  if (!beta) {
+    // 矩阵（近）奇异：不再用 ridge 强行凑一个看似精确、实则没有意义的系数，
+    // 而是明确告知用户问题所在，并展示 VIF 表帮助定位该剔除哪个字段
+    warnEl.classList.remove('hidden');
+    warnEl.textContent = '由于字段间共线性极高（可能存在完全线性相关或近乎重复的字段），无法求解稳定的回归系数，请参考下方 VIF 列先剔除高共线字段后重新运行。';
+    document.getElementById('importanceResult').innerHTML = `<b>完整样本数:</b> ${n} &nbsp; <span style="color:var(--text-muted)">（矩阵近奇异，未输出系数/图表）</span>`;
+    Plotly.purge('importanceChart');
+    coefBody.innerHTML = usedFields.map((f, i) => `
+      <tr>
+        <td>${escapeHtml(f)}</td>
+        <td class="num">-</td>
+        <td class="num">${Number.isFinite(univariateR[i]) ? univariateR[i].toFixed(4) : '-'}</td>
+        <td class="num">${Number.isFinite(vifs[i]) ? vifs[i].toFixed(1) : '∞'}</td>
+        <td>${vifBadge(vifs[i])}</td>
+      </tr>
+    `).join('');
+    return;
+  }
+  warnEl.classList.add('hidden');
+
   // R^2：标准化 y 的 SST = sum(y^2)（均值已为0）
   let sse = 0, sst = 0;
   for (let r = 0; r < n; r++) {
@@ -236,12 +306,15 @@ function renderFeatureImportance(targetField, fields) {
     sst += y.z[r] ** 2;
   }
   const r2 = sst > 0 ? 1 - sse / sst : 0;
+  // 调整 R²：惩罚字段数量，避免"字段越多 R² 越高"这种虚假的模型质量提升假象
+  const adjR2 = n - k - 1 > 0 ? 1 - (1 - r2) * (n - 1) / (n - k - 1) : NaN;
 
-  const result = usedFields.map((f, i) => ({ field: f, beta: beta[i] }));
+  const result = usedFields.map((f, i) => ({ field: f, beta: beta[i], vif: vifs[i], r: univariateR[i] }));
   result.sort((a, b) => Math.abs(b.beta) - Math.abs(a.beta));
 
   document.getElementById('importanceResult').innerHTML =
-    `<b>完整样本数:</b> ${n} &nbsp; <b>R²:</b> ${r2.toFixed(4)} &nbsp; <span style="color:var(--text-muted)">（标准化系数：每变化 1 个标准差对目标的独立贡献，符号=方向，绝对值=强度）</span>`;
+    `<b>完整样本数:</b> ${n} &nbsp; <b>R²:</b> ${r2.toFixed(4)} &nbsp; <b>调整 R²:</b> ${Number.isFinite(adjR2) ? adjR2.toFixed(4) : '-'} &nbsp;
+    <span style="color:var(--text-muted)">（这 ${k} 个字段合计能解释 ${targetField} 方差的 ${(Math.max(0, adjR2 || r2) * 100).toFixed(1)}%；标准化系数：每变化 1 个标准差对目标的独立贡献，符号=方向，绝对值=强度）</span>`;
 
   Plotly.newPlot('importanceChart', [{
     x: result.map(r => r.beta),
@@ -253,6 +326,16 @@ function renderFeatureImportance(targetField, fields) {
     xaxis: { title: '标准化系数 β' },
     margin: { t: 50, l: Math.min(280, 60 + Math.max(...result.map(r => r.field.length)) * 6) }
   }), { responsive: true });
+
+  coefBody.innerHTML = result.map(r => `
+    <tr>
+      <td>${escapeHtml(r.field)}</td>
+      <td class="num">${r.beta.toFixed(4)}</td>
+      <td class="num">${Number.isFinite(r.r) ? r.r.toFixed(4) : '-'}</td>
+      <td class="num">${Number.isFinite(r.vif) ? r.vif.toFixed(1) : '∞'}</td>
+      <td>${vifBadge(r.vif)}</td>
+    </tr>
+  `).join('');
 }
 
 // ---------- 4. 时间维度分析 ----------

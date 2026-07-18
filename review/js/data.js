@@ -245,13 +245,18 @@ function computeCorrelations(rows) {
       }
       if (pairs.length >= 5) {
         const r = pearson(pairs);
+        // 布尔/二值字段（去重值 <= 2）的排名信息量很低，Spearman 在这类字段上意义不大，直接跳过（NaN）
+        const distinctCount = new Set(pairs.map(p => p[0])).size;
+        const rho = distinctCount > 2 ? spearman(pairs) : NaN;
         list.push({
           target: t.key,
           feature: fkey,
           source: isAssembledField(fkey) ? 'assembled' : 'original',
           r,
           n: pairs.length,
-          p: pearsonPValue(r, pairs.length)
+          p: pearsonPValue(r, pairs.length),
+          rho,
+          delta: Number.isFinite(rho) ? Math.abs(r - rho) : NaN
         });
       }
     }

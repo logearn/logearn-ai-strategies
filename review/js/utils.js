@@ -134,6 +134,31 @@ function erf(x) {
 }
 function normalCdf(z) { return 0.5 * (1 + erf(z / Math.SQRT2)); }
 
+// 把数组转成排名（1-based），并列值取平均排名（标准 tied rank 处理），
+// 是 Spearman 秩相关的基础：把两列数据分别转成排名后再对排名做 Pearson 相关，就是 Spearman ρ
+function rankTransform(arr) {
+  const n = arr.length;
+  const idx = arr.map((_, i) => i).sort((a, b) => arr[a] - arr[b]);
+  const ranks = new Array(n);
+  let i = 0;
+  while (i < n) {
+    let j = i;
+    while (j + 1 < n && arr[idx[j + 1]] === arr[idx[i]]) j++;
+    const avgRank = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) ranks[idx[k]] = avgRank;
+    i = j + 1;
+  }
+  return ranks;
+}
+
+// Spearman 秩相关：衡量单调关系（不要求线性），能捕捉 Pearson r 会低估甚至掩盖的 U 型/对数型等非线性但单调的关系
+function spearman(pairs) {
+  if (pairs.length < 2) return NaN;
+  const rx = rankTransform(pairs.map(p => p[0]));
+  const ry = rankTransform(pairs.map(p => p[1]));
+  return pearson(rx.map((r, i) => [r, ry[i]]));
+}
+
 // 用 Fisher z 变换近似计算 Pearson r 的双侧 p 值（大样本近似）
 function pearsonPValue(r, n) {
   if (n < 4) return NaN;

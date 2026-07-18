@@ -35,10 +35,16 @@ function renderCorrTable() {
   const source = document.getElementById('corrSource').value;
   const top = Number(document.getElementById('topN').value);
   const correction = document.getElementById('corrCorrection').value;
+  const sortBy = document.getElementById('corrSortBy').value;
 
   // m 必须是当前 目标/来源 筛选下参与检验的全部字段数（不是 topN 截断后的数量），
   // 否则会系统性低估需要校正的严重程度；corrSource/corrTarget 切换时 m 会跟着重新计算。
   const fullSet = allCorrelations.filter(c => (target === 'all' || c.target === target) && (source === 'all' || c.source === source));
+  if (sortBy === 'delta') {
+    fullSet.sort((a, b) => (Number.isFinite(b.delta) ? b.delta : -1) - (Number.isFinite(a.delta) ? a.delta : -1));
+  } else {
+    fullSet.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
+  }
   const rawPs = fullSet.map(c => c.p);
   const adjustedPs = correction === 'bonferroni' ? bonferroniAdjust(rawPs)
     : correction === 'none' ? rawPs
@@ -62,6 +68,9 @@ function renderCorrTable() {
     // 让用户看到"曾经以为显著、其实经不起多重比较校验"的字段，这本身就是重要信息
     const wasDemoted = correction !== 'none' && Number.isFinite(c.p) && c.p < 0.05 && !(Number.isFinite(c._adjP) && c._adjP < 0.05);
     const rowStyle = wasDemoted ? ' style="color: var(--text-muted); text-decoration: line-through;"' : '';
+    // |Δ| 较大说明 Pearson r 和 Spearman ρ 明显不一致，可能存在非线性但单调的关系，提示去散点图里看形状
+    const deltaFlag = Number.isFinite(c.delta) && c.delta > 0.15
+      ? ` <span title="该字段的线性相关性和单调相关性差异较大，可能存在非线性关系，建议在散点图里查看具体形状（可尝试打开对数轴）">🔀</span>` : '';
     return `
     <tr${rowStyle}>
       <td>${escapeHtml(c.target)}</td>
@@ -69,6 +78,8 @@ function renderCorrTable() {
       <td class="ellip" title="${escapeHtml(getFieldDesc(c.feature))}">${escapeHtml(getFieldDesc(c.feature)) || '暂无备注'}</td>
       <td><span class="tag ${c.source}">${c.source === 'assembled' ? '组装' : '原始'}</span></td>
       <td class="num">${c.r.toFixed(4)}</td>
+      <td class="num">${Number.isFinite(c.rho) ? c.rho.toFixed(4) : '-'}</td>
+      <td class="num">${Number.isFinite(c.delta) ? c.delta.toFixed(4) : '-'}${deltaFlag}</td>
       <td class="num">${c.n}</td>
       <td class="num">${Number.isFinite(c.p) ? c.p.toFixed(4) : '-'}</td>
       <td class="num">${Number.isFinite(c._adjP) ? c._adjP.toFixed(4) : '-'}</td>
@@ -737,6 +748,7 @@ document.getElementById('corrTarget').addEventListener('change', renderCorrTable
 document.getElementById('corrSource').addEventListener('change', renderCorrTable);
 document.getElementById('topN').addEventListener('change', renderCorrTable);
 document.getElementById('corrCorrection').addEventListener('change', renderCorrTable);
+document.getElementById('corrSortBy').addEventListener('change', renderCorrTable);
 document.getElementById('downloadCsvBtn').addEventListener('click', downloadCsv);
 document.getElementById('addFilterRow').addEventListener('click', () => addFilterRow());
 document.getElementById('applyFilter').addEventListener('click', applyFilter);

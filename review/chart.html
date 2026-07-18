@@ -455,6 +455,13 @@
           </select>
         </div>
         <div class="control" style="flex: 0; min-width: auto;">
+          <label for="corrSortBy">排序</label>
+          <select id="corrSortBy">
+            <option value="r" selected>|r| 降序</option>
+            <option value="delta">|Δ|（线性/单调差异）降序</option>
+          </select>
+        </div>
+        <div class="control" style="flex: 0; min-width: auto;">
           <label for="corrCorrection">多重比较校正</label>
           <select id="corrCorrection">
             <option value="bh" selected>Benjamini-Hochberg FDR（推荐，较宽松）</option>
@@ -467,7 +474,7 @@
       <div class="table-scroll">
         <table>
           <thead>
-            <tr><th>目标</th><th>字段</th><th>中文含义</th><th>来源</th><th class="num">r</th><th class="num">n</th><th class="num">p</th><th class="num">校正后 p</th><th>操作</th></tr>
+            <tr><th>目标</th><th>字段</th><th>中文含义</th><th>来源</th><th class="num">r</th><th class="num">Spearman ρ</th><th class="num">|Δ|</th><th class="num">n</th><th class="num">p</th><th class="num">校正后 p</th><th>操作</th></tr>
           </thead>
           <tbody id="corrBody"></tbody>
         </table>

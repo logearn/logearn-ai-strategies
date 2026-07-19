@@ -8,6 +8,33 @@
 let timeAnalysisData = [];
 let rollingCorrData = [];
 
+// 读取"切分方式/训练集比例/切分种子（锁定）"三个输入控件的值，拼成 splitTrainTest 需要的 options 对象。
+// 相关性面板/回归面板/组合评分面板三处的切分控件 DOM id 只有前缀不同（如 oos/regOos/composite），
+// 约定统一走 `${prefix}SplitMethod` / `${prefix}TrainRatio` / `${prefix}Seed` 三个 id 即可复用。
+function readSplitOptions(prefix, extra = {}) {
+  return {
+    ...extra,
+    method: document.getElementById(`${prefix}SplitMethod`).value,
+    ratio: Number(document.getElementById(`${prefix}TrainRatio`).value) || 0.7,
+    seed: Number(document.getElementById(`${prefix}Seed`).value)
+  };
+}
+
+// "导入相关性表 Top10"按钮：从已计算好的 allCorrelations（按 |r| 降序排好）里取前 N 个不重复字段
+// 批量塞进某个字段标签选择器，四个 Pro 子面板（相关矩阵/ROC批量/相似Case/组合评分）共用同一套逻辑。
+// presetFields：调用前先固定加入的字段（如相关矩阵额外预填 returnCurrent/returnMax），可留空。
+function wireImportTop10Btn(btnId, selector, presetFields = [], topN = 10) {
+  document.getElementById(btnId).addEventListener('click', () => {
+    if (!allCorrelations.length) { showToast('请先点击"分析"加载数据'); return; }
+    presetFields.forEach(f => selector.addField(f));
+    const seen = new Set();
+    for (const c of allCorrelations) {
+      if (seen.size >= topN) break;
+      if (!seen.has(c.feature)) { seen.add(c.feature); selector.addField(c.feature); }
+    }
+  });
+}
+
 // ---------- 通用多选字段标签输入（复用 X 指标联想 datalist） ----------
 // 与 ui.js 的 batchXSelected 标签输入是同一套交互模式，但服务于本文件内独立的字段列表（相关性矩阵/回归特征），
 // 因此在此单独实现一个参数化版本，而不是直接改造 ui.js 里那个专属 batchXSelected 的实现。
@@ -268,10 +295,32 @@ function computeGroupKey(row, groupField, breakpoints) {
   return (gv === undefined || gv === null || gv === '') ? '(空)' : String(gv);
 }
 
-function renderGroupCompare(groupField, breakpointsText, featureField, targetField, minSample) {
+// 自动分位数分层（混杂控制）通用工具：把一组数值按分位数切成 quantileCount 层，每层样本量大致相等，
+// 避免手动断点容易出现的"某一层几乎包揽全部样本"问题。返回 { breakpoints } 或 { error } 二选一，
+// 由调用方决定用 showToast 还是别的方式呈现——这个函数本身不做 UI 交互，保持纯函数、方便复用/测试。
+function computeQuantileBreakpoints(values, quantileCount) {
+  const vals = values.filter(isFiniteNumber).map(Number).sort((a, b) => a - b);
+  if (vals.length < quantileCount * 5) {
+    return { error: `有效数值样本仅 ${vals.length} 条，不足以做 ${quantileCount} 分位分层（每层至少需要约 5 条）` };
+  }
+  const cuts = [];
+  for (let i = 1; i < quantileCount; i++) cuts.push(percentile(vals, i / quantileCount));
+  const breakpoints = [...new Set(cuts)].filter(Number.isFinite);
+  if (!breakpoints.length) return { error: '取值过于集中，分位数切点全部重合，无法分层' };
+  return { breakpoints };
+}
+
+function renderGroupCompare(groupField, breakpointsText, featureField, targetField, minSample, quantileCount) {
   if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   if (!groupField || !featureField) { showToast('请填写分组字段和特征字段'); return; }
-  const breakpoints = breakpointsText ? parseBreakpoints(breakpointsText) : [];
+  let breakpoints = breakpointsText ? parseBreakpoints(breakpointsText) : [];
+  // 启用自动分位数分层时优先于手动断点
+  if (Number.isFinite(quantileCount) && quantileCount >= 2) {
+    const result = computeQuantileBreakpoints(activeRows.map(r => getFeature(r, groupField)), quantileCount);
+    if (result.error) { showToast(`分组字段${result.error}；请换字段或改用手动断点`); return; }
+    breakpoints = result.breakpoints;
+    if (breakpointsText) showToast('已启用自动分位数分层，手动断点本次被忽略');
+  }
   const threshold = Number.isFinite(minSample) && minSample > 0 ? minSample : 10;
 
   const groups = new Map();
@@ -295,7 +344,7 @@ function renderGroupCompare(groupField, breakpointsText, featureField, targetFie
     const belowThreshold = pairs.length < threshold;
     const r = (!belowThreshold && pairs.length >= 5) ? pearson(pairs) : NaN;
     const p = Number.isFinite(r) ? pearsonPValue(r, pairs.length) : NaN;
-    stats.push({ key, n: rows.length, mean, winRate, r, p, rn: pairs.length, belowThreshold });
+    stats.push({ key, n: rows.length, mean, winRate, r, p, rn: pairs.length, belowThreshold, targets });
   }
   stats.sort((a, b) => b.n - a.n);
   if (!stats.length) { showToast('没有可用的分组数据，请检查字段是否正确'); return; }
@@ -307,16 +356,27 @@ function renderGroupCompare(groupField, breakpointsText, featureField, targetFie
     if (isFiniteNumber(fv) && isFiniteNumber(tv)) overallPairs.push([Number(fv), Number(tv)]);
   }
   const overallR = overallPairs.length >= 5 ? pearson(overallPairs) : NaN;
-  document.getElementById('groupCompareOverall').innerHTML = Number.isFinite(overallR)
-    ? `<b>整体（未分组）r:</b> ${overallR.toFixed(4)} &nbsp; <span style="color:var(--text-muted)">(n=${overallPairs.length}，作为下方各分组 r 的对照基准)</span>`
-    : '';
+
+  // 分层调整后 r（混杂控制的核心输出）：各层内 r 按有效样本量加权平均。
+  // 它回答的问题是“控制住分组变量后，特征还剩多少独立解释力”；与整体 r 差距越大，
+  // 说明原始相关性里被分组变量（混杂）解释掉的比例越高
+  const validGroupStats = stats.filter(s => Number.isFinite(s.r));
+  const weightSum = validGroupStats.reduce((a, s) => a + s.rn, 0);
+  const weightedR = weightSum > 0 ? validGroupStats.reduce((a, s) => a + s.r * s.rn, 0) / weightSum : NaN;
+  const overallParts = [];
+  if (Number.isFinite(overallR)) overallParts.push(`<b>整体（未分组）r:</b> ${overallR.toFixed(4)} <span style="color:var(--text-muted)">(n=${overallPairs.length})</span>`);
+  if (Number.isFinite(weightedR)) overallParts.push(`<b>分层调整后 r（层内按样本量加权）:</b> ${weightedR.toFixed(4)} <span style="color:var(--text-muted)">(基于 ${validGroupStats.length} 层，覆盖 n=${weightSum})</span>`);
+  document.getElementById('groupCompareOverall').innerHTML = overallParts.join(' &nbsp;|&nbsp; ');
 
   // 伪相关识别（自动标注，不需要用户手工判断）
-  const validGroupStats = stats.filter(s => Number.isFinite(s.r));
   const warnEl = document.getElementById('groupCompareWarning');
   const warnings = [];
   if (Number.isFinite(overallR) && Math.abs(overallR) >= 0.3 && validGroupStats.length && validGroupStats.every(s => Math.abs(s.r) < 0.15)) {
     warnings.push('⚠️ 整体相关性可能是分组间均值差异导致的合成效应（辛普森悖论），单个分组内没有独立解释力。');
+  }
+  if (Number.isFinite(overallR) && Number.isFinite(weightedR) && Math.abs(overallR) >= 0.2
+    && (Math.sign(weightedR) !== Math.sign(overallR) || Math.abs(weightedR) < Math.abs(overallR) * 0.5)) {
+    warnings.push(`⚠️ 控制 ${escapeHtml(groupField)} 分层后相关性大幅减弱（整体 r=${overallR.toFixed(3)} → 层内加权 r=${weightedR.toFixed(3)}）：原始相关性可能主要由 ${escapeHtml(groupField)} 这个混杂因素造成，而非特征本身的独立解释力。`);
   }
   if (Number.isFinite(overallR) && validGroupStats.length) {
     const largestGroup = validGroupStats.reduce((a, b) => (b.n > a.n ? b : a));
@@ -352,6 +412,24 @@ function renderGroupCompare(groupField, breakpointsText, featureField, targetFie
       <td class="num">${(s.winRate * 100).toFixed(1)}%</td>
       <td class="num">${Number.isFinite(s.r) ? s.r.toFixed(4) : `样本不足(${s.rn})`}</td>
       <td class="num">${Number.isFinite(s.p) ? s.p.toExponential(2) : '-'}</td>
+    </tr>
+  `).join('');
+
+  // 分组内多档位达标率：目标字段是"倍数"口径（1 = 不涨不跌），常见需求是不只看"是否 >1"这一个
+  // 阈值的单一胜率，还想知道组内有多少比例能到 2 倍、3 倍……用同一份 targets 数组多算几个阈值，
+  // 不需要重新分组或重新扫 activeRows。
+  const WIN_THRESHOLDS = [1, 1.5, 2, 3, 5, 10];
+  document.getElementById('groupCompareBreakdownHead').innerHTML = `
+    <tr><th>分组</th><th class="num">样本数</th>${WIN_THRESHOLDS.map(t => `<th class="num">\u2265${t}\u500d</th>`).join('')}</tr>
+  `;
+  document.getElementById('groupCompareBreakdownBody').innerHTML = stats.map(s => `
+    <tr>
+      <td>${escapeHtml(s.key)}</td>
+      <td class="num">${s.targets.length}</td>
+      ${WIN_THRESHOLDS.map(t => {
+        const rate = s.targets.length ? s.targets.filter(v => v >= t).length / s.targets.length : NaN;
+        return `<td class="num">${Number.isFinite(rate) ? (rate * 100).toFixed(1) + '%' : '-'}</td>`;
+      }).join('')}
     </tr>
   `).join('');
 }
@@ -437,7 +515,7 @@ function renderFeatureImportance(targetField, fields, oosOptions) {
   let rows = completeRows, testRows = [];
   const oosEnabled = oosOptions && oosOptions.enabled;
   if (oosEnabled) {
-    const split = splitTrainTest(completeRows, oosOptions.method, oosOptions.ratio, 'swapBeginTime');
+    const split = splitTrainTest(completeRows, oosOptions.method, oosOptions.ratio, 'swapBeginTime', oosOptions.seed);
     rows = split.train;
     testRows = split.test;
     if (rows.length < fields.length + 5) {
@@ -690,6 +768,156 @@ function renderFeatureInteractions(fields, ops, targetField) {
   });
 }
 
+// ---------- 3.6 组合评分（多字段综合打分） ----------
+// 训练/评估结果暂存，供"训练并评估"和"写入工作集"两个按钮共享（写入时对全量 matchedRows 复用训练集算出的标准化参数）
+let lastCompositeSpec = null; // { targetField, fields: [{field, rho, direction, weight, mean, std, n}], weightMethod, trainN, testN }
+
+// 用训练集的 mean/std 把该行每个评分字段标准化并截断到 ±3（防极端值主导整体评分），
+// 按方向（Spearman ρ 符号）和权重加权平均；某字段缺失时跳过该字段（只用剩余字段的权重归一化），
+// 全部字段都缺失时返回 NaN（不给一个建立在 0 个真实观测上的评分）
+function computeCompositeRowScore(row, spec) {
+  let wSum = 0, scoreSum = 0, missing = 0;
+  for (const f of spec.fields) {
+    const v = getFeature(row, f.field);
+    if (!isFiniteNumber(v)) { missing++; continue; }
+    const z = f.std > 1e-12 ? (Number(v) - f.mean) / f.std : 0;
+    const zc = Math.max(-3, Math.min(3, z));
+    scoreSum += f.direction * f.weight * zc;
+    wSum += f.weight;
+  }
+  if (wSum <= 0) return null;
+  return { score: scoreSum / wSum, missing };
+}
+
+function renderCompositeScore(targetField, fields, weightMethod, splitOptions) {
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  if (fields.length < 2) { showToast('请至少选择 2 个评分字段'); return; }
+  if (fields.length > 15) { showToast(`评分字段数量（${fields.length}）超过上限 15 个，请减少后再运行。`); return; }
+
+  const completeRows = activeRows.filter(r => isFiniteNumber(getFeature(r, targetField)));
+  if (completeRows.length < 20) { showToast(`有效样本（含目标字段 ${targetField}）仅 ${completeRows.length} 条，太少无法训练/评估组合评分`); return; }
+
+  const { train, test } = splitTrainTest(completeRows, splitOptions.method, splitOptions.ratio, 'swapBeginTime', splitOptions.seed);
+  if (train.length < 10 || test.length < 10) {
+    showToast(`训练集（${train.length}）或测试集（${test.length}）样本过少，请调整训练集比例`);
+    return;
+  }
+
+  // 训练集上确定方向/权重/标准化参数——绝不用测试集数据参与这一步，否则"测试集评估"就失去了验证意义
+  const specs = [];
+  const excluded = [];
+  for (const f of fields) {
+    const pairs = [];
+    for (const r of train) {
+      const fv = getFeature(r, f), tv = getFeature(r, targetField);
+      if (isFiniteNumber(fv) && isFiniteNumber(tv)) pairs.push([Number(fv), Number(tv)]);
+    }
+    if (pairs.length < 10) { excluded.push(`${f}（训练集有效样本仅 ${pairs.length} 条，<10）`); continue; }
+    const rho = spearman(pairs);
+    if (!Number.isFinite(rho) || rho === 0) { excluded.push(`${f}（训练集 ρ 不可用或为 0，无法确定方向）`); continue; }
+    const vals = pairs.map(p => p[0]);
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const variance = vals.reduce((a, v) => a + (v - mean) ** 2, 0) / vals.length;
+    const std = Math.sqrt(variance);
+    const direction = rho >= 0 ? 1 : -1;
+    const weight = weightMethod === 'rho' ? Math.abs(rho) : 1;
+    specs.push({ field: f, rho, direction, weight, mean, std, n: pairs.length });
+  }
+
+  if (specs.length < 2) {
+    showToast(`训练集上可用于组合评分的字段不足 2 个${excluded.length ? '（' + excluded.join('；') + '）' : ''}，请更换字段或增大数据集`);
+    return;
+  }
+
+  lastCompositeSpec = { targetField, fields: specs, weightMethod, trainN: train.length, testN: test.length };
+  document.getElementById('applyCompositeScoreBtn').classList.add('hidden'); // 每次重新训练后需要重新确认再写入，避免用旧结果覆盖
+
+  // 测试集评估：评分与目标的相关性（评分是排名/方向的加权混合，秩相关比线性相关更贴切，Pearson 仅作对照）
+  const testPairs = [];
+  for (const r of test) {
+    const tv = getFeature(r, targetField);
+    if (!isFiniteNumber(tv)) continue;
+    const res = computeCompositeRowScore(r, lastCompositeSpec);
+    if (res && Number.isFinite(res.score)) testPairs.push([res.score, Number(tv)]);
+  }
+  const testRho = testPairs.length >= 5 ? spearman(testPairs) : NaN;
+  const testR = testPairs.length >= 5 ? pearson(testPairs) : NaN;
+
+  document.getElementById('compositeSpecBody').innerHTML = specs.map(s => `
+    <tr>
+      <td>${escapeHtml(s.field)}</td>
+      <td class="num">${s.rho.toFixed(4)}</td>
+      <td>${s.direction > 0 ? '正向（越大越好）' : '反向（越小越好）'}</td>
+      <td class="num">${s.weight.toFixed(4)}</td>
+      <td class="num">${s.n}</td>
+    </tr>
+  `).join('');
+
+  const warnEl = document.getElementById('compositeWarning');
+  const warnings = [];
+  if (excluded.length) warnings.push(`⚠️ 以下字段已自动剔除，未参与评分：${excluded.map(escapeHtml).join('；')}`);
+  if (test.length < 20) warnings.push(`⚠️ 测试集样本过少（n=${test.length} < 20），评估结果仅供参考。`);
+  if (Number.isFinite(testRho) && Math.abs(testRho) < 0.1) warnings.push(`⚠️ 评分在测试集上与目标的秩相关很弱（ρ=${testRho.toFixed(3)}），组合评分可能没有实际筛选能力，谨慎采信。`);
+  if (warnings.length) { warnEl.classList.remove('hidden'); warnEl.innerHTML = warnings.join('<br>'); }
+  else warnEl.classList.add('hidden');
+
+  document.getElementById('compositeSummary').innerHTML =
+    `训练集 n=${train.length}，测试集 n=${test.length}（切分：${splitOptions.method === 'time' ? '按时间顺序' : '随机（种子 ' + splitOptions.seed + '，锁定可复现）'}）。`
+    + ` 评分与 <b>${escapeHtml(targetField)}</b> 在测试集上的 Spearman ρ = <b>${Number.isFinite(testRho) ? testRho.toFixed(4) : '-'}</b>，`
+    + ` Pearson r = ${Number.isFinite(testR) ? testR.toFixed(4) : '-'}（n=${testPairs.length}）。`;
+
+  // 测试集评分五分位分层：直接看"评分越高，未来收益是否真的越好"，比单一相关系数更直观、也更贴近实际使用场景（按评分筛 token）
+  const sortedByScore = testPairs.slice().sort((a, b) => a[0] - b[0]);
+  const qCount = 5;
+  const bucketSize = Math.ceil(sortedByScore.length / qCount);
+  const buckets = [];
+  for (let i = 0; i < qCount; i++) {
+    const chunk = sortedByScore.slice(i * bucketSize, (i + 1) * bucketSize);
+    if (!chunk.length) continue;
+    const targets = chunk.map(p => p[1]);
+    const mean = targets.reduce((a, b) => a + b, 0) / targets.length;
+    const sortedT = targets.slice().sort((a, b) => a - b);
+    const median = percentile(sortedT, 0.5);
+    const winRate = targets.filter(v => v > 1).length / targets.length;
+    buckets.push({
+      label: `Q${i + 1}${i === qCount - 1 ? '（最高）' : i === 0 ? '（最低）' : ''}`,
+      lo: chunk[0][0], hi: chunk[chunk.length - 1][0],
+      n: chunk.length, mean, median, winRate
+    });
+  }
+  document.getElementById('compositeDecileBody').innerHTML = buckets.map(b => `
+    <tr>
+      <td>${b.label}</td>
+      <td class="num">[${b.lo.toFixed(3)}, ${b.hi.toFixed(3)}]</td>
+      <td class="num">${b.n}</td>
+      <td class="num">${formatNumberSmart(b.mean)}</td>
+      <td class="num">${formatNumberSmart(b.median)}</td>
+      <td class="num">${(b.winRate * 100).toFixed(1)}%</td>
+    </tr>
+  `).join('') || '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);">测试集样本不足，无法分层</td></tr>';
+
+  document.getElementById('applyCompositeScoreBtn').classList.remove('hidden');
+}
+
+// 把最近一次训练好的评分（含训练集算出的标准化参数）应用到全量 matchedRows，写入 features.composite_score，
+// 供散点图/过滤/分箱柱状图等下游功能直接当成一个普通数值字段使用。不经过自定义字段的公式引擎，因为
+// 权重/方向/标准化参数是训练产物而不是用户手写的公式。
+function applyCompositeScore() {
+  if (!lastCompositeSpec) { showToast('请先点击"训练并评估"'); return; }
+  if (!matchedRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  let written = 0;
+  for (const r of matchedRows) {
+    const res = computeCompositeRowScore(r, lastCompositeSpec);
+    if (res && Number.isFinite(res.score)) { r.features.composite_score = res.score; written++; }
+    else delete r.features.composite_score;
+  }
+  FIELD_DESC['composite_score'] = `组合评分：基于字段 ${lastCompositeSpec.fields.map(f => f.field).join('、')} 在训练集上确定方向/权重后合成（目标 ${lastCompositeSpec.targetField}）`;
+  allNumericKeys = [...new Set([...matchedRows.flatMap(r => Object.keys(r.features)), ...DERIVED_KEYS, ...customFields.map(c => c.name)])].sort();
+  updateScatterSelects();
+  refreshAnalysisViews();
+  showToast(`已把组合评分写入 composite_score（${written}/${matchedRows.length} 条样本有效），可在散点图/过滤/分箱柱状图里直接使用`);
+}
+
 // ---------- 4. 时间维度分析 ----------
 function renderTimeAnalysis(featureField, targetField, bucketCount) {
   if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
@@ -852,7 +1080,7 @@ function downloadRollingCorrCsv() {
 }
 
 // ---------- 5. 分类字段与收益关系（箱线图 + 胜率对比 + 显著性检验） ----------
-function renderCatAnalysis(catField, breakpointsText, valueField, sigTestEnabled) {
+async function renderCatAnalysis(catField, breakpointsText, valueField, sigTestEnabled) {
   if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   if (!catField || !valueField) { showToast('请填写分类字段和目标数值字段'); return; }
   const breakpoints = breakpointsText ? parseBreakpoints(breakpointsText) : [];
@@ -867,7 +1095,7 @@ function renderCatAnalysis(catField, breakpointsText, valueField, sigTestEnabled
   if (!groups.size) { showToast('没有可用数据，请检查字段是否正确'); return; }
   // 分类值过多（比如误把连续数值字段当分类字段）时箱线图会失去意义，这里提示但不阻断
   if (groups.size > 15) {
-    if (!confirm(`检测到 ${groups.size} 个不同分类值，类别过多不利于阅读，可能不是合适的分类字段，是否继续？`)) return;
+    if (!await showConfirm(`检测到 ${groups.size} 个不同分类值，类别过多不利于阅读，可能不是合适的分类字段，是否继续？`)) return;
   }
 
   const entries = [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
@@ -1016,25 +1244,25 @@ function initProAnalytics() {
   ));
   // 默认预填"相关性表 Top10 字段 + returnCurrent + returnMax"——从当前已计算好的 allCorrelations 里取
   // |r| 最大的前 10 个不重复字段（allCorrelations 本身已按 |r| 降序排好，直接取前几个去重即可）
-  document.getElementById('importTop10CorrBtn').addEventListener('click', () => {
-    if (!allCorrelations.length) { showToast('请先点击"分析"加载数据'); return; }
-    corrMatrixSelector.addField('returnCurrent');
-    corrMatrixSelector.addField('returnMax');
-    const seen = new Set();
-    for (const c of allCorrelations) {
-      if (seen.size >= 10) break;
-      if (!seen.has(c.feature)) { seen.add(c.feature); corrMatrixSelector.addField(c.feature); }
-    }
-  });
+  wireImportTop10Btn('importTop10CorrBtn', corrMatrixSelector, ['returnCurrent', 'returnMax']);
 
   const importanceSelector = makeFieldTagSelector('importanceInput', 'importanceTagBox');
   document.getElementById('genImportanceBtn').addEventListener('click', () => {
-    renderFeatureImportance(document.getElementById('importanceTargetField').value, importanceSelector.getSelected(), {
-      enabled: document.getElementById('regOosEnabled').checked,
-      method: document.getElementById('regOosSplitMethod').value,
-      ratio: Number(document.getElementById('regOosTrainRatio').value) || 0.7
-    });
+    renderFeatureImportance(document.getElementById('importanceTargetField').value, importanceSelector.getSelected(),
+      readSplitOptions('regOos', { enabled: document.getElementById('regOosEnabled').checked }));
   });
+
+  const compositeSelector = makeFieldTagSelector('compositeInput', 'compositeTagBox');
+  wireImportTop10Btn('importCompositeTop10Btn', compositeSelector);
+  document.getElementById('genCompositeScoreBtn').addEventListener('click', () => {
+    renderCompositeScore(
+      document.getElementById('compositeTargetField').value,
+      compositeSelector.getSelected(),
+      document.getElementById('compositeWeightMethod').value,
+      readSplitOptions('composite')
+    );
+  });
+  document.getElementById('applyCompositeScoreBtn').addEventListener('click', applyCompositeScore);
 
   const interactionSelector = makeFieldTagSelector('interactionInput', 'interactionTagBox');
   document.getElementById('genInteractionBtn').addEventListener('click', () => {
@@ -1059,7 +1287,8 @@ function initProAnalytics() {
       document.getElementById('groupByBreakpoints').value.trim(),
       document.getElementById('groupFeatureField').value.trim(),
       document.getElementById('groupTargetField').value,
-      Number(document.getElementById('groupMinSample').value)
+      Number(document.getElementById('groupMinSample').value),
+      Number(document.getElementById('groupByQuantiles').value)
     );
   });
 
@@ -1116,14 +1345,7 @@ function initProAnalytics() {
   });
 
   const rocBatchSelector = makeFieldTagSelector('rocBatchInput', 'rocBatchTagBox');
-  document.getElementById('importRocTop10Btn').addEventListener('click', () => {
-    if (!allCorrelations.length) { showToast('请先点击"分析"加载数据'); return; }
-    const seen = new Set();
-    for (const c of allCorrelations) {
-      if (seen.size >= 10) break;
-      if (!seen.has(c.feature)) { seen.add(c.feature); rocBatchSelector.addField(c.feature); }
-    }
-  });
+  wireImportTop10Btn('importRocTop10Btn', rocBatchSelector);
   document.getElementById('genRocBatchBtn').addEventListener('click', () => {
     renderRocBatch(
       rocBatchSelector.getSelected(),
@@ -1133,14 +1355,7 @@ function initProAnalytics() {
   });
 
   const similarFieldsSelector = makeFieldTagSelector('similarFieldsInput', 'similarFieldsTagBox');
-  document.getElementById('importSimilarTop10Btn').addEventListener('click', () => {
-    if (!allCorrelations.length) { showToast('请先点击"分析"加载数据'); return; }
-    const seen = new Set();
-    for (const c of allCorrelations) {
-      if (seen.size >= 10) break;
-      if (!seen.has(c.feature)) { seen.add(c.feature); similarFieldsSelector.addField(c.feature); }
-    }
-  });
+  wireImportTop10Btn('importSimilarTop10Btn', similarFieldsSelector);
   document.getElementById('genSimilarBtn').addEventListener('click', () => {
     renderSimilarCases(
       document.getElementById('similarBaseInput').value,

@@ -6,6 +6,8 @@ const FIELD_DESC = {
   // 收益
   'returnCurrent': '当前倍数 = current_mcap / initial_mcap（1=不涨不跌，2=涨一倍）',
   'returnMax': '期间最大倍数 = max_mcap / initial_mcap（1=不涨不跌，2=涨一倍）',
+  'logReturnCurrent': 'log(returnCurrent)：对当前倍数取自然对数，收窄重尾分布，使 Pearson r/p 值/置信区间更稳健',
+  'logReturnMax': 'log(returnMax)：对期间最大倍数取自然对数，收窄重尾分布，使 Pearson r/p 值/置信区间更稳健',
 
   // GMGN 风险/持仓比例类字段：原始值是 0-1 小数，这里已 ×100 转成百分比数值（如 3.31 表示 3.31%）
   'gmgn.stat.top_rat_trader_percentage': '插队/内鬼交易者成交占比（%，已从 0-1 小数转换，取值范围 0-100）',
@@ -104,6 +106,10 @@ const FIELD_DESC = {
   'max_ratio': '最大涨幅（%）',
   'type': '信号类型',
 
+  // 组装字段（design doc §20 新增）
+  'buy_max_retracement': 'buy 之前最大回撤（v_breakout_volume_list 中 n_pattern_retracement 的最大值，无数据为 0）',
+  'last_alert_low_lower_than_pre_low': '最近一个 V 转信号的最低点是否比上一个 V 转信号的最低点更低（1=更低/连续创新低，0=未创新低；任一侧数据缺失不参与）',
+
   // K线/指标（ctx.kline_and_indicators）
   'kline_and_indicators': '历史 K 线 + avg_price/AO 等指标数据',
   'resolution': 'K线粒度（系统自动推算）',
@@ -179,6 +185,8 @@ const FIELD_DESC = {
   'buy_tx_per_buyer': '人均买入笔数 = buy_tx_count_d1 / buyer_count_d1（越高=可能是少数人/机器人在刷单，而不是很多真实用户参与）',
   'smart_money_net_buy_count': '聪明钱净买入地址数 = smart_money_address_buy_count_d1 - smart_money_address_sell_count_d1',
   'chip_analysis.pressure_net': '筹码净压力指标 = chip_analysis.above_percent - chip_analysis.below_percent（正数=上方套牢盘更多抛压大，负数=下方支撑更强）',
+  'open_to_buy_duration': '开盘到买入时长 = 快照时间（买入点）- swap_begin_time（第一笔交易时间），单位分钟',
+  'launch_to_buy_duration': '上线到买入时长 = 快照时间（买入点）- launch_time（代币上线时间），单位分钟',
 };
 
 // 数据源/前缀说明

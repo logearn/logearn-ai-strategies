@@ -57,18 +57,89 @@ function batchSetChartOption(opt, value) {
   if (matchedRows.length) plot();
 }
 function resetAllChartOptions() {
+  // 图表卡片现在会跨多次 plot() 调用被复用，创建卡片时闭包捕获的是 getChartSettings(xField)
+  // 返回的对象引用；这里必须在原对象上原地重置字段（而不是像以前那样整个替换掉 Map 里的
+  // 对象），否则已经渲染出来的卡片会一直用着替换前的旧对象，重置操作对它们不生效。
   for (const xField of batchXSelected) {
-    chartSettings.set(xField, { logX: false, logY: false, clipOutliers: false, showConfBand: true, showBinned: false, swapped: defaultSwapped });
+    Object.assign(getChartSettings(xField), { logX: false, logY: false, clipOutliers: false, showConfBand: true, showBinned: false, swapped: defaultSwapped });
   }
   if (matchedRows.length) plot();
 }
 
 // 逐个渲染所有选中的 X 指标：每个指标一张全宽散点图，自上而下平铺，
 // 每张图自带一组功能按钮（对数轴 / 剔除离群点 / 置信区间 / 分档统计），互不影响
+//
+// 性能说明：以前每次调用都会 `stack.innerHTML = ''` 整体清空再重建所有卡片——
+// 既没有对旧图调用 Plotly.purge()（Plotly 官方要求：移除图表容器前必须先 purge，
+// 否则残留的内部监听器/状态会不断累积），也会把没有变化的图表连同它们的按钮、
+// 事件监听器一起销毁重建。选中的图越多，单次"删除该图"触发的全量重建就越卡。
+// 现在改为增量对账（reconcile）：按 X 字段缓存已渲染的卡片，只对"不再需要展示"
+// 的图调用 purge + 移除 DOM，只对"新增"的图创建卡片，其余图表原地复用 DOM/监听器，
+// 仅重新计算 Plotly 数据。
+const chartCardsByField = new Map(); // xField -> { card, chartDiv, rerender }
+
+function purgeChartCard(entry) {
+  try { Plotly.purge(entry.chartDiv); } catch (e) {}
+  entry.card.remove();
+}
+
+function clearAllChartCards() {
+  for (const entry of chartCardsByField.values()) purgeChartCard(entry);
+  chartCardsByField.clear();
+}
+
+// 分页：一次性选中几十上百个 X 指标时，就算单张图的重渲染已经做了脏检查优化，"当前页要展示
+// 多少张图"本身仍然是硬成本——每张新出现的图都要跑一次 Plotly.newPlot（regression/置信区间/
+// 分档统计 + SVG 绘制），129 张图一次性全画出来无论如何都会卡。分页后每次只渲染一小部分，
+// 翻页时上一页的图会被正常 purge 掉（不会累积），从根上把渲染量摊开。
+let plotPageSize = 20;
+let plotPage = 0;
+
+function paginationHtml(totalFields, totalPages) {
+  if (totalPages <= 1) return '';
+  return `
+    <div class="plot-pagination">
+      <button type="button" class="secondary plot-page-prev" ${plotPage === 0 ? 'disabled' : ''}>‹ 上一页</button>
+      <span>第 <b style="color:var(--text)">${plotPage + 1}</b> / ${totalPages} 页，共 ${totalFields} 张图</span>
+      <button type="button" class="secondary plot-page-next" ${plotPage >= totalPages - 1 ? 'disabled' : ''}>下一页 ›</button>
+      <label style="display:flex; align-items:center; gap:6px;">每页
+        <select class="plot-page-size">${[10, 20, 50].map(n => `<option value="${n}" ${n === plotPageSize ? 'selected' : ''}>${n}</option>`).join('')}</select>
+        张
+      </label>
+    </div>`;
+}
+
+function renderPlotPagination(totalFields, totalPages) {
+  const html = paginationHtml(totalFields, totalPages);
+  const top = document.getElementById('plotPaginationTop');
+  const bottom = document.getElementById('plotPaginationBottom');
+  if (top) top.innerHTML = html;
+  if (bottom) bottom.innerHTML = html;
+}
+
+// 翻页/改每页数量的按钮是每次 renderPlotPagination 都会被整体替换掉的动态 DOM，直接在容器上
+// 用事件委托一次性绑定，不用每次渲染完再重新 addEventListener
+['plotPaginationTop', 'plotPaginationBottom'].forEach(id => {
+  const container = document.getElementById(id);
+  if (!container) return;
+  container.addEventListener('click', e => {
+    if (e.target.closest('.plot-page-prev')) { plotPage = Math.max(0, plotPage - 1); plot(); }
+    else if (e.target.closest('.plot-page-next')) { plotPage += 1; plot(); }
+  });
+  container.addEventListener('change', e => {
+    if (e.target.classList.contains('plot-page-size')) {
+      plotPageSize = Number(e.target.value) || 20;
+      plotPage = 0;
+      plot();
+    }
+  });
+});
+
 function plot() {
   const stack = document.getElementById('plotStack');
   if (!activeRows.length) {
-    stack.innerHTML = '';
+    clearAllChartCards();
+    renderPlotPagination(0, 0);
     document.getElementById('plotStats').innerHTML = matchedRows.length ? '<b>当前过滤条件下没有样本</b>' : '';
     return;
   }
@@ -76,12 +147,58 @@ function plot() {
   const fields = batchXSelected.filter(f => scatterOptions.includes(f) && f !== yField);
   if (!fields.length || !yField) {
     document.getElementById('plotStats').innerHTML = '<b>错误:</b> 请先添加 X 指标并选择有效的 Y 字段';
-    stack.innerHTML = '';
+    clearAllChartCards();
+    renderPlotPagination(0, 0);
+    plotPage = 0;
     return;
   }
+
+  // 之前加过"新增字段自动跳到最后一页"的逻辑，但用户反馈：图很多（比如 100 张、5 页）的时候
+  // 应该始终聚焦在第一页第一张图，不要因为加字段就被甩到最后一页——只做正常的范围收紧
+  // （页数变少导致当前页超界时才回退到最后一页），不主动跳页。
+  const totalPages = Math.max(1, Math.ceil(fields.length / plotPageSize));
+  plotPage = Math.min(Math.max(0, plotPage), totalPages - 1);
+
+  const pageStart = plotPage * plotPageSize;
+  const pageFields = fields.slice(pageStart, pageStart + plotPageSize);
+
   document.getElementById('plotStats').innerHTML = `<b>共 ${fields.length} 张图</b> &nbsp; Y = <b>${escapeHtml(yField)}</b> &nbsp; 样本集 = <b>${activeRows.length}</b> 条`;
-  stack.innerHTML = '';
-  for (const f of fields) renderChartCard(f, yField);
+  renderPlotPagination(fields.length, totalPages);
+
+  const fieldSet = new Set(pageFields);
+  for (const [f, entry] of chartCardsByField) {
+    if (!fieldSet.has(f)) {
+      purgeChartCard(entry);
+      chartCardsByField.delete(f);
+    }
+  }
+
+  let prevCard = null;
+  for (const f of pageFields) {
+    let entry = chartCardsByField.get(f);
+    const isNew = !entry;
+    if (isNew) {
+      entry = createChartCard(f);
+      chartCardsByField.set(f, entry);
+    }
+    // 先把卡片插进 DOM，再调用 Plotly 渲染：新建的卡片这时还是"游离"状态（没挂到 #plotStack
+    // 上），此时量出来的容器宽度是 0，Plotly.newPlot 会按它内部的兜底宽度画图，图表就只占了
+    // 卡片左边一小条、右边大片空白——即使容器随后被插入 DOM 变宽，这张图也不会自动纠正过来。
+    // 顺序倒一下，量宽度时容器已经在文档里、有真实布局宽度，就不会出这个问题。
+    if (!entry.card.isConnected || entry.card.previousElementSibling !== prevCard) {
+      if (prevCard) prevCard.after(entry.card);
+      else stack.prepend(entry.card);
+    }
+    prevCard = entry.card;
+    if (isNew) {
+      entry.rerender();
+    } else {
+      // 只对"渲染依据真的变了"的图重新算 Plotly 数据；纯粹增删别的图（比如点删除、加一个新
+      // X 字段）不会影响这张图的 X/Y/颜色/样本集/主题，直接跳过，避免选中的图越多、单次操作
+      // 越卡——重新计算回归/置信区间/分箱统计 + Plotly.newPlot 本身就不便宜，图多了尤其明显。
+      entry.rerenderIfStale();
+    }
+  }
 }
 
 // 导出任意已渲染的 Plotly 图为 PNG（design doc §15.4），供散点图/分箱柱状图/收益分布图统一复用。
@@ -119,7 +236,7 @@ async function exportChartPng(chartDiv, filename, useLightBg) {
   }
 }
 
-function renderChartCard(xField, yField) {
+function createChartCard(xField) {
   const opt = getChartSettings(xField);
   const card = document.createElement('div');
   card.className = 'plot-card';
@@ -184,17 +301,53 @@ function renderChartCard(xField, yField) {
   card.appendChild(titleBar);
   card.appendChild(chartDiv);
   card.appendChild(caption);
-  document.getElementById('plotStack').appendChild(card);
 
+  const swapBtn = controls.querySelector('[data-action="swap"]');
+  const checkboxes = controls.querySelectorAll('input[type=checkbox]');
+
+  // yField/colorField 通过 getValidFieldInput/getValidColorField 实时读取，而不是在创建
+  // 卡片时捕获成闭包常量：卡片现在会被 plot() 跨多次调用复用，Y 轴/颜色字段随时可能变化，
+  // 闭包捕获的话会导致复用的卡片渲染出过期的 Y 字段。
+  //
+  // opt 同理也可能被卡片之外的地方原地修改（批量设置选项 / 重置所有选项），所以每次
+  // rerender 都把开关控件的可视状态（checkbox 勾选 / 交换按钮高亮）跟当前 opt 同步一遍，
+  // 否则复用的卡片会出现"控件显示的状态"和"实际生效的设置"对不上的情况。
   const rerender = () => {
+    swapBtn.classList.toggle('active', opt.swapped);
+    checkboxes.forEach(cb => { cb.checked = !!opt[cb.dataset.opt]; });
+
+    const yField = getValidFieldInput('yField');
     const effX = opt.swapped ? yField : xField;
     const effY = opt.swapped ? xField : yField;
     titleText.textContent = `${effY} vs ${effX}`;
     renderScatterChart(effX, effY, { ...opt, colorField: getValidColorField() }, chartDiv, caption);
+    renderedSnapshot = currentSnapshot();
   };
-  controls.querySelector('[data-action="swap"]').addEventListener('click', e => {
+  // plot() 每次调用都会遍历所有已展示的图，但只有极少数场景真的需要重新计算 Plotly 数据
+  // （Y/颜色字段变了、样本集变了、主题切换了，或者这张图自己的选项变了）——大多数时候
+  // （比如删除了另一张图、新增了一个 X 字段）对这张图完全没影响。用一份轻量快照（都是
+  // 基本类型或对象引用比较，不深比较 activeRows 数组本身）判断是否需要重算，命中就跳过，
+  // 图越多、无关操作的性能提升越明显。
+  const currentSnapshot = () => ({
+    logX: opt.logX, logY: opt.logY, clipOutliers: opt.clipOutliers,
+    showConfBand: opt.showConfBand, showBinned: opt.showBinned, swapped: opt.swapped,
+    yField: getValidFieldInput('yField'), colorField: getValidColorField(),
+    activeRows, highlightCAs, light: isLightTheme()
+  });
+  let renderedSnapshot = null;
+  const rerenderIfStale = () => {
+    const snap = currentSnapshot();
+    const prev = renderedSnapshot;
+    const same = prev && prev.logX === snap.logX && prev.logY === snap.logY &&
+      prev.clipOutliers === snap.clipOutliers && prev.showConfBand === snap.showConfBand &&
+      prev.showBinned === snap.showBinned && prev.swapped === snap.swapped &&
+      prev.yField === snap.yField && prev.colorField === snap.colorField &&
+      prev.activeRows === snap.activeRows && prev.highlightCAs === snap.highlightCAs &&
+      prev.light === snap.light;
+    if (!same) rerender();
+  };
+  swapBtn.addEventListener('click', () => {
     opt.swapped = !opt.swapped;
-    e.currentTarget.classList.toggle('active', opt.swapped);
     rerender();
   });
   controls.querySelector('[data-action="remove"]').addEventListener('click', () => {
@@ -202,13 +355,13 @@ function renderChartCard(xField, yField) {
     renderBatchTags();
     plot();
   });
-  controls.querySelectorAll('input[type=checkbox]').forEach(cb => {
+  checkboxes.forEach(cb => {
     cb.addEventListener('change', () => {
       opt[cb.dataset.opt] = cb.checked;
       rerender();
     });
   });
-  rerender();
+  return { card, chartDiv, rerender, rerenderIfStale };
 }
 
 function renderScatterChart(xField, yField, settings, chartDiv, captionEl) {
@@ -301,7 +454,13 @@ function renderScatterChart(xField, yField, settings, chartDiv, captionEl) {
       x: [minX, maxX],
       y: [slope * minX + intercept, slope * maxX + intercept],
       mode: 'lines', type: 'scatter', name: '趋势线',
-      line: { color: '#ff9f0a' }
+      line: { color: '#ff9f0a' },
+      // hoverinfo:'skip'：趋势线只有 2 个数据点，但 Plotly 对 mode:'lines' 的最近点判定是按
+      // "鼠标到线段本身的距离"算的，会覆盖几乎整条横轴。之前只给置信区间加了这个属性，
+      // 趋势线没加，导致点击稍微偏离样本点（哪怕只偏几个像素）时，Plotly 判定"最近的点"是趋势线
+      // 而不是下面的样本点——趋势线没有 customdata，点击处理器按设计静默返回，看起来就是
+      // "点了没反应，console 也没日志"。加上这个属性后趋势线彻底退出 hover/点击的候选判定。
+      hoverinfo: 'skip'
     });
 
     if (showConfBand && n >= 4) {
@@ -387,14 +546,54 @@ function renderScatterChart(xField, yField, settings, chartDiv, captionEl) {
     hovermode: 'closest',
     legend: { orientation: 'h' },
     margin: { t: 40 }
-  }), { responsive: true }).then(() => {
-    chartDiv.on('plotly_click', ev => {
-      const pt = ev.points && ev.points[0];
-      const addr = pt && pt.customdata;
-      if (!addr) return; // 趋势线/置信带/分箱统计等非样本 trace 没有 customdata
-      const url = logearnUrl(addr);
-      if (url) window.open(url, '_blank');
-    });
+  }), { responsive: true }).catch(err => {
+    // Plotly.newPlot 对某些数据分布（比如某个 X 字段全部同值、方差为 0、log 轴遇到 <=0 等边界
+    // 情况）会在内部渲染时抛错导致 Promise reject；以前这里没有 .catch，一旦某张图命中这种情况，
+    // 后面的 .then() 绑定点击事件的代码根本不会执行，且没有任何报错提示——图看起来渲染出来了
+    // （Plotly 经常是先画出大部分内容再在某一步抛错），但点数据点永远没反应，且没法从控制台之外
+    // 看出原因。这里兜底捕获一下，至少不让这一步阻断后面的点击事件绑定。
+    console.error('Plotly 图表渲染出现异常，仍尝试绑定点击事件：', err);
+  }).then(() => {
+    // 图表卡片会在 plot() 的多次调用间被复用、反复 rerender()（切换对数轴/离群点/交换 X-Y 等
+    // 都会重新走到这里），而同一个 chartDiv 上重复调用 Plotly.newPlot 并不会清空之前用 .on()
+    // 挂的监听器；如果每次都重新绑定，点一次数据点会触发 N 次（rerender 过几次就开几个新标签页）。
+    // 用 __clickBound 保证每个 chartDiv 只绑定一次，卡片被删除（Plotly.purge）后该 div 整个丢弃，
+    // 不存在"以后还要重新绑定"的情况。
+    if (chartDiv.__clickBound) return;
+    chartDiv.__clickBound = true;
+    try {
+      chartDiv.on('plotly_click', ev => {
+        // 用 ev.points[0] 而不是找第一个有 customdata 的点：当点击位置恰好和趋势线/置信区间边缘
+        // 重叠时，Plotly 的 hovermode:'closest' 有时会命中那条线而不是下面的样本点，line/置信区间
+        // trace 没有 customdata，导致明明点在数据点上却没反应。改成从所有命中里找第一个有
+        // customdata 的，样本点和趋势线重叠时依然能正确取到样本点的地址。
+        // 临时诊断日志（排查"点击没反应"问题用，定位到问题后可以删掉）：把点击命中的每一步
+        // 都打出来，下次点击后直接看 console 就知道具体卡在哪一步，不用再靠猜。
+        console.log('[logearn点击] plotly_click 触发，ev.points =', ev.points);
+        const pt = (ev.points || []).find(p => p.customdata) || (ev.points && ev.points[0]);
+        const addr = pt && pt.customdata;
+        console.log('[logearn点击] 命中点 pt =', pt, ' addr =', addr);
+        if (!addr) {
+          // 趋势线/置信带/分箱统计等非样本 trace 没有 customdata：之前这里直接静默 return，
+          // 用户点了没反应、console 也没日志，完全看不出发生了什么。现在给个明确提示，
+          // 而不是让用户怀疑是图表本身坏了（大多数情况下已经靠上面给趋势线加 hoverinfo:'skip'
+          // 从根上避免命中趋势线，这里只是兜底剩余的边界情况，如启用了"分档统计"时点在分箱线上）。
+          showToast('该位置未命中具体样本点（可能点在趋势线/分档统计线上），请点击蓝色圆点样本');
+          return;
+        }
+        const url = logearnUrl(addr);
+        console.log('[logearn点击] 生成的 url =', url);
+        if (!url) return;
+        // window.open 被浏览器弹窗拦截时会返回 null/undefined（不抛错，界面上往往只有地址栏一个
+        // 很容易被忽略的小图标提示），之前完全没处理这种情况，看起来就是"点了没反应"。这里检测
+        // 一下，拦截时明确用 toast 告诉用户去放行，而不是让用户怀疑是这张图表本身坏了。
+        const win = window.open(url, '_blank');
+        console.log('[logearn点击] window.open 返回值 =', win);
+        if (!win) showToast('浏览器拦截了新页签，请点击地址栏的拦截图标允许弹出窗口后重试', true);
+      });
+    } catch (e) {
+      console.error('绑定图表点击事件失败：', e);
+    }
   });
 }
 

@@ -30,6 +30,74 @@ function showToast(message, isError) {
   setTimeout(remove, 4000);
 }
 
+// 自定义确认弹窗，取代浏览器原生 confirm()（原生弹窗是系统级 UI，样式没法定制，跟页面深色/浅色
+// 主题完全割裂）。confirm() 是同步阻塞调用，自定义弹窗做不到"同步返回"，所以改成 Promise<boolean>：
+// 调用处把 `if (!confirm(msg)) return;` 换成 `if (!await showConfirm(msg)) return;`，语义完全一致
+// （resolve true = 点了确定/回车，false = 取消/点遮罩层/按 Esc），只是调用方需要是 async 函数。
+function showConfirm(message, opts = {}) {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    const box = document.createElement('div');
+    box.className = 'confirm-box';
+    box.innerHTML = `
+      <div class="confirm-message"></div>
+      <div class="confirm-actions">
+        <button type="button" class="secondary confirm-cancel">${escapeHtml(opts.cancelText || '取消')}</button>
+        <button type="button" class="confirm-ok${opts.danger ? ' danger' : ''}">${escapeHtml(opts.okText || '确定')}</button>
+      </div>
+    `;
+    box.querySelector('.confirm-message').textContent = message;
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    const cleanup = result => {
+      document.removeEventListener('keydown', onKey);
+      overlay.remove();
+      resolve(result);
+    };
+    const onKey = e => {
+      if (e.key === 'Escape') cleanup(false);
+      else if (e.key === 'Enter') cleanup(true);
+    };
+    document.addEventListener('keydown', onKey);
+    overlay.addEventListener('mousedown', e => { if (e.target === overlay) cleanup(false); });
+    box.querySelector('.confirm-cancel').addEventListener('click', () => cleanup(false));
+    const okBtn = box.querySelector('.confirm-ok');
+    okBtn.addEventListener('click', () => cleanup(true));
+    okBtn.focus();
+  });
+}
+
+// 全局轻量 loading 遮罩：给"要处理一会儿但已经不至于卡死页面"的操作用（比如分页上线后一次性
+// 加入很多字段），避免用户以为点击没反应而多点几次。withLoading 内部用两次 requestAnimationFrame
+// 保证遮罩先真正绘制出来一帧，再执行传入的重活，不然同步的重计算可能会抢在浏览器重绘之前跑完，
+// 导致遮罩一闪而过甚至根本看不见。
+function showLoading(text) {
+  let el = document.getElementById('globalLoadingOverlay');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'globalLoadingOverlay';
+    el.className = 'loading-overlay';
+    el.innerHTML = '<div class="loading-box"><div class="loading-spinner"></div><div class="loading-text"></div></div>';
+    document.body.appendChild(el);
+  }
+  el.querySelector('.loading-text').textContent = text || '处理中...';
+  el.classList.add('visible');
+}
+function hideLoading() {
+  const el = document.getElementById('globalLoadingOverlay');
+  if (el) el.classList.remove('visible');
+}
+async function withLoading(text, fn) {
+  showLoading(text);
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  try {
+    return await fn();
+  } finally {
+    hideLoading();
+  }
+}
+
 // 通用 CSV 下载：任意二维数组数据都能复用，不用每个面板各写一套 Blob/下载逻辑
 function downloadCsvGeneric(filename, headers, rows) {
   const lines = [headers.map(csvEscape).join(',')];
@@ -134,6 +202,41 @@ function bootstrapPearsonCI(pairs, B) {
   return { lo: percentile(rs, 0.025), hi: percentile(rs, 0.975) };
 }
 
+// Bootstrap 差值置信区间：给定两组独立样本 sampleA（新数据）、sampleB（基准），statsFn 是一个
+// "给一组样本，返回一份 {统计量名: 数值} 摘要"的函数（比如 arr => ({winRate, mean, median})）。
+// 对 A、B 各自独立做 B 次有放回重抽样，每次同时算出 statsFn(重抽样A) 和 statsFn(重抽样B) 里每个
+// 同名指标的差值，重复 B 次后对每个指标分别取差值分布的 2.5%/97.5% 分位数，得到"A - B"这个差值
+// 本身的 95% 置信区间——只做一次重抽样循环就能同时得出多个指标的差值区间，不用每个指标单独重抽样
+// 一遍。区间跨 0 → 这个指标上两组没有统计意义上可分辨的差别，谁高谁低可能只是抽样运气。
+// 用途：新一批数据 vs 基准库的胜率/均值/中位数对比。
+function bootstrapDiffCI(sampleA, sampleB, statsFn, B) {
+  const nA = sampleA.length, nB = sampleB.length;
+  if (nA < 2 || nB < 2) return null;
+  const keys = Object.keys(statsFn(sampleA));
+  const diffsByKey = {};
+  keys.forEach(k => { diffsByKey[k] = []; });
+  for (let b = 0; b < B; b++) {
+    const resampleA = new Array(nA);
+    for (let i = 0; i < nA; i++) resampleA[i] = sampleA[Math.floor(Math.random() * nA)];
+    const resampleB = new Array(nB);
+    for (let i = 0; i < nB; i++) resampleB[i] = sampleB[Math.floor(Math.random() * nB)];
+    const statsA = statsFn(resampleA);
+    const statsB = statsFn(resampleB);
+    keys.forEach(k => {
+      const d = statsA[k] - statsB[k];
+      if (Number.isFinite(d)) diffsByKey[k].push(d);
+    });
+  }
+  const result = {};
+  keys.forEach(k => {
+    const arr = diffsByKey[k];
+    if (!arr.length) { result[k] = { lo: NaN, hi: NaN }; return; }
+    arr.sort((a, b) => a - b);
+    result[k] = { lo: percentile(arr, 0.025), hi: percentile(arr, 0.975) };
+  });
+  return result;
+}
+
 function percentile(sortedArr, p) {
   if (!sortedArr.length) return NaN;
   const idx = (sortedArr.length - 1) * p;
@@ -217,15 +320,36 @@ function pearsonPValue(r, n) {
   return 2 * (1 - normalCdf(Math.abs(zscore)));
 }
 
+// mulberry32：轻量确定性伪随机数生成器（同一个种子产生完全相同的随机序列），
+// 用于"锁定切分"——随机切分若每次都用 Math.random()，同一份数据反复分析会得到漂移的训练/测试划分，
+// 结论（训练/测试 r、样本外 R² 等）跟着漂移，用户无法区分"结论变了"和"切分变了"。
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 // 样本外验证的训练/测试集切分：时间序列数据用随机切分容易泄露未来信息（训练集里混入了测试集"未来"的样本），
-// 默认按时间顺序切分（前 trainRatio 作训练集，后面作测试集）；随机切分模式直接洗牌后按比例切，
+// 默认按时间顺序切分（前 trainRatio 作训练集，后面作测试集）；随机切分模式洗牌后按比例切，
 // 更适合非时间序列场景（比如用户明确知道数据没有时间上的漂移，只是想看结果对随机子集是否稳健）。
-function splitTrainTest(rows, method, trainRatio, timeField) {
+// seed 为有限数字时启用锁定切分：先按 时间+token 稳定排序消除输入顺序差异，再用种子化 RNG 洗牌，
+// 保证同一份数据 + 同一个种子的切分结果 100% 可复现；改种子即可检验结论对切分的稳健性。
+function splitTrainTest(rows, method, trainRatio, timeField, seed) {
   let ordered;
   if (method === 'random') {
     ordered = rows.slice();
+    const rand = Number.isFinite(seed) ? mulberry32(seed) : Math.random;
+    if (Number.isFinite(seed)) {
+      ordered.sort((a, b) => ((a[timeField] ?? 0) - (b[timeField] ?? 0))
+        || String(a.tokenAddress || '').localeCompare(String(b.tokenAddress || '')));
+    }
     for (let i = ordered.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
+      const j = Math.floor(rand() * (i + 1));
       [ordered[i], ordered[j]] = [ordered[j], ordered[i]];
     }
   } else {

@@ -15,6 +15,10 @@ const DERIVED_KEYS = [
   'buy_tx_per_buyer',
   'smart_money_net_buy_count',
   'chip_analysis.pressure_net',
+  'open_to_buy_duration',
+  'launch_to_buy_duration',
+  'buy_max_retracement',
+  'last_alert_low_lower_than_pre_low',
 ];
 
 // 以下字段原始值是 0-1 的小数比例（比如 "0.0331" 实际代表 3.31%），
@@ -161,6 +165,12 @@ const MAX_SNAPSHOT_MATCH_DIFF_SECONDS = 3600;
 // 就通过 onProgress 回调汇报进度，并 await 一次 setTimeout(0) 把主线程让给浏览器刷新 UI，避免整页冻结。
 const BUILD_ROWS_CHUNK_SIZE = 500;
 
+// 兼容秒/毫秒：>=1e12 视为毫秒，否则视为秒，统一转成毫秒
+function toMilliseconds(ts) {
+  const n = Number(ts);
+  return Number.isFinite(n) ? (n >= 1e12 ? n : n * 1000) : NaN;
+}
+
 async function buildRows(calls, snapshots, onProgress) {
   const snapsByKey = new Map();
   for (const s of snapshots) {
@@ -233,6 +243,40 @@ async function buildRows(calls, snapshots, onProgress) {
     // 筹码净压力指标：正数=上方套牢盘更多抛压大，负数=下方支撑更强（design doc §20.5）
     if (fin(chipAbove) && fin(chipBelow)) features['chip_analysis.pressure_net'] = chipAbove - chipBelow;
 
+    // 开盘/上线到买入经过的时长，单位分钟：买入点时间用快照的 timestamp（s.timestamp，快照数据
+    // 本身的抓取时刻，对应真实买入点）——call.timestamp 是导出数据的时间，没有业务含义，不能用。
+    // swap_begin_time 是第一笔交易时间、launch_time 是代币上线时间。用户需求新增字段。
+    // 兼容秒/毫秒，统一转成毫秒后再算分钟级差值，避免单位不一致
+    const buyMs = toMilliseconds(s.timestamp);
+    const swapBeginMs = toMilliseconds(features['swap_begin_time']);
+    const launchMs = toMilliseconds(features['launch_time']);
+    if (Number.isFinite(buyMs) && Number.isFinite(swapBeginMs)) features['open_to_buy_duration'] = (buyMs - swapBeginMs) / 60000;
+    if (Number.isFinite(buyMs) && Number.isFinite(launchMs)) features['launch_to_buy_duration'] = (buyMs - launchMs) / 60000;
+
+    // buy 之前最大回撤：v_breakout_volume_list 里最大的 n_pattern_retracement，没有则为 0
+    // 该数组实际挂在 ctx.logearn 下（logearn 与 signal 同源重复，flatten 时已跳过标量去重，但数组需要单独取）
+    const breakouts = (s.signal && s.signal.v_breakout_volume_list)
+                   || (s.ctx && s.ctx.logearn && s.ctx.logearn.v_breakout_volume_list)
+                   || (s.ctx && s.ctx.v_breakout_volume_list);
+    let maxRetracement = 0;
+    if (Array.isArray(breakouts) && breakouts.length) {
+      for (const ev of breakouts) {
+        const v = Number(ev && ev.n_pattern_retracement);
+        if (Number.isFinite(v) && v > maxRetracement) maxRetracement = v;
+      }
+    }
+    features['buy_max_retracement'] = maxRetracement;
+
+    // 最近一个 V 转信号（last_alert）的最低点是否比上一个 V 转信号的最低点更低（用户需求新增字段）：
+    // 1 = 更低（连续创新低，形态可能更弱），0 = 未创新低。last_alert.low_price/pre_low_price
+    // 由 flattenObject 对 signal.last_alert 递归展开自动产生，不需要单独处理嵌套结构；
+    // 任一侧缺失（比如历史上只出现过一次 V 转信号，没有 pre_low_price）不参与，不强行给默认值。
+    const lastAlertLow = features['last_alert.low_price'];
+    const lastAlertPreLow = features['last_alert.pre_low_price'];
+    if (fin(lastAlertLow) && fin(lastAlertPreLow)) {
+      features['last_alert_low_lower_than_pre_low'] = lastAlertLow < lastAlertPreLow ? 1 : 0;
+    }
+
     // 冗余字段合并（design doc §20.1，已用真实快照数据核实：65 条样本里 mcap/fdv/current_mcap 100% 完全相同）。
     // 注意：gmgn.dev.top_10_holder_rate 与 gmgn.stat.top_10_holder_rate 经核实【不是】冗余字段
     // （65 条样本里 12 条数值不同，应为不同口径的独立统计），不做合并。
@@ -250,6 +294,11 @@ async function buildRows(calls, snapshots, onProgress) {
       signalType: c.signal_type || '',
       // 用于 Pro 版"时间维度分析"按开仓时间分桶；不参与 getFeature/isNumericColumn 常规字段体系
       swapBeginTime: num(c.swap_begin_time),
+      // 观察窗口两端（用于"观察时长不足、returnMax 尚未定型"的偏差检测）：
+      // buyTimestamp = 快照抓取时刻（真实买入点，秒）；exportTimestamp = call 导出时刻（秒），
+      // returnMax 里的 max_mcap 只统计到导出为止，导出越早的样本越没机会创出真实最高点
+      buyTimestamp: Number.isFinite(s.timestamp) ? s.timestamp / 1000 : null,
+      exportTimestamp: Number.isFinite(c.timestamp) ? c.timestamp / 1000 : null,
       initialMcap: init,
       currentMcap: cur,
       maxMcap: mx,
@@ -269,37 +318,140 @@ async function buildRows(calls, snapshots, onProgress) {
 }
 
 function isAssembledField(key) {
-  return DERIVED_KEYS.includes(key) || customFields.some(c => c.name === key);
+  // composite_score 是进阶分析“组合评分”写入工作集的衍生字段，归入组装字段口径
+  return DERIVED_KEYS.includes(key) || key === 'composite_score' || customFields.some(c => c.name === key);
+}
+
+// 相关性候选池治理：三类字段在进入相关性检验前直接剔除——
+// 1) 绝对时间戳（epoch 秒/毫秒）：它们与收益的"相关性"多半是数据采集顺序造成的伪相关（晚导入的
+//    样本时间戳更大之类），本身不构成可交易信号；时间信息的正确形态是时长（duration，如
+//    open_to_buy_duration），那些不受影响；
+// 2) 内部标记/噪声字段（_highlight_*/ai_max_*）：与字段浏览器白名单的既有口径保持一致；
+// 3) 取值恒定的字段：零信息量，r 恒为 0。
+// 剔除的意义不只是少几行垃圾结果：多重比较校正的 m 是按参与检验的字段总数算的，池子里垃圾字段
+// 越多，真字段的校正后 p 被拖累得越厉害。
+// 注意：max_up_* / signal_max_* 这类"截至快照时刻的最大值"统计量【不在】剔除范围——快照是买入
+// 时刻抓取的，这些是买入前已发生的历史，不是未来函数（已用真实样本的时间戳核实过先后关系）。
+const CORR_TIMESTAMP_FIELD_RE = /(^|\.)(time|signalTime|last_traded|created_time)$|_time$|_timestamp$|_ts$/;
+const CORR_INTERNAL_FIELD_RE = /(^|\.)_highlight_|(^|\.)ai_max_/;
+
+function correlationPoolExclusionReason(key) {
+  if (CORR_TIMESTAMP_FIELD_RE.test(key)) return 'timestamp';
+  if (CORR_INTERNAL_FIELD_RE.test(key)) return 'internal';
+  return null;
+}
+
+// 目标筛选口径：corrTarget 下拉的"全部"不包含 log 目标——log(returnMax) 与 returnMax 是同一结果的
+// 单调变换而非独立假设，同时计入会把多重比较校正的 m 无理由翻倍，拖累真字段的校正后 p；
+// 想看 log 目标请在下拉里单独选。相关性表/Bootstrap CI 两处筛选逻辑共用这一条判断。
+function matchCorrTarget(c, target) {
+  return target === 'all' ? (c.target === 'returnCurrent' || c.target === 'returnMax') : c.target === target;
 }
 
 function computeCorrelations(rows) {
   const targets = [
     { key: 'returnCurrent', get: r => r.returnCurrent },
-    { key: 'returnMax', get: r => r.returnMax }
+    { key: 'returnMax', get: r => r.returnMax },
+    // log 目标：收益倍数是重尾分布，原始尺度上的 Pearson r 容易被少数极端倍数主导；对数变换后
+    // 分布更接近对称，Pearson/p 值/CI 都更稳健（Spearman 是秩相关，对单调变换不敏感，
+    // log 前后 ρ 不变，所以 log 目标的意义主要在修正线性相关那一列）。收益倍数理论上 > 0，
+    // 非正值（脏数据）直接记 NaN 不参与。
+    { key: 'logReturnCurrent', get: r => (Number.isFinite(r.returnCurrent) && r.returnCurrent > 0) ? Math.log(r.returnCurrent) : NaN },
+    { key: 'logReturnMax', get: r => (Number.isFinite(r.returnMax) && r.returnMax > 0) ? Math.log(r.returnMax) : NaN }
   ];
   const featureKeys = new Set();
   rows.forEach(r => Object.keys(r.features).forEach(k => featureKeys.add(k)));
   const list = [];
+  const excluded = { timestamp: [], internal: [], constant: [] };
   for (const fkey of featureKeys) {
-    for (const t of targets) {
-      const pairs = [];
-      for (const r of rows) {
-        const v = r.features[fkey];
-        const tv = t.get(r);
-        if (v !== undefined && v !== null && Number.isFinite(v) && Number.isFinite(tv)) {
-          pairs.push([v, tv]);
-        }
+    const preReason = correlationPoolExclusionReason(fkey);
+    if (preReason) { excluded[preReason].push(fkey); continue; }
+    // 取值恒定检测：在全部有效数值上看去重值个数，恒定字段两个 target 都没有信息量，整个字段跳过
+    const distinctValues = new Set();
+    for (const r of rows) {
+      const v = r.features[fkey];
+      if (v !== undefined && v !== null && Number.isFinite(v)) distinctValues.add(v);
+      if (distinctValues.size > 1) break;
+    }
+    if (distinctValues.size <= 1) { excluded.constant.push(fkey); continue; }
+    // 4 个目标（returnCurrent/Max + log 版本）共用同一份 v 有效性判断，之前是每个目标各自完整扫一遍
+    // rows（4 次全量扫描），改成扫一遍 rows、同时往 4 个 pairs 数组里分流，减少 75% 的行扫描次数——
+    // 字段数多、样本量大时（每次过滤/分析都会触发一次 computeCorrelations）这个常数因子有实际意义。
+    const pairsByTarget = targets.map(() => []);
+    for (const r of rows) {
+      const v = r.features[fkey];
+      if (v === undefined || v === null || !Number.isFinite(v)) continue;
+      const timeVal = Number.isFinite(r.swapBeginTime) ? r.swapBeginTime : 0;
+      for (let ti = 0; ti < targets.length; ti++) {
+        const tv = targets[ti].get(r);
+        // 第三个元素带上时间，供下面按时间前后切半算稳定性用；pearson() 只读前两个元素，不受影响
+        if (Number.isFinite(tv)) pairsByTarget[ti].push([v, tv, timeVal]);
       }
+    }
+    for (let ti = 0; ti < targets.length; ti++) {
+      const t = targets[ti];
+      const pairs = pairsByTarget[ti];
       if (pairs.length >= 5) {
         const r = pearson(pairs);
         // 布尔/二值字段（去重值 <= 2）的排名信息量很低，Spearman 在这类字段上意义不大，直接跳过（NaN）
         const distinctCount = new Set(pairs.map(p => p[0])).size;
         const rho = distinctCount > 2 ? spearman(pairs) : NaN;
+        // 离群值敏感性：把 x、y 两侧各最极端的 ~1%（至少 1 个点）剔掉后重算 r。收益是重尾分布，
+        // 一个 r=0.45 的字段可能剔掉两三个极端样本后跌到 0.1——这种"相关性"本质是被少数极端点
+        // 撑起来的，换一批数据大概率不复现。rTrim 与 r 差异大时表格里会给出标记。
+        let rTrim = NaN;
+        if (pairs.length >= 10) {
+          const k = Math.max(1, Math.floor(pairs.length * 0.01));
+          const xSorted = pairs.map(p => p[0]).sort((a, b) => a - b);
+          const ySorted = pairs.map(p => p[1]).sort((a, b) => a - b);
+          const xLo = xSorted[k], xHi = xSorted[xSorted.length - 1 - k];
+          const yLo = ySorted[k], yHi = ySorted[ySorted.length - 1 - k];
+          const trimmed = pairs.filter(([x, y]) => x >= xLo && x <= xHi && y >= yLo && y <= yHi);
+          if (trimmed.length >= 5 && trimmed.length < pairs.length) rTrim = pearson(trimmed);
+        }
+        // 只对本来看起来"有点东西"的字段（|r|>=0.2）做该判定，弱相关字段剔不剔离群点都无所谓
+        const outlierDriven = Number.isFinite(rTrim) && Math.abs(r) >= 0.2
+          && (Math.abs(rTrim) < Math.abs(r) * 0.5 || (Math.sign(rTrim) !== Math.sign(r) && rTrim !== 0));
+        // 时间稳定性：按 swap_begin_time 排序切前后两半，各算一次 r。真信号在两个时间段里方向应当
+        // 一致；前半段 r=0.4、后半段 r=-0.1 的字段，多半是某个特定时间窗（比如某轮行情）里的巧合
+        let rFirstHalf = NaN, rSecondHalf = NaN;
+        if (pairs.length >= 20) {
+          const byTime = pairs.slice().sort((a, b) => a[2] - b[2]);
+          const mid = Math.floor(byTime.length / 2);
+          rFirstHalf = pearson(byTime.slice(0, mid));
+          rSecondHalf = pearson(byTime.slice(mid));
+        }
+        const unstable = Number.isFinite(rFirstHalf) && Number.isFinite(rSecondHalf) && Math.abs(r) >= 0.2
+          && (Math.sign(rFirstHalf) !== Math.sign(rSecondHalf)
+            || Math.min(Math.abs(rFirstHalf), Math.abs(rSecondHalf)) < Math.max(Math.abs(rFirstHalf), Math.abs(rSecondHalf)) * 0.3);
+
+        // 综合质量评分（0-100）：把分散在覆盖率/样本量/离群敏感性/非线性一致性/时间稳定性里的
+        // 质量信号收敛成一个数字 + 扣分原因清单，省得每个字段都要跨几个面板对照着看
+        let score = 100;
+        const reasons = [];
+        const coverage = rows.length ? pairs.length / rows.length : 0;
+        if (coverage < 0.5) { score -= 25; reasons.push(`覆盖率仅 ${(coverage * 100).toFixed(0)}%（结论只适用于有该字段的子集，且该子集本身可能有偏）`); }
+        else if (coverage < 0.9) { score -= 10; reasons.push(`覆盖率 ${(coverage * 100).toFixed(0)}%，部分样本缺失该字段`); }
+        if (pairs.length < 20) { score -= 30; reasons.push(`有效样本仅 ${pairs.length} 条（<20），任何统计结论都很脆弱`); }
+        else if (pairs.length < 50) { score -= 15; reasons.push(`有效样本 ${pairs.length} 条（<50），结论稳定性有限`); }
+        if (outlierDriven) { score -= 25; reasons.push(`相关性由少数极端样本驱动（剔除极端 1% 后 r 从 ${r.toFixed(2)} 变为 ${Number.isFinite(rTrim) ? rTrim.toFixed(2) : '-'}）`); }
+        if (Number.isFinite(rho) && Math.abs(r - rho) > 0.15) { score -= 10; reasons.push('Pearson 与 Spearman 明显不一致，线性假设可能不成立'); }
+        if (unstable) { score -= 25; reasons.push(`时间上不稳定（前半段 r=${rFirstHalf.toFixed(2)}，后半段 r=${rSecondHalf.toFixed(2)}）`); }
+        else if (!Number.isFinite(rFirstHalf)) { score -= 5; reasons.push('样本太少，无法检验时间稳定性'); }
+        score = Math.max(0, score);
+
         list.push({
           target: t.key,
           feature: fkey,
           source: isAssembledField(fkey) ? 'assembled' : 'original',
           r,
+          rTrim,
+          outlierDriven,
+          rFirstHalf,
+          rSecondHalf,
+          unstable,
+          quality: score,
+          qualityReasons: reasons,
           n: pairs.length,
           p: pearsonPValue(r, pairs.length),
           rho,
@@ -309,6 +461,10 @@ function computeCorrelations(rows) {
     }
   }
   list.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
+  // 挂在返回的数组上（而不是 computeCorrelations.lastXxx 静态属性）：OOS 会用 train/test 子集
+  // 再各跑一遍本函数，静态属性会被后跑的覆盖掉；挂在数组上，allCorrelations._excluded 始终对应
+  // 完整数据集那一次的剔除结果，不会被 OOS 的中间计算污染
+  list._excluded = excluded;
   return list;
 }
 
@@ -319,6 +475,8 @@ const ROW_LEVEL_FIELDS = ['symbol', 'signalType', 'id', 'token_address'];
 function getFeature(row, field) {
   if (field === 'returnCurrent') return row.returnCurrent;
   if (field === 'returnMax') return row.returnMax;
+  if (field === 'logReturnCurrent') return (Number.isFinite(row.returnCurrent) && row.returnCurrent > 0) ? Math.log(row.returnCurrent) : undefined;
+  if (field === 'logReturnMax') return (Number.isFinite(row.returnMax) && row.returnMax > 0) ? Math.log(row.returnMax) : undefined;
   if (field === 'token_address') return row.tokenAddress;
   if (ROW_LEVEL_FIELDS.includes(field)) return row[field];
   if (row.features[field] !== undefined) return row.features[field];
@@ -326,7 +484,7 @@ function getFeature(row, field) {
 }
 
 function isNumericColumn(col) {
-  if (col === 'returnCurrent' || col === 'returnMax') return true;
+  if (col === 'returnCurrent' || col === 'returnMax' || col === 'logReturnCurrent' || col === 'logReturnMax') return true;
   if (ROW_LEVEL_FIELDS.includes(col)) return false;
   for (const r of matchedRows) {
     const v = getFeature(r, col);

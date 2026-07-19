@@ -55,6 +55,13 @@
       --shadow: 0 2px 16px rgba(0,0,0,.08);
     }
     * { box-sizing: border-box; }
+    /* 默认系统滚动条（尤其是浅色系统上的宽灰条）跟整体 Apple 风深色/浅色卡片视觉不搭；
+       统一换成细的、跟随主题的样式，Firefox/Chromium 各给一套对应属性 */
+    * { scrollbar-width: thin; scrollbar-color: var(--surface-3) transparent; }
+    ::-webkit-scrollbar { width: 9px; height: 9px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 8px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--border); }
     html { color-scheme: dark; scroll-behavior: smooth; }
     #proSubNav a.chart-tool-btn { text-decoration: none; display: inline-block; }
     html[data-theme="light"] { color-scheme: light; }
@@ -160,6 +167,14 @@
       background: var(--accent); color: #fff;
     }
     button.secondary.active:hover { background: var(--accent-hover); }
+    /* 破坏性操作（删除/清除/重置）统一用这个样式：默认只描边、不填色，避免和"分析""筛选 CA"这类
+       主操作抢视觉权重；hover 时才填红色提示"这会真的删掉东西"，给一个反悔的余地 */
+    button.danger {
+      background: transparent; color: var(--red);
+      box-shadow: inset 0 0 0 1px rgba(255,69,58,.35);
+    }
+    button.danger:hover { background: var(--red); color: #fff; box-shadow: none; }
+    button.danger:disabled { background: transparent; color: var(--text-muted); box-shadow: inset 0 0 0 1px var(--border); }
     .cf-card {
       background: var(--surface-2); border-radius: 12px; padding: 10px 14px; margin-bottom: 8px;
     }
@@ -195,6 +210,19 @@
       font-size: 13px; color: var(--text); margin-left: auto; padding: 6px 0;
     }
     .stats b { color: var(--accent); font-weight: 600; }
+    /* 一组"当前是多少"的关键数字（总览统计等）：以前是一行 label:value 文字挤在一起，几个数字很难
+       扫一眼看清哪个是哪个；改成一排卡片，label 在上（小、次要色），value 在下（大、主色），扫描效率
+       更高，宽度不够时自动换行 */
+    .stat-row { display: flex; flex-wrap: wrap; gap: 10px; }
+    .stat-tile {
+      flex: 1 1 130px; min-width: 130px;
+      background: var(--surface-2); border-radius: var(--radius-sm);
+      padding: 10px 14px;
+    }
+    .stat-tile .stat-label { font-size: 11.5px; color: var(--text-muted); letter-spacing: -.01em; white-space: nowrap; }
+    .stat-tile .stat-value { font-size: 19px; font-weight: 600; color: var(--text); letter-spacing: -.02em; margin-top: 2px; white-space: nowrap; }
+    .stat-tile .stat-value.accent { color: var(--accent); }
+    .stat-row-note { flex-basis: 100%; font-size: 12px; color: var(--text-muted); margin-top: -2px; }
     table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
     th, td { border-bottom: 1px solid var(--border-subtle); padding: 9px 12px; text-align: left; }
     th {
@@ -216,6 +244,7 @@
     }
     .tag.original { background: rgba(48,209,88,.18); color: var(--green); }
     .tag.assembled { background: rgba(255,69,58,.18); color: var(--red); }
+    .tag.trusted { background: rgba(255,159,10,.18); color: #ff9f0a; }
     .tag-input {
       display: flex; flex-wrap: wrap; gap: 7px; align-items: center;
       padding: 8px 10px; min-height: 44px;
@@ -274,6 +303,47 @@
     .toast.toast-fade-out { animation: toast-out .25s ease-in forwards; }
     @keyframes toast-in { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
     @keyframes toast-out { from { opacity: 1; } to { opacity: 0; transform: translateX(20px); } }
+    /* 自定义确认弹窗，取代原生 confirm()：原生弹窗是系统级 UI，样式没法定制，深色页面里跳出一个
+       浏览器默认样式的白底弹窗（标题栏还带着文件路径）体验很割裂，跟 alert() 换成 showToast() 是同一个理由 */
+    .confirm-overlay {
+      position: fixed; inset: 0; z-index: 10001;
+      background: rgba(0,0,0,.45);
+      display: flex; align-items: center; justify-content: center;
+      padding: 20px;
+      animation: confirm-fade-in .15s ease-out;
+    }
+    .confirm-box {
+      background: var(--surface); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius); box-shadow: 0 24px 60px rgba(0,0,0,.4);
+      max-width: 420px; width: 100%; padding: 22px 22px 18px;
+      animation: confirm-pop-in .18s cubic-bezier(.2,.8,.3,1.2);
+    }
+    .confirm-message { font-size: 14px; color: var(--text); line-height: 1.6; white-space: pre-wrap; }
+    .confirm-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+    @keyframes confirm-fade-in { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes confirm-pop-in { from { opacity: 0; transform: scale(.96); } to { opacity: 1; transform: scale(1); } }
+    /* 全局轻量 loading 遮罩：一次性加入很多字段之类的操作虽然不会像以前那样直接卡死页面，
+       但仍需要几百毫秒到一两秒处理，给个反馈避免用户以为点击没反应又连续多点几次 */
+    .loading-overlay {
+      position: fixed; inset: 0; z-index: 10002;
+      background: rgba(0,0,0,.25);
+      display: flex; align-items: center; justify-content: center;
+      opacity: 0; pointer-events: none;
+      transition: opacity .15s ease;
+    }
+    .loading-overlay.visible { opacity: 1; pointer-events: auto; }
+    .loading-box {
+      background: var(--surface); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius); box-shadow: var(--shadow);
+      padding: 20px 28px; display: flex; align-items: center; gap: 14px;
+    }
+    .loading-spinner {
+      width: 20px; height: 20px; border-radius: 50%;
+      border: 2.5px solid var(--surface-3); border-top-color: var(--accent);
+      animation: loading-spin .7s linear infinite; flex: 0 0 auto;
+    }
+    .loading-text { font-size: 13.5px; color: var(--text); }
+    @keyframes loading-spin { to { transform: rotate(360deg); } }
     .field-chip-btn {
       padding: 4px 10px; font-size: 11.5px;
       font-family: "SF Mono", "SFMono-Regular", Consolas, monospace;
@@ -299,6 +369,12 @@
       transition: background .15s ease;
     }
     .tag-chip .chip-remove:hover { background: var(--accent); color: #fff; }
+    .plot-pagination {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      padding: 10px 4px; font-size: 13px; color: var(--text-muted);
+    }
+    .plot-pagination select { padding: 5px 10px; font-size: 12.5px; }
+    .plot-pagination button.secondary { padding: 6px 14px; font-size: 12.5px; }
     .plot-card {
       background: var(--surface); border: 1px solid var(--border-subtle);
       border-radius: var(--radius); box-shadow: var(--shadow);
@@ -331,7 +407,7 @@
     }
     .chart-tool-btn:hover { background: var(--surface-3); }
     .chart-tool-btn.active { background: var(--accent); color: #fff; }
-    .chart-tool-btn.danger { margin-left: auto; }
+    .chart-tool-btn.danger { margin-left: auto; color: var(--red); }
     .chart-tool-btn.danger:hover { background: var(--red); color: #fff; }
     .autocomplete-panel {
       position: fixed; z-index: 1000;
@@ -345,9 +421,18 @@
     .ac-item-title {
       font-size: 12.5px; font-weight: 500; color: var(--text);
       font-family: "SF Mono", "SFMono-Regular", Consolas, monospace;
+      display: flex; align-items: center; gap: 7px;
     }
     .ac-item-desc { font-size: 11px; color: var(--text-muted); margin-top: 2px; line-height: 1.4; }
     .ac-empty { padding: 10px; font-size: 12px; color: var(--text-muted); text-align: center; }
+    /* 用户手动核实过、认为有统计/预测意义的常用字段：联想框里排到最前面并高亮，减少每次都要
+       重新在几十上百个字段里找"哪些是真的靠谱的"这个负担 */
+    .ac-item.trusted { background: rgba(255,159,10,.08); }
+    .ac-item.trusted:hover, .ac-item.trusted.active { background: rgba(255,159,10,.16); }
+    .ac-divider {
+      padding: 6px 10px 4px; font-size: 10.5px; color: var(--text-muted);
+      letter-spacing: .02em; text-transform: uppercase;
+    }
     .filter-field.invalid { box-shadow: 0 0 0 2px var(--red) inset; }
     #navMenuPanel {
       position: absolute; top: calc(100% + 6px); right: 0; z-index: 200;
@@ -472,6 +557,42 @@
         </table>
       </div>
       <div class="hint" id="datasetStatusHint" style="margin: 8px 0 0;"></div>
+
+      <hr style="border-color: var(--border-subtle); margin: 20px 0;">
+      <h4 style="margin: 0 0 6px;">基准库对比</h4>
+      <p class="hint" style="margin: 0 0 12px;">基准库是累积的历史数据（比如策略跑了很久攒下的样本），跟上面两种"整体快照/整体数据集"不同：这里是拿<b>当前数据</b>（用上方过滤后的 activeRows）去跟某个基准库做胜率/收益的差异显著性检验，确认这次调整是不是真的变好了，而不是抽样运气；对比完确认无误后可以把当前数据并入基准库，基准库像滚雪球一样越滚越大。基准库单独存储，不受你在主界面里筛选/探索的影响。</p>
+      <div class="row" style="gap: 8px; align-items: center;">
+        <div class="control" style="flex: 1;">
+          <label for="benchmarkNameInput">新基准库名称</label>
+          <input type="text" id="benchmarkNameInput" placeholder="如 强势盘策略-基准">
+        </div>
+        <div class="control" style="flex: 0 0 auto; min-width: auto; display:flex; align-items:flex-end; gap: 8px;">
+          <button type="button" id="createBenchmarkBtn" class="secondary">用当前数据新建基准库</button>
+          <button type="button" id="importBenchmarkBtn" class="secondary" title="从之前导出的 JSON 备份文件恢复基准库">从 JSON 导入</button>
+          <input type="file" id="importBenchmarkFile" accept=".json" class="hidden">
+        </div>
+      </div>
+      <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
+        <table class="desc-table">
+          <thead><tr><th>基准库名称</th><th class="num">样本数</th><th class="num">胜率</th><th class="num">均值倍数</th><th class="num">体积（占上限）</th><th>更新时间</th><th>操作</th></tr></thead>
+          <tbody id="benchmarkListBody"></tbody>
+        </table>
+      </div>
+      <div class="hint" id="benchmarkStatusHint" style="margin: 8px 0 0;"></div>
+
+      <div class="row" style="margin-top: 14px; gap: 8px; align-items: center;">
+        <div class="control" style="flex: 1;">
+          <label for="benchmarkSelect">对比哪个基准库</label>
+          <select id="benchmarkSelect"></select>
+        </div>
+        <div class="control" style="flex: 0 0 auto; min-width: auto; display:flex; align-items:flex-end;">
+          <button type="button" id="compareBenchmarkBtn">对比当前数据 vs 该基准库</button>
+        </div>
+        <div class="control" style="flex: 0 0 auto; min-width: auto; display:flex; align-items:flex-end;">
+          <button type="button" id="confirmMergeBenchmarkBtn" class="secondary" disabled title="需先点击左边的对比按钮">确认并入基准库</button>
+        </div>
+      </div>
+      <div id="benchmarkCompareResult" class="hidden" style="margin-top: 10px;"></div>
     </div>
   </div>
 
@@ -522,14 +643,18 @@
         <button type="button" class="collapse-toggle">▾</button>
       </div>
       <div class="panel-body" id="filterBody_">
-        <p class="hint">决定下方所有分析使用的数据源：不设置过滤条件时，使用左侧加载的完整数据；设置并点击"筛选 CA"后，下方总览 / 相关性 / 散点图 / 分箱图全部改为基于过滤后的数据源计算。支持多个条件同时满足（AND），支持全部字段：数值字段用 &gt; &lt; &gt;= &lt;= == !=（如 mcap &gt; 120000），字符串字段（symbol / tokenAddress / signalType）用 == != 包含 不包含。字段名必须从输入框下拉联想中选择（这样才能保证与数据中实际字段一致），手打拼错的字段名会被判定为无效并提示。点击"清除"恢复为完整数据源。</p>
+        <p class="hint" style="margin-top: 0;">决定下方所有分析使用的数据源：设置条件并点击"筛选 CA"后，下方总览 / 相关性 / 散点图 / 分箱图全部改为基于过滤后的数据源计算；不设置时使用完整数据。</p>
+        <details style="margin: -4px 0 12px;">
+          <summary>过滤语法说明</summary>
+          <p class="hint" style="margin-top: 6px;">支持多个条件同时满足（AND），支持全部字段：数值字段用 &gt; &lt; &gt;= &lt;= == !=（如 mcap &gt; 120000），字符串字段（symbol / tokenAddress / signalType）用 == != 包含 不包含。字段名必须从输入框下拉联想中选择（这样才能保证与数据中实际字段一致），手打拼错的字段名会被判定为无效并提示。点击"清除"恢复为完整数据源。</p>
+        </details>
         <datalist id="filterFieldList"></datalist>
         <div id="filterRows"></div>
         <div class="row" style="margin-top: 10px;">
           <button id="addFilterRow" class="secondary">添加条件</button>
           <button id="applyFilter">筛选 CA</button>
           <button id="copyFilterCAs" class="secondary">复制 CA</button>
-          <button id="clearFilter" class="secondary">清除</button>
+          <button id="clearFilter" class="danger">清除</button>
         </div>
         <div class="row" style="margin-top: 8px; gap: 8px; align-items: center;">
           <div class="control" style="flex: 0; min-width: 160px;">
@@ -545,7 +670,7 @@
           </div>
           <div class="control" style="flex: 0 0 auto; min-width: auto; display:flex; align-items:flex-end;">
             <button type="button" id="applyFilterPresetBtn" class="secondary">应用</button>
-            <button type="button" id="deleteFilterPresetBtn" class="secondary" title="删除下拉框里选中的预设">删除</button>
+            <button type="button" id="deleteFilterPresetBtn" class="danger" title="删除下拉框里选中的预设">删除</button>
           </div>
         </div>
         <div id="filterStats" class="stats" style="margin-top: 10px;"></div>
@@ -671,9 +796,11 @@
         <div class="control" style="flex: 0 0 auto; min-width: auto;">
           <label for="corrTarget">目标</label>
           <select id="corrTarget">
-            <option value="all">全部</option>
+            <option value="all">全部（不含 log 目标）</option>
             <option value="returnCurrent">returnCurrent</option>
             <option value="returnMax" selected>returnMax</option>
+            <option value="logReturnCurrent">log(returnCurrent)（重尾稳健）</option>
+            <option value="logReturnMax">log(returnMax)（重尾稳健）</option>
           </select>
         </div>
         <div class="control" style="flex: 0 0 auto; min-width: auto;">
@@ -697,6 +824,7 @@
           <label for="corrSortBy">排序</label>
           <select id="corrSortBy">
             <option value="r" selected>|r| 降序</option>
+            <option value="rho">|ρ|（Spearman，推荐：对极端值不敏感）降序</option>
             <option value="delta">|Δ|（线性/单调差异）降序</option>
           </select>
         </div>
@@ -725,6 +853,10 @@
         <div class="control" style="flex: 0; min-width: 140px;">
           <label for="oosTrainRatio">训练集比例</label>
           <input type="number" id="oosTrainRatio" value="0.7" min="0.1" max="0.9" step="0.05">
+        </div>
+        <div class="control" style="flex: 0; min-width: 140px;">
+          <label for="oosSeed" title="锁定切分：同一份数据 + 同一个种子的随机切分结果完全可复现，避免每次刷新都换一套切分导致结论漂移；改种子可检验结论对切分的稳健性">切分种子（锁定）</label>
+          <input type="number" id="oosSeed" value="42" step="1">
         </div>
       </div>
       <div id="oosWarning" class="hint hidden" style="margin: 0 0 10px; color: var(--warn, #ff9f0a);"></div>
@@ -842,7 +974,8 @@
         <div style="margin-top: 8px;">
           <button type="button" id="batchXImportToggle" class="secondary">📋 粘贴 JSON 片段快速添加</button>
           <button type="button" id="fieldBrowserToggle" class="secondary">📚 按分组浏览字段</button>
-          <button type="button" id="batchXClearBtn" class="secondary">🗑 一键清空 X</button>
+          <button type="button" id="loadTrustedFieldsBtn" class="secondary" title="把已核实过的常用字段（联想框里带 ★ 常用标记的那批）一次性加入 X">★ 一键加载常用字段</button>
+          <button type="button" id="batchXClearBtn" class="danger">🗑 一键清空 X</button>
           <div id="batchXImportPanel" class="hidden" style="margin-top: 8px;">
             <p class="hint" style="margin: 0 0 6px;">粘贴任意包含字段的 JSON/对象片段（严格 JSON "key": 、单引号 'key': 、不带引号的 key: 都支持；行内 // 注释、末尾逗号、外层不闭合、甚至只贴一两行 key: value 都可以），会自动提取里面的 key，按名称匹配到当前数据里已存在的字段（无需带 gmgn.stat. 等前缀），一次性加入 X 列表。</p>
             <textarea id="batchXImportText" rows="6" style="width: 100%;" placeholder='例如粘贴：
@@ -899,7 +1032,7 @@
       <div class="stats" id="plotStats"></div>
     </div>
     <div class="row" style="margin-top: 8px; gap: 8px; align-items: center; flex-wrap: wrap;">
-      <span class="hint" style="margin: 0;">批量操作（只影响当前已展示的图表，不影响后续新增图表的默认值）：</span>
+      <span class="hint" style="margin: 0;">批量操作（影响当前已选中的全部 X 字段，含未在当前页展示的，不影响后续新增字段的默认值）：</span>
       <button type="button" class="secondary batch-chart-op-btn" data-op="logX" data-val="true">全部启用对数X</button>
       <button type="button" class="secondary batch-chart-op-btn" data-op="showConfBand" data-val="true">全部启用置信区间</button>
       <button type="button" class="secondary batch-chart-op-btn" data-op="showBinned" data-val="true">全部启用分档统计</button>
@@ -914,7 +1047,9 @@
     </div>
   </div>
 
+  <div id="plotPaginationTop"></div>
   <div id="plotStack"></div>
+  <div id="plotPaginationBottom"></div>
 
   <div class="panel hidden" id="binBarPanel">
     <div class="panel-header-row" data-target="binBarBody_">
@@ -984,6 +1119,7 @@
         <a href="#proSectionGroupCompare" class="chart-tool-btn">2.分组对比</a>
         <a href="#proSectionRegression" class="chart-tool-btn">3.回归</a>
         <a href="#proSectionFeatureCombo" class="chart-tool-btn">3.5特征组合</a>
+        <a href="#proSectionCompositeScore" class="chart-tool-btn">3.6组合评分</a>
         <a href="#proSectionTimeAnalysis" class="chart-tool-btn">4.时间分析</a>
         <a href="#proSectionCategoryCompare" class="chart-tool-btn">5.分类对比</a>
         <a href="#proSectionRoc" class="chart-tool-btn">6.ROC-AUC</a>
@@ -1028,7 +1164,7 @@
 
         <div class="pro-section" id="proSectionGroupCompare">
           <h4>2. 分组对比分析</h4>
-          <p class="hint" style="margin: 0 0 10px;">按分类字段（如 signalType/platform）分组，对比同一特征在不同组内与收益的相关性是否一致，避免"整体相关性显著，其实只是某一类信号驱动"的伪相关（辛普森悖论）。分组字段也可以是数值字段，填写断点后会自动离散化分组。</p>
+          <p class="hint" style="margin: 0 0 10px;">按分类字段（如 signalType/platform）分组，对比同一特征在不同组内与收益的相关性是否一致，避免"整体相关性显著，其实只是某一类信号驱动"的伪相关（辛普森悖论）。分组字段也可以是数值字段：填写断点手动离散化，或选“自动分位数分层”把它当作混杂因素（如市值/流动性）控制后，再看特征在各层内是否仍有独立解释力（层内加权 r 会与整体 r 对照）。</p>
           <div class="row">
             <div class="control" style="position: relative;">
               <label for="groupByField">分组字段</label>
@@ -1037,6 +1173,15 @@
             <div class="control">
               <label for="groupByBreakpoints">分组断点（数值字段离散化，可留空）</label>
               <input type="text" id="groupByBreakpoints" placeholder="如 0.5,1,1.5,2">
+            </div>
+            <div class="control" style="flex: 0; min-width: 170px;">
+              <label for="groupByQuantiles" title="对数值型分组字段自动按分位数切层（优先于手动断点），用于控制混杂因素">自动分位数分层</label>
+              <select id="groupByQuantiles">
+                <option value="0" selected>不启用</option>
+                <option value="3">三分位（3 层）</option>
+                <option value="4">四分位（4 层）</option>
+                <option value="5">五分位（5 层）</option>
+              </select>
             </div>
             <div class="control" style="position: relative;">
               <label for="groupFeatureField">特征字段</label>
@@ -1047,6 +1192,8 @@
               <select id="groupTargetField">
                 <option value="returnCurrent">returnCurrent</option>
                 <option value="returnMax" selected>returnMax</option>
+                <option value="logReturnCurrent">log(returnCurrent)</option>
+                <option value="logReturnMax">log(returnMax)</option>
               </select>
             </div>
             <div class="control" style="flex: 0; min-width: 120px;">
@@ -1066,6 +1213,13 @@
               <tbody id="groupCompareBody"></tbody>
             </table>
           </div>
+          <p class="hint" style="margin: 14px 0 6px;">分组内多档位达标率：每组内目标字段（倍数）达到各档位的样本占比，用于看清"胜率"具体是靠小赚撑起来的还是有更高倍数的分布。</p>
+          <div class="table-scroll" style="margin-top: 0; max-height: 260px;">
+            <table class="desc-table">
+              <thead id="groupCompareBreakdownHead"></thead>
+              <tbody id="groupCompareBreakdownBody"></tbody>
+            </table>
+          </div>
         </div>
 
         <div class="pro-section" id="proSectionRegression">
@@ -1077,6 +1231,8 @@
               <select id="importanceTargetField">
                 <option value="returnCurrent">returnCurrent</option>
                 <option value="returnMax" selected>returnMax</option>
+                <option value="logReturnCurrent">log(returnCurrent)（重尾稳健）</option>
+                <option value="logReturnMax">log(returnMax)（重尾稳健）</option>
               </select>
             </div>
             <div class="control" style="flex: 1 1 100%; position: relative;">
@@ -1106,6 +1262,10 @@
               <label for="regOosTrainRatio">训练集比例</label>
               <input type="number" id="regOosTrainRatio" value="0.7" min="0.1" max="0.9" step="0.05">
             </div>
+            <div class="control" style="flex: 0; min-width: 140px;">
+              <label for="regOosSeed" title="锁定切分：同一份数据 + 同一个种子的随机切分结果完全可复现；改种子可检验结论对切分的稳健性">切分种子（锁定）</label>
+              <input type="number" id="regOosSeed" value="42" step="1">
+            </div>
           </div>
           <div id="importanceResult" class="stats"></div>
           <div id="importanceWarning" class="hint hidden" style="margin-top: 10px; color: var(--warn, #ff9f0a);"></div>
@@ -1127,6 +1287,8 @@
               <select id="interactionTargetField">
                 <option value="returnCurrent">returnCurrent</option>
                 <option value="returnMax" selected>returnMax</option>
+                <option value="logReturnCurrent">log(returnCurrent)</option>
+                <option value="logReturnMax">log(returnMax)</option>
               </select>
             </div>
             <div class="control" style="flex: 1 1 100%; position: relative;">
@@ -1158,6 +1320,75 @@
             <table class="desc-table">
               <thead><tr><th>组合表达式</th><th class="num">新组合 r</th><th class="num">字段 A 单独 r</th><th class="num">字段 B 单独 r</th><th class="num">提升幅度</th><th class="num">n</th><th>操作</th></tr></thead>
               <tbody id="interactionBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="pro-section" id="proSectionCompositeScore">
+          <h4>3.6 组合评分（多字段综合打分）</h4>
+          <p class="hint" style="margin: 0 0 10px;">把多个字段合成一个综合评分：在<b>训练集</b>上确定每个字段的方向（Spearman ρ 的符号）和权重，再在<b>测试集</b>上评估评分与目标的秩相关，避免"在全量数据上挑字段又在全量数据上验证"的自我循环。评分 = 各字段截断 z 分数（±3 封顶，防极端值主导）按权重的符号加权平均。满意后可一键把评分写入工作集字段 <code>composite_score</code>，即可在散点图/过滤/分箱里直接使用。</p>
+          <div class="row">
+            <div class="control" style="flex: 0; min-width: 160px;">
+              <label for="compositeTargetField">目标</label>
+              <select id="compositeTargetField">
+                <option value="returnCurrent">returnCurrent</option>
+                <option value="returnMax" selected>returnMax</option>
+                <option value="logReturnCurrent">log(returnCurrent)</option>
+                <option value="logReturnMax">log(returnMax)</option>
+              </select>
+            </div>
+            <div class="control" style="flex: 1 1 100%; position: relative;">
+              <label for="compositeInput">评分字段（2~15 个）</label>
+              <div class="tag-input" id="compositeTagBox">
+                <input type="text" id="compositeInput" placeholder="输入字段名联想，选中自动添加..." autocomplete="off">
+              </div>
+            </div>
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
+              <button type="button" id="importCompositeTop10Btn">导入相关性表 Top10</button>
+            </div>
+          </div>
+          <div class="row" style="margin-top: 4px; align-items: flex-end;">
+            <div class="control" style="flex: 0; min-width: 180px;">
+              <label for="compositeWeightMethod">权重方式</label>
+              <select id="compositeWeightMethod">
+                <option value="sign" selected>等权（只用方向，更稳健）</option>
+                <option value="rho">按训练集 |ρ| 加权</option>
+              </select>
+            </div>
+            <div class="control" style="flex: 0; min-width: 160px;">
+              <label for="compositeSplitMethod">切分方式</label>
+              <select id="compositeSplitMethod">
+                <option value="time" selected>按时间顺序切分（推荐）</option>
+                <option value="random">随机切分</option>
+              </select>
+            </div>
+            <div class="control" style="flex: 0; min-width: 140px;">
+              <label for="compositeTrainRatio">训练集比例</label>
+              <input type="number" id="compositeTrainRatio" value="0.7" min="0.1" max="0.9" step="0.05">
+            </div>
+            <div class="control" style="flex: 0; min-width: 140px;">
+              <label for="compositeSeed" title="锁定切分：同一份数据 + 同一个种子的随机切分结果完全可复现；改种子可检验评分对切分的稳健性">切分种子（锁定）</label>
+              <input type="number" id="compositeSeed" value="42" step="1">
+            </div>
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
+              <button type="button" id="genCompositeScoreBtn">训练并评估</button>
+            </div>
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
+              <button type="button" id="applyCompositeScoreBtn" class="secondary hidden">把评分写入工作集字段 composite_score</button>
+            </div>
+          </div>
+          <div id="compositeWarning" class="hint hidden" style="margin: 10px 0; color: var(--warn, #ff9f0a);"></div>
+          <div id="compositeSummary" class="stats"></div>
+          <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
+            <table class="desc-table">
+              <thead><tr><th>字段</th><th class="num">训练集 ρ</th><th>方向</th><th class="num">权重</th><th class="num">训练集有效 n</th></tr></thead>
+              <tbody id="compositeSpecBody"></tbody>
+            </table>
+          </div>
+          <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
+            <table class="desc-table">
+              <thead><tr><th>测试集评分分层（五分位）</th><th>评分区间</th><th class="num">n</th><th class="num">目标均值</th><th class="num">目标中位数</th><th class="num">胜率</th></tr></thead>
+              <tbody id="compositeDecileBody"></tbody>
             </table>
           </div>
         </div>

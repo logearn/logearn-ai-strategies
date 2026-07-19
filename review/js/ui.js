@@ -13,9 +13,35 @@ const bootstrapCIMap = new Map(); // `${target}|${feature}` -> { lo, hi, n }；a
 let bootstrapRunning = false;
 let bootstrapCancelFlag = false;
 
+// 样本外验证（训练/测试集相关性）结果缓存：只在 method/ratio/seed 真正变化时才重新
+// splitTrainTest + computeCorrelations(train) + computeCorrelations(test)。
+// 之前 renderCorrTable 每次调用（包括阈值筛选框敲字触发的 input 事件、切换排序/校正方式等
+// 跟切分完全无关的操作）都会在 oosEnabled 时无条件重算一遍，字段多、样本量大时明显卡顿。
+// 缓存的失效时机是 refreshAnalysisViews()（数据集真正变化的唯一入口），而不是靠 activeRows
+// 的引用比较——因为自定义字段编辑等场景会原地 mutate 现有行的 features，activeRows 引用不变
+// 但数据内容已经变了，引用比较会误判为"没变"从而返回过期结果。
+let oosCorrCache = null;
+function getOosCorrelations(method, ratio, seed) {
+  if (oosCorrCache && oosCorrCache.method === method && oosCorrCache.ratio === ratio && oosCorrCache.seed === seed) {
+    return oosCorrCache;
+  }
+  const { train, test } = splitTrainTest(activeRows, method, ratio, 'swapBeginTime', seed);
+  oosCorrCache = {
+    method, ratio, seed,
+    trainCorr: computeCorrelations(train),
+    testCorr: computeCorrelations(test),
+    testN: test.length
+  };
+  return oosCorrCache;
+}
+
 function updateSummary() {
+  const el = document.getElementById('summaryText');
   if (!activeRows.length) {
-    document.getElementById('summaryText').innerHTML = `<b>匹配样本数:</b> 0（当前过滤条件下没有样本，原始 ${matchedRows.length} 条）`;
+    el.innerHTML = `<div class="stat-row">
+      <div class="stat-tile"><div class="stat-label">匹配样本数</div><div class="stat-value">0</div></div>
+      <div class="stat-row-note">当前过滤条件下没有样本，原始 ${matchedRows.length} 条</div>
+    </div>`;
     return;
   }
   const cur = activeRows.map(r => r.returnCurrent);
@@ -23,14 +49,65 @@ function updateSummary() {
   const cs = calcStats(cur, 1);
   const ms = calcStats(mx, 1);
   const filterNote = activeRows.length !== matchedRows.length
-    ? ` &nbsp; <b>(已应用全局过滤，原始 ${matchedRows.length} 条)</b>` : '';
-  document.getElementById('summaryText').innerHTML = `
-    <b>匹配样本数:</b> ${activeRows.length} &nbsp;
-    <b>returnCurrent 平均倍数:</b> ${cs.mean.toFixed(4)}x &nbsp;
-    <b>胜率(倍数>1):</b> ${(cs.winRate * 100).toFixed(1)}% &nbsp;
-    <b>returnMax 平均倍数:</b> ${ms.mean.toFixed(4)}x &nbsp;
-    <b>最大倍数:</b> ${ms.max.toFixed(4)}x${filterNote}
+    ? `<div class="stat-row-note">已应用全局过滤，原始 ${matchedRows.length} 条</div>` : '';
+  // 观察窗口偏差检测：returnMax 的 max_mcap 只统计到导出时刻，观察时长太短的样本还没机会创出
+  // 真实最高点，会系统性拉低整体胜率/均值。阈值 6 小时——meme 类 token 的最大涨幅通常在几分钟到
+  // 几小时内出现，6 小时后仍未定型的占比已经不高。
+  const OBS_WINDOW_MIN_SECONDS = 6 * 3600;
+  const obsWindows = activeRows
+    .map(r => (Number.isFinite(r.exportTimestamp) && Number.isFinite(r.buyTimestamp)) ? r.exportTimestamp - r.buyTimestamp : null)
+    .filter(v => v !== null && v >= 0);
+  let obsNote = '';
+  let obsTile = '';
+  if (obsWindows.length) {
+    const sortedObs = obsWindows.slice().sort((a, b) => a - b);
+    const medianObs = percentile(sortedObs, 0.5);
+    const fmtDur = s => s >= 86400 ? (s / 86400).toFixed(1) + '天' : s >= 3600 ? (s / 3600).toFixed(1) + '小时' : Math.round(s / 60) + '分钟';
+    obsTile = `<div class="stat-tile"><div class="stat-label" title="从买入（快照抓取时刻）到数据导出经过的时长；returnMax 只统计到导出为止">观察时长中位数</div><div class="stat-value">${fmtDur(medianObs)}</div></div>`;
+    const freshCount = obsWindows.filter(v => v < OBS_WINDOW_MIN_SECONDS).length;
+    if (freshCount > 0) {
+      obsNote = `<div class="stat-row-note" style="color:var(--warn, #ff9f0a);">⚠️ ${freshCount} 条样本（${(freshCount / obsWindows.length * 100).toFixed(0)}%）观察时长不足 6 小时，其 returnMax 可能尚未定型，会拉低整体胜率/均值——和观察时间充分的老样本混在一起对比时要注意这个偏差。</div>`;
+    }
+  }
+  // 非独立样本检测：同一个 token 触发多次信号，这些样本的收益高度相关，但所有统计都把它们当独立
+  // 样本算，会虚增显著性。样本数和去重 token 数差距明显时给出警告和一键去重入口。
+  const uniqueTokens = new Set(activeRows.map(r => (r.tokenAddress || '').toLowerCase()).filter(Boolean)).size;
+  const dupNote = uniqueTokens > 0 && activeRows.length > uniqueTokens * 1.2
+    ? `<div class="stat-row-note" style="color:var(--warn, #ff9f0a);">⚠️ ${activeRows.length} 条样本里只有 ${uniqueTokens} 个不同 token（同一 token 的多次信号收益高度相关，会虚增所有统计检验的显著性）。<button type="button" id="dedupPerTokenBtn" class="secondary" style="padding:3px 12px; font-size:12px; margin-left:8px;">每 token 只保留首条信号</button></div>`
+    : '';
+  // 几个关键数字以前是挤在一行的 label:value 文字，数字越多越难一眼扫清哪个是哪个；
+  // 改成一排卡片（label 在上/次要色，value 在下/大号），扫描效率更高。
+  el.innerHTML = `
+    <div class="stat-row">
+      <div class="stat-tile"><div class="stat-label">匹配样本数</div><div class="stat-value accent">${activeRows.length}</div></div>
+      <div class="stat-tile"><div class="stat-label" title="去重后的不同 token 个数；和样本数差距大说明存在同一 token 的重复信号">去重 token 数</div><div class="stat-value">${uniqueTokens || '-'}</div></div>
+      <div class="stat-tile"><div class="stat-label">returnCurrent 平均倍数</div><div class="stat-value">${cs.mean.toFixed(4)}x</div></div>
+      <div class="stat-tile"><div class="stat-label">胜率（倍数&gt;1）</div><div class="stat-value">${(cs.winRate * 100).toFixed(1)}%</div></div>
+      <div class="stat-tile"><div class="stat-label">returnMax 平均倍数</div><div class="stat-value">${ms.mean.toFixed(4)}x</div></div>
+      <div class="stat-tile"><div class="stat-label">最大倍数</div><div class="stat-value">${ms.max.toFixed(4)}x</div></div>
+      ${obsTile}
+      ${filterNote}
+      ${obsNote}
+      ${dupNote}
+    </div>
   `;
+  const dedupBtn = document.getElementById('dedupPerTokenBtn');
+  if (dedupBtn) {
+    dedupBtn.addEventListener('click', async () => {
+      if (!await showConfirm(`将从当前工作集中排除同一 token 的重复信号（每 token 保留买入时间最早的一条），${activeRows.length} 条 → ${uniqueTokens} 条。不修改原始文件，重新点"分析"或清除过滤即可恢复，是否继续？`)) return;
+      const byToken = new Map();
+      for (const r of activeRows) {
+        const key = (r.tokenAddress || '').toLowerCase() || `__no_addr_${byToken.size}`;
+        const prev = byToken.get(key);
+        const rTime = Number.isFinite(r.buyTimestamp) ? r.buyTimestamp : (r.swapBeginTime || Infinity);
+        const prevTime = prev ? (Number.isFinite(prev.buyTimestamp) ? prev.buyTimestamp : (prev.swapBeginTime || Infinity)) : Infinity;
+        if (!prev || rTime < prevTime) byToken.set(key, r);
+      }
+      activeRows = [...byToken.values()];
+      refreshAnalysisViews();
+      showToast(`已按 token 去重：现在的工作集为 ${activeRows.length} 条（每 token 保留首条信号）`);
+    });
+  }
 }
 
 // 相关性表里勾选的行（key 为 `${target}|${feature}`），跨搜索过滤/排序持久保留，
@@ -60,9 +137,14 @@ function renderCorrTable() {
 
   // m 必须是当前 目标/来源 筛选下参与检验的全部字段数（不是 topN 截断后的数量），
   // 否则会系统性低估需要校正的严重程度；corrSource/corrTarget 切换时 m 会跟着重新计算。
-  const fullSet = allCorrelations.filter(c => (target === 'all' || c.target === target) && (source === 'all' || c.source === source));
+  // “全部”不包含 log 目标：共享判断见 data.js 里的 matchCorrTarget。
+  const fullSet = allCorrelations.filter(c => matchCorrTarget(c, target) && (source === 'all' || c.source === source));
   if (sortBy === 'delta') {
     fullSet.sort((a, b) => (Number.isFinite(b.delta) ? b.delta : -1) - (Number.isFinite(a.delta) ? a.delta : -1));
+  } else if (sortBy === 'rho') {
+    // Spearman 排序：秩相关对重尾收益的极端值不敏感，比 |r| 排序更不容易把“被几个极端样本
+    // 撑起来的字段”排到前面；ρ 无法计算（布尔字段等）的排末尾
+    fullSet.sort((a, b) => (Number.isFinite(b.rho) ? Math.abs(b.rho) : -1) - (Number.isFinite(a.rho) ? Math.abs(a.rho) : -1));
   } else {
     fullSet.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
   }
@@ -81,18 +163,31 @@ function renderCorrTable() {
     const methodName = correction === 'bonferroni' ? 'Bonferroni' : 'BH-FDR';
     summaryEl.textContent = `共 ${fullSet.length} 个字段参与检验，未校正时有 ${rawSigCount} 个字段 p<0.05，${methodName} 校正后仅剩 ${adjSigCount} 个仍然显著。`;
   }
+  // 候选池治理摘要：说明有多少无效字段没有进入检验（既是透明度，也是提醒"m 已经瘦身，校正没那么苛刻了"）；
+  // 悬浮可以看具体剔除了哪些字段
+  const ex = allCorrelations._excluded;
+  if (ex) {
+    const exTotal = ex.timestamp.length + ex.internal.length + ex.constant.length;
+    if (exTotal > 0) {
+      summaryEl.textContent += ` 另有 ${exTotal} 个无效字段已自动剔除、不占检验名额（时间戳 ${ex.timestamp.length}、内部标记 ${ex.internal.length}、取值恒定 ${ex.constant.length}）。`;
+      summaryEl.title = [
+        ex.timestamp.length ? `时间戳字段：${ex.timestamp.join('、')}` : '',
+        ex.internal.length ? `内部标记字段：${ex.internal.join('、')}` : '',
+        ex.constant.length ? `取值恒定字段：${ex.constant.join('、')}` : '',
+      ].filter(Boolean).join('\n');
+    } else {
+      summaryEl.title = '';
+    }
+  }
 
   // 样本外验证：按训练/测试集分别跑一遍 computeCorrelations，两组结果并排展示，
   // 而不是只在训练集上重新拟合（重新拟合就失去了"验证"的意义）
   let testN = 0;
   const oosWarnEl = document.getElementById('oosWarning');
   if (oosEnabled) {
-    const method = document.getElementById('oosSplitMethod').value;
-    const ratio = Number(document.getElementById('oosTrainRatio').value) || 0.7;
-    const { train, test } = splitTrainTest(activeRows, method, ratio, 'swapBeginTime');
-    testN = test.length;
-    const trainCorr = computeCorrelations(train);
-    const testCorr = computeCorrelations(test);
+    const { method, ratio, seed } = readSplitOptions('oos');
+    const { trainCorr, testCorr, testN: cachedTestN } = getOosCorrelations(method, ratio, seed);
+    testN = cachedTestN;
     const trainMap = new Map(trainCorr.map(c => [`${c.target}|${c.feature}`, c]));
     const testMap = new Map(testCorr.map(c => [`${c.target}|${c.feature}`, c]));
     fullSet.forEach(c => {
@@ -106,7 +201,8 @@ function renderCorrTable() {
     oosWarnEl.classList.add('hidden');
   }
 
-  document.querySelector('#corrTableHead tr').innerHTML = '<th><input type="checkbox" id="corrSelectAll" title="全选当前过滤后的字段"></th><th>目标</th><th>字段</th><th>中文含义</th><th>来源</th><th class="num">r</th>'
+  document.querySelector('#corrTableHead tr').innerHTML = '<th><input type="checkbox" id="corrSelectAll" title="全选当前过滤后的字段"></th><th>目标</th><th>字段</th><th>中文含义</th><th>来源</th>'
+    + '<th class="num" title="综合覆盖率/样本量/离群敏感性/线性一致性/时间稳定性的 0-100 评分，悬浮单元格可看具体扣分原因">质量分</th><th class="num">r</th>'
     + (oosEnabled ? '<th class="num">训练集 r</th><th class="num">测试集 r</th>' : '')
     + '<th class="num">Spearman ρ</th><th class="num">|Δ|</th><th class="num">n</th><th class="num">p</th><th class="num">校正后 p</th><th>r 的 95% CI</th><th>操作</th>';
 
@@ -137,6 +233,10 @@ function renderCorrTable() {
     // |Δ| 较大说明 Pearson r 和 Spearman ρ 明显不一致，可能存在非线性但单调的关系，提示去散点图里看形状
     const deltaFlag = Number.isFinite(c.delta) && c.delta > 0.15
       ? ` <span title="该字段的线性相关性和单调相关性差异较大，可能存在非线性关系，建议在散点图里查看具体形状（可尝试打开对数轴）">🔀</span>` : '';
+    // 离群值敏感性：剔除两侧极端 ~1% 样本后 r 大幅缩水或变号 → 该相关性主要由少数极端样本撑起，
+    // 换一批数据大概率不复现，标记出来防止用户被点估计值唬住
+    const outlierFlag = c.outlierDriven
+      ? ` <span title="剔除极端 1% 样本后 r 从 ${c.r.toFixed(3)} 变为 ${Number.isFinite(c.rTrim) ? c.rTrim.toFixed(3) : '-'}：该相关性主要由少数极端样本驱动，谨慎采信">📌</span>` : '';
     let oosCells = '';
     if (oosEnabled) {
       // 衰减幅度较大（测试集 |r| 相比训练集下降超过 50%）或符号翻转 → 醒目标出，提示可能是过拟合/巧合
@@ -167,7 +267,8 @@ function renderCorrTable() {
       <td>${escapeHtml(c.feature)}</td>
       <td class="ellip" title="${escapeHtml(getFieldDesc(c.feature))}">${escapeHtml(getFieldDesc(c.feature)) || '暂无备注'}</td>
       <td><span class="tag ${c.source}">${c.source === 'assembled' ? '组装' : '原始'}</span></td>
-      <td class="num">${c.r.toFixed(4)}</td>
+      <td class="num" style="color:${c.quality >= 80 ? 'var(--green)' : c.quality >= 50 ? '#ff9f0a' : 'var(--red)'}; font-weight:600;"${c.qualityReasons && c.qualityReasons.length ? ` title="${escapeHtml('扣分原因：\n' + c.qualityReasons.join('\n'))}"` : ' title="各项质量检查均通过"'}>${Number.isFinite(c.quality) ? c.quality : '-'}</td>
+      <td class="num"${c.outlierDriven ? ' style="color:#ff9f0a;"' : ''}>${c.r.toFixed(4)}${outlierFlag}</td>
       ${oosCells}
       <td class="num">${Number.isFinite(c.rho) ? c.rho.toFixed(4) : '-'}</td>
       <td class="num">${Number.isFinite(c.delta) ? c.delta.toFixed(4) : '-'}${deltaFlag}</td>
@@ -262,10 +363,10 @@ function renderQualityAlerts() {
     </tr>
   `).join('') || '<tr><td colspan="3" style="text-align:center; color:var(--text-muted);">未发现可能存在问题的记录</td></tr>';
 
-  excludeBtn.onclick = () => {
+  excludeBtn.onclick = async () => {
     const flaggedIds = new Set(alerts.map(a => a.row.id));
     if (!flaggedIds.size) return;
-    if (!confirm(`确定要从当前工作集中排除这 ${flaggedIds.size} 条记录吗？（不会修改原始文件，只影响当前分析）`)) return;
+    if (!await showConfirm(`确定要从当前工作集中排除这 ${flaggedIds.size} 条记录吗？（不会修改原始文件，只影响当前分析）`)) return;
     activeRows = activeRows.filter(r => !flaggedIds.has(r.id));
     refreshAnalysisViews();
   };
@@ -282,7 +383,7 @@ async function runBootstrapCI() {
   const top = Number(document.getElementById('topN').value);
   const B = Math.max(100, Math.min(2000, Number(document.getElementById('bootstrapResamples').value) || 500));
 
-  const fullSet = allCorrelations.filter(c => (target === 'all' || c.target === target) && (source === 'all' || c.source === source));
+  const fullSet = allCorrelations.filter(c => matchCorrTarget(c, target) && (source === 'all' || c.source === source));
   fullSet.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
   const targets = fullSet.slice(0, top);
   if (!targets.length) { showToast('当前表格没有可计算的字段'); return; }
@@ -478,15 +579,24 @@ function attachAutocomplete(input, anchorEl, datalistId, onSelect) {
     positionPanel();
     const q = input.value.trim().toLowerCase();
     const opts = getOptions().filter(o => !q || o.value.toLowerCase().includes(q) || o.label.toLowerCase().includes(q));
+    // 常用字段排到最前面（Array.sort 是稳定排序，组内保持原有顺序不变），并单独高亮+打标，
+    // 不用每次都从几十上百个字段里重新找"哪些是核实过靠谱的"
+    opts.sort((a, b) => (TRUSTED_FIELDS.has(b.value) ? 1 : 0) - (TRUSTED_FIELDS.has(a.value) ? 1 : 0));
     if (!opts.length) {
       panel.innerHTML = '<div class="ac-empty">无匹配字段</div>';
     } else {
-      panel.innerHTML = opts.slice(0, 300).map(o => `
-        <div class="ac-item" data-value="${escapeHtml(o.value)}">
-          <div class="ac-item-title">${escapeHtml(o.value)}</div>
+      const trustedCount = opts.findIndex(o => !TRUSTED_FIELDS.has(o.value));
+      panel.innerHTML = opts.slice(0, 300).map((o, i) => {
+        const trusted = TRUSTED_FIELDS.has(o.value);
+        // 常用字段和其余字段之间插一条分隔线，明确"上面是常用的，下面是其它"，避免用户以为
+        // 排序乱了看不懂
+        const divider = i > 0 && i === trustedCount ? '<div class="ac-divider">其它字段</div>' : '';
+        return `${divider}
+        <div class="ac-item${trusted ? ' trusted' : ''}" data-value="${escapeHtml(o.value)}">
+          <div class="ac-item-title">${escapeHtml(o.value)}${trusted ? '<span class="tag trusted">★ 常用</span>' : ''}</div>
           ${o.label && o.label !== o.value ? `<div class="ac-item-desc">${escapeHtml(o.label)}</div>` : ''}
-        </div>
-      `).join('');
+        </div>`;
+      }).join('');
     }
     panel.classList.remove('hidden');
   }
@@ -543,7 +653,7 @@ function getValidColorField() {
 let scatterSelectsInitialized = false;
 
 function updateScatterSelects() {
-  scatterOptions = ['returnCurrent', 'returnMax', ...allNumericKeys].filter(isNumericColumn);
+  scatterOptions = ['returnCurrent', 'returnMax', 'logReturnCurrent', 'logReturnMax', ...allNumericKeys].filter(isNumericColumn);
   const defaultX = scatterOptions.includes('buyer_count_d1') ? 'buyer_count_d1' :
     scatterOptions.find(c => c !== 'returnCurrent' && c !== 'returnMax') || scatterOptions[0] || '';
   const defaultY = scatterOptions.includes('returnMax') ? 'returnMax' : scatterOptions[0] || '';
@@ -616,7 +726,7 @@ function addFilterRow(field = '', op = '>=', threshold = '') {
       <option value="not_contains" ${op === 'not_contains' ? 'selected' : ''}>不包含</option>
     </select>
     <input type="text" class="filter-threshold" placeholder="阈值（数字或文本）" value="${escapeHtml(threshold)}">
-    <button type="button" class="removeFilterRow">删除</button>
+    <button type="button" class="removeFilterRow danger">删除</button>
   `;
   container.appendChild(div);
   const fieldInput = div.querySelector('.filter-field');
@@ -643,6 +753,7 @@ function refreshAnalysisViews() {
   refreshSimilarBaseOptions();
   renderDistribution();
   bootstrapCIMap.clear();
+  oosCorrCache = null; // 数据集真正变了（过滤/分析/自定义字段编辑等），OOS 训练/测试集缓存必须失效
   allCorrelations = computeCorrelations(activeRows);
   renderCorrTable();
   updateSummary();
@@ -703,14 +814,14 @@ function applyFilter() {
   const avgReturn = results.length ? (results.reduce((a, b) => a + b.returnCurrent, 0) / results.length).toFixed(4) : '-';
   const usedConditionsNote = `已生效 ${conditions.length} 个条件`;
   document.getElementById('filterStats').innerHTML = `命中 <b>${results.length}</b> / ${matchedRows.length} 条，平均 returnCurrent = <b>${avgReturn}</b> &nbsp; <span style="color:var(--text-muted)">（${usedConditionsNote}，已同步应用于上方相关性/总览/散点图/分箱图）</span>`;
-  document.getElementById('filterBody').innerHTML = results.map(r => `
+  document.getElementById('filterBody').innerHTML = results.length ? results.map(r => `
     <tr>
       <td>${escapeHtml(r.symbol || '')}</td>
       <td>${escapeHtml(r.tokenAddress || '')}</td>
       <td class="num">${r.returnCurrent.toFixed(4)}x</td>
       <td class="num">${conditions.map(c => { const v = getFeature(r, c.field); return `${escapeHtml(c.field)}: ${escapeHtml(typeof v === 'number' ? formatNumberSmart(v) : v)}`; }).join('<br>')}</td>
     </tr>
-  `).join('');
+  `).join('') : `<tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:20px 12px;">没有满足条件的样本，试试放宽阈值</td></tr>`;
 }
 
 function copyFilterCAs() {
@@ -801,11 +912,11 @@ function applyFilterPreset() {
   applyFilter();
 }
 
-function deleteFilterPreset() {
+async function deleteFilterPreset() {
   const id = document.getElementById('filterPresetSelect').value;
   if (!id) { showToast('请先从下拉框选择一个预设'); return; }
   const preset = filterPresets.find(p => p.id === id);
-  if (!preset || !confirm(`确定删除预设「${preset.name}」？`)) return;
+  if (!preset || !await showConfirm(`确定删除预设「${preset.name}」？`, { danger: true, okText: '删除' })) return;
   filterPresets = filterPresets.filter(p => p.id !== id);
   saveFilterPresetsToStorage();
   renderFilterPresetOptions();
@@ -927,55 +1038,75 @@ function copyFieldNames(fields) {
     .catch(err => showToast('复制失败：' + err));
 }
 
-function addFieldsToX(fields) {
-  if (!fields.length) return;
-  if (fields.length > 20 && !confirm(`即将一次性加入 ${fields.length} 个字段到 X，会生成 ${fields.length} 张独立散点图，可能比较慢，是否继续？`)) return;
-  let added = 0;
-  for (const f of fields) {
-    if (!batchXSelected.includes(f)) { batchXSelected.push(f); added++; }
-  }
-  renderBatchTags();
-  if (matchedRows.length) plot();
-  return added;
+async function addFieldsToX(fields) {
+  if (!fields.length) return 0;
+  // 以前这里超过 20 个字段会弹一个原生 confirm() 警告"可能比较慢"——分页上线后 plot()
+  // 只渲染当前页，不会再因为一次加几十上百个字段就把页面卡死，这个警告已经过时，直接去掉；
+  // 改成大批量时给个 loading 反馈（renderBatchTags 要重建全部标签 + plot() 渲染首页图表，
+  // 字段多的时候仍需要看得见的一小段时间，避免用户以为点击没反应）。
+  const run = () => {
+    let added = 0;
+    for (const f of fields) {
+      if (!batchXSelected.includes(f)) { batchXSelected.push(f); added++; }
+    }
+    renderBatchTags();
+    if (matchedRows.length) plot();
+    return added;
+  };
+  return fields.length > 20 ? withLoading(`正在加入 ${fields.length} 个字段...`, () => run()) : run();
 }
 
 // "原字段"分组的白名单：只有确实是有意义的原始业务字段才归入"原字段"，
 // 排除 _highlight_*/ai_max_*/all_signals_max_ratio.* 等内部标记或高度重复的衍生统计字段（这些改归入"组装字段"分组）。
 const ORIGINAL_FIELD_WHITELIST = new Set([
-  'amm_volume', 'buy_tx_count_d1', 'buy_wcoin_amount_d1', 'buy_wcoin_amount_h1', 'buy_wcoin_amount_m5',
-  'buyer_count_d1', 'exchange_volume', 'frequent_volume',
-  'gmgn.dev.creator_open_count', 'gmgn.dev.creator_token_balance', 'gmgn.dev.cto_flag', 'gmgn.dev.dexscr_ad',
-  'gmgn.dev.dexscr_ad_ts', 'gmgn.dev.dexscr_boost_fee', 'gmgn.dev.dexscr_trending_bar', 'gmgn.dev.dexscr_update_link',
+  'buy_tx_count_d1', 'buy_wcoin_amount_d1', 'buy_wcoin_amount_h1', 'buy_wcoin_amount_m5',
+  'buyer_count_d1', 'frequent_volume', 'gmgn.dev.creator_token_balance',
+  'gmgn.dev.dexscr_boost_fee', 
   'gmgn.dev.top_10_holder_rate', 'gmgn.dev.twitter_create_token_count', 'gmgn.dev.twitter_del_post_token_count',
-  'gmgn.image_dup_count', 'gmgn.launchpad_progress', 'gmgn.launchpad_status', 'gmgn.link.verify_status',
-  'gmgn.liquidity', 'gmgn.locked_ratio', 'gmgn.migration_market_cap', 'gmgn.og',
-  'gmgn.pool.base_reserve', 'gmgn.pool.base_reserve_value', 'gmgn.pool.fee_ratio', 'gmgn.pool.initial_base_reserve',
-  'gmgn.pool.initial_liquidity', 'gmgn.pool.initial_quote_reserve', 'gmgn.pool.liquidity', 'gmgn.pool.quote_reserve',
-  'gmgn.pool.quote_reserve_value',
+  'gmgn.image_dup_count',
+  'gmgn.liquidity', 'gmgn.locked_ratio',
+   'gmgn.pool.liquidity',
   'gmgn.price.buy_volume_1h', 'gmgn.price.buy_volume_1m', 'gmgn.price.buy_volume_24h', 'gmgn.price.buy_volume_5m',
   'gmgn.price.buy_volume_6h', 'gmgn.price.buys_1h', 'gmgn.price.buys_1m', 'gmgn.price.buys_24h', 'gmgn.price.buys_5m',
-  'gmgn.price.buys_6h', 'gmgn.price.hot_level', 'gmgn.price.price', 'gmgn.price.price_1h', 'gmgn.price.price_1m',
+  'gmgn.price.buys_6h', 'gmgn.price.price_1h', 'gmgn.price.price_1m',
   'gmgn.price.price_24h', 'gmgn.price.price_5m', 'gmgn.price.price_6h',
   'gmgn.price.sell_volume_1h', 'gmgn.price.sell_volume_1m', 'gmgn.price.sell_volume_24h', 'gmgn.price.sell_volume_5m',
   'gmgn.price.sell_volume_6h', 'gmgn.price.sells_1h', 'gmgn.price.sells_1m', 'gmgn.price.sells_24h',
   'gmgn.price.sells_5m', 'gmgn.price.sells_6h',
   'gmgn.price.swaps_1h', 'gmgn.price.swaps_1m', 'gmgn.price.swaps_24h', 'gmgn.price.swaps_5m', 'gmgn.price.swaps_6h',
   'gmgn.price.volume_1h', 'gmgn.price.volume_1m', 'gmgn.price.volume_24h', 'gmgn.price.volume_5m', 'gmgn.price.volume_6h',
-  'gmgn.stat.bot_degen_count', 'gmgn.stat.bot_degen_rate', 'gmgn.stat.creator_created_count', 'gmgn.stat.creator_hold_rate',
-  'gmgn.stat.creator_token_balance', 'gmgn.stat.degen_call_count', 'gmgn.stat.dev_team_hold_rate',
-  'gmgn.stat.fresh_wallet_rate', 'gmgn.stat.holder_count', 'gmgn.stat.private_vault_hold_rate', 'gmgn.stat.signal_count',
+  'gmgn.stat.bot_degen_rate', 'gmgn.stat.creator_created_count', 'gmgn.stat.creator_hold_rate',
+  'gmgn.stat.creator_token_balance', 'gmgn.stat.dev_team_hold_rate',
+  'gmgn.stat.fresh_wallet_rate', 'gmgn.stat.holder_count',
   'gmgn.stat.top70_sniper_hold_rate', 'gmgn.stat.top_10_holder_rate', 'gmgn.stat.top_bot_degen_percentage',
   'gmgn.stat.top_bundler_trader_percentage', 'gmgn.stat.top_entrapment_trader_percentage', 'gmgn.stat.top_rat_trader_percentage',
   'gmgn.visiting_count',
   'gmgn.wallet_tags_stat.bundler_wallets', 'gmgn.wallet_tags_stat.creator_wallets', 'gmgn.wallet_tags_stat.fresh_wallets',
   'gmgn.wallet_tags_stat.rat_trader_wallets', 'gmgn.wallet_tags_stat.renowned_wallets', 'gmgn.wallet_tags_stat.smart_wallets',
-  'gmgn.wallet_tags_stat.sniper_wallets', 'gmgn.wallet_tags_stat.top_wallets', 'gmgn.wallet_tags_stat.whale_wallets',
-  'h1_featured_index', 'launch_time', 'launch_time_duration', 'm5_featured_index', 'max_up_duration', 'max_up_mcap',
-  'max_up_mcap_time', 'max_up_ratio', 'mcap', 'new_volume', 'old_volume', 'pool_liquidity', 'profit_usernum',
-  'scam_volume', 'sell_tx_count_d1', 'sell_wcoin_amount_d1', 'sell_wcoin_amount_h1', 'sell_wcoin_amount_m5',
-  'seller_count_d1', 'shit_volume', 'signal_max_mcap', 'signal_max_ratio', 'signal_max_time', 'signal_open_mcap',
-  'signal_open_time', 'smart_money_address_buy_count_d1', 'smart_money_address_sell_count_d1', 'smart_volume',
+  'gmgn.wallet_tags_stat.sniper_wallets', 'gmgn.wallet_tags_stat.top_wallets',
+  'h1_featured_index', 'm5_featured_index', 'max_up_duration', 'max_up_mcap',
+  'max_up_ratio', 'mcap', 'new_volume', 'old_volume', 'pool_liquidity',
+  'price_change_1d', 'price_change_1h', 'price_change_5m', 'price_change_6h', 'profit_usernum',
+  'sell_tx_count_d1', 'sell_wcoin_amount_d1', 'sell_wcoin_amount_h1', 'sell_wcoin_amount_m5',
+  'seller_count_d1', 'shit_volume', 'signal_max_mcap', 'signal_max_ratio', 'signal_open_mcap',
+  'smart_money_address_buy_count_d1', 'smart_money_address_sell_count_d1', 'smart_volume',
   'whale_volume',
+]);
+
+// 用户手动核实过、认为确实有统计/预测意义的"常用字段"（2026-07-19 反馈）。跟 ORIGINAL_FIELD_WHITELIST
+// 是两回事：白名单控制"按分组浏览字段"面板里出现不出现，这个集合控制所有联想框（X/Y/颜色/过滤条件/
+// 分箱字段等）里排序优先级和高亮——字段那么多，每次都要重新从几十上百个里找"哪些真的靠谱"太累。
+const TRUSTED_FIELDS = new Set([
+  'gmgn.dev.top_10_holder_rate', 'gmgn.stat.top_10_holder_rate',
+  'gmgn.image_dup_count',
+  'gmgn.liquidity', 'gmgn.pool.liquidity',
+  'gmgn.stat.bot_degen_count', 'gmgn.stat.bot_degen_rate',
+  'gmgn.stat.creator_hold_rate', 'gmgn.stat.dev_team_hold_rate',
+  'gmgn.stat.top70_sniper_hold_rate', 'gmgn.stat.top_bot_degen_percentage',
+  'gmgn.stat.top_bundler_trader_percentage', 'gmgn.stat.top_entrapment_trader_percentage',
+  'gmgn.stat.top_rat_trader_percentage',
+  'old_volume', 'new_volume', 'frequent_volume',
+  'price_change_5m', 'price_change_1h', 'price_change_6h', 'price_change_1d',
 ]);
 
 function renderFieldBrowser() {
@@ -1247,7 +1378,18 @@ document.getElementById('fieldBrowserAddAllOriginal').addEventListener('click', 
 document.getElementById('fieldBrowserAddAllAssembled').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.assembled));
 document.getElementById('fieldBrowserCopyOriginal').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.original));
 document.getElementById('fieldBrowserCopyAssembled').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.assembled));
-document.getElementById('batchXClearBtn').addEventListener('click', () => {
+document.getElementById('loadTrustedFieldsBtn').addEventListener('click', async () => {
+  // TRUSTED_FIELDS 是全局的字段白名单，不是所有数据集都包含这些字段，按 scatterOptions（当前数据集
+  // 实际存在、可作为 X 轴的字段）过滤一遍，避免加进去一堆当前数据里根本没有的死字段
+  const fields = [...TRUSTED_FIELDS].filter(f => scatterOptions.includes(f));
+  if (!fields.length) { showToast('当前数据集里没有已核实过的常用字段（可能字段名对不上，或者还没加载数据）'); return; }
+  const added = await addFieldsToX(fields);
+  showToast(`已加入 ${fields.length} 个常用字段（新增 ${added}，其余之前已在列表中）`);
+});
+document.getElementById('batchXClearBtn').addEventListener('click', async () => {
+  // 一键清空可能会把手动挑了老半天的一长串 X 字段瞬间清光，且没有撤销入口；字段较多时
+  // 加一次确认，跟"删除预设/快照"等既有的高风险操作确认保持一致的风险阈值。
+  if (batchXSelected.length > 3 && !await showConfirm(`确定要清空当前已选的 ${batchXSelected.length} 个 X 指标吗？`, { danger: true, okText: '清空' })) return;
   batchXSelected = [];
   renderBatchTags();
   if (matchedRows.length) plot();
@@ -1291,9 +1433,9 @@ document.getElementById('corrFilterMinN').addEventListener('input', renderCorrTa
 document.getElementById('corrFilterMaxP').addEventListener('input', renderCorrTable);
 document.getElementById('corrFilterMaxAdjP').addEventListener('input', renderCorrTable);
 document.getElementById('corrFilterCiExcludesZero').addEventListener('change', renderCorrTable);
-document.getElementById('corrSendToScatterBtn').addEventListener('click', () => {
+document.getElementById('corrSendToScatterBtn').addEventListener('click', async () => {
   const features = [...new Set([...corrSelectedRows].map(k => k.split('|')[1]))].filter(f => scatterOptions.includes(f));
-  const added = addFieldsToX(features);
+  const added = await addFieldsToX(features);
   corrSelectedRows.clear();
   renderCorrTable();
   const scatterPanel = document.getElementById('scatterPanel');
@@ -1310,6 +1452,7 @@ document.getElementById('cancelBootstrapCIBtn').addEventListener('click', () => 
 document.getElementById('oosEnabled').addEventListener('change', renderCorrTable);
 document.getElementById('oosSplitMethod').addEventListener('change', renderCorrTable);
 document.getElementById('oosTrainRatio').addEventListener('change', renderCorrTable);
+document.getElementById('oosSeed').addEventListener('change', renderCorrTable);
 document.getElementById('downloadCsvBtn').addEventListener('click', downloadCsv);
 document.getElementById('addFilterRow').addEventListener('click', () => addFilterRow());
 document.getElementById('applyFilter').addEventListener('click', applyFilter);
@@ -1377,6 +1520,7 @@ const NAV_ITEMS = [
   { group: '进阶分析', label: '2. 分组对比分析', panelId: 'proPanel', targetId: 'proSectionGroupCompare' },
   { group: '进阶分析', label: '3. 特征重要性（回归）', panelId: 'proPanel', targetId: 'proSectionRegression' },
   { group: '进阶分析', label: '3.5 特征组合探索', panelId: 'proPanel', targetId: 'proSectionFeatureCombo' },
+  { group: '进阶分析', label: '3.6 组合评分', panelId: 'proPanel', targetId: 'proSectionCompositeScore' },
   { group: '进阶分析', label: '4. 时间维度分析', panelId: 'proPanel', targetId: 'proSectionTimeAnalysis' },
   { group: '进阶分析', label: '5. 分类字段与收益关系', panelId: 'proPanel', targetId: 'proSectionCategoryCompare' },
   { group: '进阶分析', label: '6. 阈值优化（ROC-AUC）', panelId: 'proPanel', targetId: 'proSectionRoc' },
@@ -1484,8 +1628,8 @@ function saveCurrentSnapshot() {
   renderSnapshotList();
 }
 
-function deleteSnapshot(id) {
-  if (!confirm('确定删除这份快照？')) return;
+async function deleteSnapshot(id) {
+  if (!await showConfirm('确定删除这份快照？', { danger: true, okText: '删除' })) return;
   analysisSnapshots = analysisSnapshots.filter(s => s.id !== id);
   saveAnalysisSnapshotsToStorage();
   renderSnapshotList();
@@ -1503,7 +1647,7 @@ function renderSnapshotList() {
       <td>${escapeHtml(s.label)}</td>
       <td>${new Date(s.savedAt).toLocaleString()}</td>
       <td class="num">${s.n}</td>
-      <td><button type="button" class="secondary snapshot-del" data-id="${s.id}">删除</button></td>
+      <td><button type="button" class="danger snapshot-del" data-id="${s.id}">删除</button></td>
     </tr>
   `).join('');
   tbody.querySelectorAll('.snapshot-del').forEach(btn => btn.addEventListener('click', () => deleteSnapshot(btn.dataset.id)));
@@ -1604,10 +1748,10 @@ function saveCurrentDataset() {
   renderDatasetList();
 }
 
-function switchToDataset(id) {
+async function switchToDataset(id) {
   const meta = datasetIndex.find(d => d.id === id);
   if (!meta) return;
-  if (matchedRows.length && !confirm(`切换到「${meta.label}」将替换当前工作集（当前未保存的过滤/自定义字段状态不会丢失，自定义字段定义本身独立存储），是否继续？`)) return;
+  if (matchedRows.length && !await showConfirm(`切换到「${meta.label}」将替换当前工作集（当前未保存的过滤/自定义字段状态不会丢失，自定义字段定义本身独立存储），是否继续？`)) return;
   const raw = localStorage.getItem(DATASET_DATA_KEY_PREFIX + id);
   if (!raw) { showToast('未找到该数据集的完整数据（可能已被清除），仅保留了列表记录'); return; }
   try {
@@ -1617,8 +1761,8 @@ function switchToDataset(id) {
   document.getElementById('fileHint').textContent = `已切换到数据集「${meta.label}」：${matchedRows.length} 条。`;
 }
 
-function deleteDataset(id) {
-  if (!confirm('确定删除这个数据集？')) return;
+async function deleteDataset(id) {
+  if (!await showConfirm('确定删除这个数据集？', { danger: true, okText: '删除' })) return;
   datasetIndex = datasetIndex.filter(d => d.id !== id);
   saveDatasetIndex();
   try { localStorage.removeItem(DATASET_DATA_KEY_PREFIX + id); } catch (e) {}
@@ -1639,7 +1783,7 @@ function renderDatasetList() {
       <td class="num">${(d.sizeBytes / 1024).toFixed(0)}KB</td>
       <td>
         <button type="button" class="secondary dataset-switch" data-id="${d.id}">切换到该数据集</button>
-        <button type="button" class="secondary dataset-del" data-id="${d.id}">删除</button>
+        <button type="button" class="danger dataset-del" data-id="${d.id}">删除</button>
       </td>
     </tr>
   `).join('');
@@ -1650,6 +1794,330 @@ function renderDatasetList() {
 document.getElementById('saveDatasetBtn').addEventListener('click', saveCurrentDataset);
 loadDatasetIndex();
 renderDatasetList();
+
+// ========== 基准库对比（用户需求，2026-07-19） ==========
+// 跟"完整数据集保存/切换"是同一套存储模式（索引 + 按 id 分开存的完整数据），但用途不同：
+// 数据集库是"整体替换工作集"，基准库是"新一批数据 vs 累积的历史基准，看这次调整是不是真的变好了"，
+// 对比完确认无误后把新数据并入基准库，基准库像滚雪球一样越滚越大，代表"目前为止的全部历史"。
+// 基准库有意跟主界面平时筛选/探索用的 matchedRows/activeRows 完全隔离存储，不会被日常操作污染。
+const BENCHMARK_INDEX_STORAGE_KEY = 'chart_benchmark_index';
+const BENCHMARK_DATA_KEY_PREFIX = 'chart_benchmark_data_';
+const BENCHMARK_SIZE_LIMIT_BYTES = 4 * 1024 * 1024;
+const BENCHMARK_BOOTSTRAP_B = 1000;
+let benchmarkIndex = [];
+// 上一次"对比"算出来的新数据快照，只有点过对比、且之后没有再改动过 activeRows 才允许"确认并入"，
+// 防止用户比完 A 批数据，页面上早就换成 B 批了，却把 B 批稀里糊涂地并进了基于 A 批算出来的对比结果里
+let pendingBenchmarkMerge = null; // { libraryId, rows }
+
+function loadBenchmarkIndex() {
+  try {
+    const raw = localStorage.getItem(BENCHMARK_INDEX_STORAGE_KEY);
+    benchmarkIndex = raw ? JSON.parse(raw) || [] : [];
+  } catch (e) { benchmarkIndex = []; }
+}
+function saveBenchmarkIndexToStorage() {
+  try { localStorage.setItem(BENCHMARK_INDEX_STORAGE_KEY, JSON.stringify(benchmarkIndex)); } catch (e) {}
+}
+
+function computeBenchmarkStats(rows) {
+  const s = calcStats(rows.map(r => r.returnCurrent), 1);
+  const m = calcStats(rows.map(r => r.returnMax), 1);
+  return { winRate: s.winRate, avgReturn: s.mean, medianReturn: s.median, avgReturnMax: m.mean, medianReturnMax: m.median };
+}
+
+function createBenchmarkLibrary() {
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  const nameInput = document.getElementById('benchmarkNameInput');
+  const name = nameInput.value.trim();
+  if (!name) { showToast('请输入基准库名称'); return; }
+  if (benchmarkIndex.some(b => b.name === name)) { showToast('已存在同名基准库，请换个名称'); return; }
+  const rows = activeRows.slice();
+  const serialized = JSON.stringify(rows);
+  const sizeBytes = new Blob([serialized]).size;
+  const hintEl = document.getElementById('benchmarkStatusHint');
+  if (sizeBytes > BENCHMARK_SIZE_LIMIT_BYTES) {
+    hintEl.textContent = `⚠️ 数据过大（约 ${(sizeBytes / 1024 / 1024).toFixed(1)}MB）无法保存为基准库。`;
+    return;
+  }
+  const id = Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  try {
+    localStorage.setItem(BENCHMARK_DATA_KEY_PREFIX + id, serialized);
+  } catch (e) {
+    hintEl.textContent = `⚠️ 保存失败（可能是浏览器存储空间已满）：${e.message}`;
+    return;
+  }
+  const now = new Date().toISOString();
+  benchmarkIndex.push({ id, name, n: rows.length, sizeBytes, createdAt: now, updatedAt: now, ...computeBenchmarkStats(rows) });
+  saveBenchmarkIndexToStorage();
+  nameInput.value = '';
+  hintEl.textContent = `✅ 已新建基准库「${name}」（${rows.length} 条）`;
+  renderBenchmarkList();
+  renderBenchmarkSelect();
+}
+
+async function deleteBenchmarkLibrary(id) {
+  const meta = benchmarkIndex.find(b => b.id === id);
+  if (!meta) return;
+  if (!await showConfirm(`确定删除基准库「${meta.name}」？累积的 ${meta.n} 条历史数据会一并清除，无法恢复。`, { danger: true, okText: '删除' })) return;
+  benchmarkIndex = benchmarkIndex.filter(b => b.id !== id);
+  saveBenchmarkIndexToStorage();
+  try { localStorage.removeItem(BENCHMARK_DATA_KEY_PREFIX + id); } catch (e) {}
+  if (pendingBenchmarkMerge && pendingBenchmarkMerge.libraryId === id) {
+    pendingBenchmarkMerge = null;
+    document.getElementById('confirmMergeBenchmarkBtn').disabled = true;
+  }
+  renderBenchmarkList();
+  renderBenchmarkSelect();
+}
+
+function renameBenchmarkLibrary(id, input) {
+  const meta = benchmarkIndex.find(b => b.id === id);
+  if (!meta) return;
+  const name = input.value.trim();
+  if (!name) { input.value = meta.name; return; }
+  if (name === meta.name) return;
+  if (benchmarkIndex.some(b => b.id !== id && b.name === name)) {
+    showToast('已存在同名基准库，请换个名称');
+    input.value = meta.name;
+    return;
+  }
+  meta.name = name;
+  saveBenchmarkIndexToStorage();
+  renderBenchmarkSelect();
+}
+
+function renderBenchmarkList() {
+  const tbody = document.getElementById('benchmarkListBody');
+  if (!tbody) return;
+  if (!benchmarkIndex.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted);">还没有基准库，先用当前数据新建一个，或从 JSON 备份导入</td></tr>';
+    return;
+  }
+  tbody.innerHTML = benchmarkIndex.slice().reverse().map(b => {
+    // 容量占用：单份存储上限 4MB，基准库是滚雪球式增长的，提前把占用比例亮出来，
+    // 别等哪天并入失败了才发现快满了
+    const usagePct = b.sizeBytes / BENCHMARK_SIZE_LIMIT_BYTES * 100;
+    const usageColor = usagePct >= 80 ? 'var(--red)' : usagePct >= 50 ? '#ff9f0a' : 'var(--text-muted)';
+    return `
+    <tr>
+      <td><input type="text" class="benchmark-rename" data-id="${b.id}" value="${escapeHtml(b.name)}" style="width:100%; min-width:120px;"></td>
+      <td class="num">${b.n}</td>
+      <td class="num">${(b.winRate * 100).toFixed(1)}%</td>
+      <td class="num">${b.avgReturn.toFixed(4)}x</td>
+      <td class="num" style="color:${usageColor};" title="单份存储上限约 4MB，占用过高时建议导出备份后清理或拆分基准库">${(b.sizeBytes / 1024).toFixed(0)}KB（${usagePct < 1 ? '<1' : usagePct.toFixed(0)}%）</td>
+      <td>${new Date(b.updatedAt).toLocaleString()}</td>
+      <td>
+        <button type="button" class="secondary benchmark-load" data-id="${b.id}" title="把这个基准库的全部累积数据加载为当前工作集，直接在上面跑相关性/散点图等分析">加载为数据源</button>
+        <button type="button" class="secondary benchmark-export" data-id="${b.id}" title="导出为 JSON 文件备份（基准库只存在浏览器本地，清缓存/换设备会丢失）">导出</button>
+        <button type="button" class="danger benchmark-del" data-id="${b.id}">删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+  tbody.querySelectorAll('.benchmark-rename').forEach(inp => inp.addEventListener('blur', () => renameBenchmarkLibrary(inp.dataset.id, inp)));
+  tbody.querySelectorAll('.benchmark-load').forEach(btn => btn.addEventListener('click', () => loadBenchmarkAsDataset(btn.dataset.id)));
+  tbody.querySelectorAll('.benchmark-export').forEach(btn => btn.addEventListener('click', () => exportBenchmarkLibrary(btn.dataset.id)));
+  tbody.querySelectorAll('.benchmark-del').forEach(btn => btn.addEventListener('click', () => deleteBenchmarkLibrary(btn.dataset.id)));
+}
+
+// 基准库导出/导入（照自定义字段配置 §13.2 的同一套模式）：基准库是长期滚雪球积累的数据资产，
+// 只存 localStorage 的话清浏览器缓存/换设备就全没了，必须能落成文件备份。
+const BENCHMARK_EXPORT_VERSION = 1;
+
+function exportBenchmarkLibrary(id) {
+  const meta = benchmarkIndex.find(b => b.id === id);
+  if (!meta) return;
+  const raw = localStorage.getItem(BENCHMARK_DATA_KEY_PREFIX + id);
+  if (!raw) { showToast('未找到该基准库的完整数据，无法导出'); return; }
+  let rows;
+  try { rows = JSON.parse(raw); } catch (e) { showToast('基准库数据解析失败：' + e.message); return; }
+  const payload = { version: BENCHMARK_EXPORT_VERSION, type: 'benchmark_library', name: meta.name, exportedAt: new Date().toISOString(), n: rows.length, rows };
+  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json;charset=utf-8;' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `benchmark_${meta.name.replace(/[\\/:*?"<>|]/g, '_')}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  showToast(`已导出基准库「${meta.name}」（${rows.length} 条）`);
+}
+
+async function importBenchmarkFromFile(file) {
+  let payload;
+  try { payload = await readJson(file); } catch (e) { showToast('文件解析失败：' + e.message); return; }
+  if (!payload || payload.type !== 'benchmark_library' || !Array.isArray(payload.rows)) {
+    showToast('文件格式不对：不是本工具导出的基准库备份文件'); return;
+  }
+  if (!payload.rows.length) { showToast('备份文件里没有数据'); return; }
+  // 同名冲突自动加后缀，不覆盖已有库——导入的目的通常是恢复/迁移，静默覆盖同名库风险太大
+  let name = payload.name || '导入的基准库';
+  while (benchmarkIndex.some(b => b.name === name)) name += '（导入）';
+  const serialized = JSON.stringify(payload.rows);
+  const sizeBytes = new Blob([serialized]).size;
+  if (sizeBytes > BENCHMARK_SIZE_LIMIT_BYTES) { showToast(`备份数据过大（约 ${(sizeBytes / 1024 / 1024).toFixed(1)}MB），超出单份存储上限，无法导入`, true); return; }
+  const id = Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  try {
+    localStorage.setItem(BENCHMARK_DATA_KEY_PREFIX + id, serialized);
+  } catch (e) { showToast('保存失败（可能是浏览器存储空间已满）：' + e.message, true); return; }
+  const now = new Date().toISOString();
+  benchmarkIndex.push({ id, name, n: payload.rows.length, sizeBytes, createdAt: now, updatedAt: now, ...computeBenchmarkStats(payload.rows) });
+  saveBenchmarkIndexToStorage();
+  renderBenchmarkList();
+  renderBenchmarkSelect();
+  showToast(`已导入基准库「${name}」（${payload.rows.length} 条）`);
+}
+
+// 基准库当数据源用（用户需求，2026-07-19）：把基准库累积的全部历史数据整体加载为 matchedRows，
+// 直接在上面跑相关性表/散点图/分箱图等全套分析——基准库通常样本量比单批新数据大得多，
+// 在它上面找相关性比每次只在一小批新数据里找更有统计效力。跟"数据集库"的切换逻辑（14.2）完全一致，
+// 复用同一套"替换前先确认"的交互，不搞第二套不一致的切换体验。
+async function loadBenchmarkAsDataset(id) {
+  const meta = benchmarkIndex.find(b => b.id === id);
+  if (!meta) return;
+  if (matchedRows.length && !await showConfirm(`加载基准库「${meta.name}」将替换当前工作集（当前未保存的过滤/自定义字段状态不会丢失，自定义字段定义本身独立存储），是否继续？`)) return;
+  const raw = localStorage.getItem(BENCHMARK_DATA_KEY_PREFIX + id);
+  if (!raw) { showToast('未找到该基准库的完整数据（可能已被清除），仅保留了列表记录'); return; }
+  try {
+    matchedRows = JSON.parse(raw);
+  } catch (e) { showToast('基准库数据解析失败：' + e.message); return; }
+  finalizeMatchedRows();
+  document.getElementById('fileHint').textContent = `已加载基准库「${meta.name}」作为当前数据源：${matchedRows.length} 条。`;
+}
+
+function renderBenchmarkSelect() {
+  const sel = document.getElementById('benchmarkSelect');
+  if (!sel) return;
+  const prevValue = sel.value;
+  sel.innerHTML = benchmarkIndex.length
+    ? benchmarkIndex.map(b => `<option value="${b.id}">${escapeHtml(b.name)}（${b.n} 条）</option>`).join('')
+    : '<option value="">（还没有基准库）</option>';
+  if (benchmarkIndex.some(b => b.id === prevValue)) sel.value = prevValue;
+}
+
+// 显著性判定统一用同一个函数，避免"结论文案"和"高亮颜色"各写一套判断条件导致不一致
+function benchmarkVerdict(ci) {
+  if (!ci || !Number.isFinite(ci.lo) || !Number.isFinite(ci.hi)) return { text: '样本不足，无法判断', color: 'var(--text-muted)' };
+  if (ci.lo > 0) return { text: '显著变好', color: 'var(--green)' };
+  if (ci.hi < 0) return { text: '显著变差', color: 'var(--red)' };
+  return { text: '无显著差异', color: 'var(--text-muted)' };
+}
+
+async function compareAgainstBenchmark() {
+  const id = document.getElementById('benchmarkSelect').value;
+  const meta = benchmarkIndex.find(b => b.id === id);
+  const resultEl = document.getElementById('benchmarkCompareResult');
+  const confirmBtn = document.getElementById('confirmMergeBenchmarkBtn');
+  confirmBtn.disabled = true;
+  pendingBenchmarkMerge = null;
+  if (!meta) { showToast('请先选择一个基准库'); return; }
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  const raw = localStorage.getItem(BENCHMARK_DATA_KEY_PREFIX + id);
+  if (!raw) { showToast('未找到该基准库的完整数据（可能已被清除），列表记录仍保留，建议删除后重建'); return; }
+  let benchmarkRows;
+  try { benchmarkRows = JSON.parse(raw); } catch (e) { showToast('基准库数据解析失败：' + e.message); return; }
+
+  const newRows = activeRows;
+  // n 太小时 bootstrap 差值本身估计不稳，先给个警告，但仍然算出来供参考（跟 OOS 测试集不足的处理方式一致）
+  const smallSampleWarn = newRows.length < 20
+    ? `<div class="hint" style="color:var(--warn, #ff9f0a); margin: 0 0 10px;">⚠️ 新数据样本量过小（n=${newRows.length} < 20），对比结果仅供参考。</div>` : '';
+
+  const statsFn = arr => {
+    const s = calcStats(arr.map(r => r.returnCurrent), 1);
+    const m = calcStats(arr.map(r => r.returnMax), 1);
+    return { winRate: s.winRate, avgReturn: s.mean, medianReturn: s.median, avgReturnMax: m.mean, medianReturnMax: m.median };
+  };
+  const diffs = bootstrapDiffCI(newRows, benchmarkRows, statsFn, BENCHMARK_BOOTSTRAP_B);
+  const newStats = statsFn(newRows);
+  const benchStats = statsFn(benchmarkRows);
+
+  const rowsHtml = [
+    ['胜率（倍数>1）', newStats.winRate, benchStats.winRate, diffs && diffs.winRate, v => (v * 100).toFixed(1) + '%'],
+    ['returnCurrent 均值', newStats.avgReturn, benchStats.avgReturn, diffs && diffs.avgReturn, v => v.toFixed(4) + 'x'],
+    ['returnCurrent 中位数', newStats.medianReturn, benchStats.medianReturn, diffs && diffs.medianReturn, v => v.toFixed(4) + 'x'],
+    ['returnMax 均值', newStats.avgReturnMax, benchStats.avgReturnMax, diffs && diffs.avgReturnMax, v => v.toFixed(4) + 'x'],
+    ['returnMax 中位数', newStats.medianReturnMax, benchStats.medianReturnMax, diffs && diffs.medianReturnMax, v => v.toFixed(4) + 'x'],
+  ].map(([label, newV, benchV, ci, fmt]) => {
+    const verdict = benchmarkVerdict(ci);
+    const ciText = ci && Number.isFinite(ci.lo) ? `[${fmt(ci.lo)}, ${fmt(ci.hi)}]` : '-';
+    return `
+    <tr>
+      <td>${escapeHtml(label)}</td>
+      <td class="num">${fmt(benchV)}</td>
+      <td class="num">${fmt(newV)}</td>
+      <td class="num">${ciText}</td>
+      <td class="num" style="color:${verdict.color}; font-weight:500;">${verdict.text}</td>
+    </tr>`;
+  }).join('');
+
+  resultEl.innerHTML = `
+    ${smallSampleWarn}
+    <div class="hint" style="margin: 0 0 8px;">对比：新数据（${newRows.length} 条）vs 基准库「${escapeHtml(meta.name)}」（${benchmarkRows.length} 条），差值 = 新数据 − 基准，括号为差值的 95% 置信区间（重抽样 ${BENCHMARK_BOOTSTRAP_B} 次）</div>
+    <div class="table-scroll">
+      <table class="desc-table">
+        <thead><tr><th>指标</th><th class="num">基准库</th><th class="num">新数据</th><th class="num">差值 95% CI</th><th class="num">结论</th></tr></thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>`;
+  resultEl.classList.remove('hidden');
+
+  pendingBenchmarkMerge = { libraryId: id, rows: newRows.slice() };
+  confirmBtn.disabled = false;
+}
+
+async function mergeIntoBenchmark() {
+  if (!pendingBenchmarkMerge) return;
+  const { libraryId, rows: newRows } = pendingBenchmarkMerge;
+  const meta = benchmarkIndex.find(b => b.id === libraryId);
+  if (!meta) { showToast('该基准库已被删除'); return; }
+  const raw = localStorage.getItem(BENCHMARK_DATA_KEY_PREFIX + libraryId);
+  if (!raw) { showToast('未找到该基准库的完整数据'); return; }
+  let benchmarkRows;
+  try { benchmarkRows = JSON.parse(raw); } catch (e) { showToast('基准库数据解析失败：' + e.message); return; }
+
+  // 去重规则跟"追加数据"（14.1）保持一致：同一个 token_address+swap_begin_time 视为同一条记录，
+  // 默认用新数据覆盖旧的，不搞第二套不一致的去重逻辑
+  const keyOf = r => `${r.tokenAddress || ''}_${r.swapBeginTime || ''}`;
+  const existingByKey = new Map(benchmarkRows.map(r => [keyOf(r), r]));
+  let addedCount = 0, overwrittenCount = 0;
+  for (const nr of newRows) {
+    const k = keyOf(nr);
+    if (existingByKey.has(k)) overwrittenCount++; else addedCount++;
+    existingByKey.set(k, nr);
+  }
+  const merged = [...existingByKey.values()];
+  const serialized = JSON.stringify(merged);
+  const sizeBytes = new Blob([serialized]).size;
+  if (sizeBytes > BENCHMARK_SIZE_LIMIT_BYTES) {
+    showToast(`合并后数据过大（约 ${(sizeBytes / 1024 / 1024).toFixed(1)}MB），超出单份存储上限，未能并入`, true);
+    return;
+  }
+  try {
+    localStorage.setItem(BENCHMARK_DATA_KEY_PREFIX + libraryId, serialized);
+  } catch (e) {
+    showToast('保存失败（可能是浏览器存储空间已满）：' + e.message, true);
+    return;
+  }
+  Object.assign(meta, { n: merged.length, sizeBytes, updatedAt: new Date().toISOString() }, computeBenchmarkStats(merged));
+  saveBenchmarkIndexToStorage();
+  pendingBenchmarkMerge = null;
+  document.getElementById('confirmMergeBenchmarkBtn').disabled = true;
+  document.getElementById('benchmarkCompareResult').classList.add('hidden');
+  renderBenchmarkList();
+  renderBenchmarkSelect();
+  showToast(`已并入基准库「${meta.name}」：新增 ${addedCount} 条，去重覆盖 ${overwrittenCount} 条，库内现有 ${merged.length} 条`);
+}
+
+document.getElementById('createBenchmarkBtn').addEventListener('click', createBenchmarkLibrary);
+document.getElementById('compareBenchmarkBtn').addEventListener('click', compareAgainstBenchmark);
+document.getElementById('confirmMergeBenchmarkBtn').addEventListener('click', mergeIntoBenchmark);
+const benchmarkImportFileInput = document.getElementById('importBenchmarkFile');
+document.getElementById('importBenchmarkBtn').addEventListener('click', () => benchmarkImportFileInput.click());
+benchmarkImportFileInput.addEventListener('change', () => {
+  const file = benchmarkImportFileInput.files[0];
+  benchmarkImportFileInput.value = '';
+  if (file) importBenchmarkFromFile(file);
+});
+loadBenchmarkIndex();
+renderBenchmarkList();
+renderBenchmarkSelect();
 
 // ========== 一键生成分析报告（design doc §10.3） ==========
 // 只负责拼接各面板已经算好的数据（不重新计算），图表部分用 Plotly.toImage 导出成 base64 图片；

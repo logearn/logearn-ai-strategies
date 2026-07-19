@@ -170,6 +170,24 @@ await testAsync('buildRows: mcap/fdv/current_mcap 冗余字段应合并只保留
   assert.strictEqual(rows[0].features.fdv, undefined);
   assert.strictEqual(rows[0].features.current_mcap, undefined);
 });
+await testAsync('buildRows: last_alert_low_lower_than_pre_low 应在最近一次 V 转信号最低点更低时记为 1', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.last_alert = { low_price: 0.05, pre_low_price: 0.08 };
+  const rows = await sandbox.buildRows([call], [snapshot]);
+  assert.strictEqual(rows[0].features.last_alert_low_lower_than_pre_low, 1);
+});
+await testAsync('buildRows: last_alert_low_lower_than_pre_low 应在未创新低时记为 0', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.last_alert = { low_price: 0.09, pre_low_price: 0.08 };
+  const rows = await sandbox.buildRows([call], [snapshot]);
+  assert.strictEqual(rows[0].features.last_alert_low_lower_than_pre_low, 0);
+});
+await testAsync('buildRows: last_alert_low_lower_than_pre_low 在缺少 pre_low_price（只出现过一次 V 转信号）时不应参与，不强行给默认值', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.last_alert = { low_price: 0.05 };
+  const rows = await sandbox.buildRows([call], [snapshot]);
+  assert.strictEqual(rows[0].features.last_alert_low_lower_than_pre_low, undefined);
+});
 
 // ---------- pearson / linearRegression / percentile ----------
 test('pearson: 完全正相关数据 r 应为 1', () => {
@@ -193,6 +211,73 @@ test('linearRegression: y=2x+1 精确拟合应得到 slope=2, intercept=1', () =
 test('percentile: 中位数应等于排序后数组的中间值', () => {
   const sorted = [1, 2, 3, 4, 5];
   assert.strictEqual(sandbox.percentile(sorted, 0.5), 3);
+});
+test('spearman: 单调但非线性关系应得到 ρ=1（Pearson r 会明显小于1）', () => {
+  const pairs = [[1, 1], [2, 4], [3, 9], [4, 16]]; // y = x^2，单调递增但非线性
+  assert.ok(Math.abs(sandbox.spearman(pairs) - 1) < 1e-9);
+});
+
+// ---------- #6 log 目标（getFeature） ----------
+test('getFeature: logReturnCurrent/logReturnMax 应返回自然对数值', () => {
+  const row = { returnCurrent: Math.E, returnMax: Math.E * Math.E, features: {}, categorical: {} };
+  assert.ok(Math.abs(sandbox.getFeature(row, 'logReturnCurrent') - 1) < 1e-9);
+  assert.ok(Math.abs(sandbox.getFeature(row, 'logReturnMax') - 2) < 1e-9);
+});
+test('getFeature: returnCurrent/returnMax 非正值（脏数据）的 log 目标应返回 undefined，不参与计算', () => {
+  const row = { returnCurrent: 0, returnMax: -1, features: {}, categorical: {} };
+  assert.strictEqual(sandbox.getFeature(row, 'logReturnCurrent'), undefined);
+  assert.strictEqual(sandbox.getFeature(row, 'logReturnMax'), undefined);
+});
+
+// ---------- computeCorrelations（性能优化：4 次行扫描合并为 1 次后的正确性回归） ----------
+test('computeCorrelations: 合并行扫描后仍应对每个目标（含 log 目标）算出正确的 r 和 n', () => {
+  // x 与 returnMax 完全正相关；returnCurrent 故意在一行留空，验证每个目标的有效样本集合互相独立
+  const rows = [
+    { returnCurrent: 2, returnMax: 2, features: { x: 1 }, categorical: {} },
+    { returnCurrent: undefined, returnMax: 4, features: { x: 2 }, categorical: {} },
+    { returnCurrent: 8, returnMax: 8, features: { x: 4 }, categorical: {} },
+    { returnCurrent: 16, returnMax: 16, features: { x: 8 }, categorical: {} },
+    { returnCurrent: 32, returnMax: 32, features: { x: 16 }, categorical: {} },
+    { returnCurrent: 64, returnMax: 64, features: { x: 32 }, categorical: {} },
+  ];
+  const list = sandbox.computeCorrelations(rows);
+  const rm = list.find(c => c.target === 'returnMax' && c.feature === 'x');
+  const rc = list.find(c => c.target === 'returnCurrent' && c.feature === 'x');
+  const logRm = list.find(c => c.target === 'logReturnMax' && c.feature === 'x');
+  assert.ok(rm, 'returnMax 应有 x 的相关性结果');
+  assert.strictEqual(rm.n, 6);
+  assert.ok(Math.abs(rm.r - 1) < 1e-9);
+  assert.ok(rc, 'returnCurrent 应有 x 的相关性结果');
+  assert.strictEqual(rc.n, 5); // 有一行 returnCurrent 缺失，不应污染其它目标的 n
+  assert.ok(logRm, 'logReturnMax 应有 x 的相关性结果');
+  assert.strictEqual(logRm.n, 6);
+});
+
+// ---------- #9 锁定切分（mulberry32 / splitTrainTest） ----------
+test('mulberry32: 同一个种子应产生完全相同的随机序列', () => {
+  const seq1 = [], seq2 = [];
+  const r1 = sandbox.mulberry32(42), r2 = sandbox.mulberry32(42);
+  for (let i = 0; i < 5; i++) { seq1.push(r1()); seq2.push(r2()); }
+  assert.deepStrictEqual(seq1, seq2);
+});
+test('splitTrainTest: 随机切分 + 相同种子，重复调用应得到完全相同的训练/测试集划分', () => {
+  const rows = Array.from({ length: 20 }, (_, i) => ({ swapBeginTime: i, tokenAddress: `T${i}` }));
+  const s1 = sandbox.splitTrainTest(rows, 'random', 0.7, 'swapBeginTime', 42);
+  const s2 = sandbox.splitTrainTest(rows, 'random', 0.7, 'swapBeginTime', 42);
+  assert.deepStrictEqual(s1.train.map(r => r.tokenAddress), s2.train.map(r => r.tokenAddress));
+  assert.deepStrictEqual(s1.test.map(r => r.tokenAddress), s2.test.map(r => r.tokenAddress));
+});
+test('splitTrainTest: 不同种子的随机切分大概率产生不同划分（验证种子确实生效，而非退化成固定顺序）', () => {
+  const rows = Array.from({ length: 20 }, (_, i) => ({ swapBeginTime: i, tokenAddress: `T${i}` }));
+  const s1 = sandbox.splitTrainTest(rows, 'random', 0.7, 'swapBeginTime', 1);
+  const s2 = sandbox.splitTrainTest(rows, 'random', 0.7, 'swapBeginTime', 2);
+  assert.notDeepStrictEqual(s1.train.map(r => r.tokenAddress), s2.train.map(r => r.tokenAddress));
+});
+test('splitTrainTest: 未指定种子时随机切分仍应按比例正确划分训练/测试集大小', () => {
+  const rows = Array.from({ length: 10 }, (_, i) => ({ swapBeginTime: i }));
+  const { train, test } = sandbox.splitTrainTest(rows, 'random', 0.7, 'swapBeginTime');
+  assert.strictEqual(train.length, 7);
+  assert.strictEqual(test.length, 3);
 });
 
 // ---------- compileCustomField / 公共函数库 / 聚合函数 ----------

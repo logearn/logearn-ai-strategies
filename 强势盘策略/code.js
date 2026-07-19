@@ -1,5 +1,7 @@
 // 单代币策略：年龄(>=1分钟 且 <=3天) + 市值(取max卡上限) + 垃圾钱包 + 平台白名单(含 four.meme) + 成本线偏离 + AO上升 + AC上升
 // 调整：日志精简——未命中只列失败项，命中只出关键摘要；去掉冗长的[期望..]描述
+// 新增：上线到买入时长 launch_to_buy_duration = (now - launch_time) 分钟 < 500
+// 新增：gmgn.stat.top_10_holder_rate < 30%、bot_degen_rate > 20%、creator_hold_rate < 10%
 var num = function (x) { var n = Number(x); return Number.isFinite(n) ? n : 0 }
 var sma = function (arr) { return arr.length ? arr.reduce(function (a, b) { return a + b }, 0) / arr.length : 0 }
 
@@ -8,6 +10,9 @@ var DEV_MIN = 2
 var DEV_MAX = 120
 var AGE_MAX_DAYS = 3
 var AGE_MIN_SEC = 60
+var TOP10_HOLDER_RATE_MAX = 30
+var BOT_DEGEN_RATE_MIN = 20
+var CREATOR_HOLD_RATE_MAX = 10
 
 var allow = [
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump 内盘
@@ -36,6 +41,14 @@ var effMcap = Math.max(mcapCandidates[0], mcapCandidates[1], mcapCandidates[2])
 var deviationPct = num(ki.avg_price_deviation_pct)
 var buyTxD1 = num(logearn.buy_tx_count_d1)
 
+var graduateTime = num(logearn.launch_time)
+var launchToBuyDuration = graduateTime > 0 ? (nowTs - graduateTime) / 60 : Infinity
+
+var gmgnStat = (ctx.gmgn && ctx.gmgn.stat) || {}
+var top10HolderRatePct = num(gmgnStat.top_10_holder_rate) * 100
+var botDegenRatePct = num(gmgnStat.bot_degen_rate) * 100
+var creatorHoldRatePct = num(gmgnStat.creator_hold_rate) * 100
+
 var resStr = String(ki.resolution || '').toUpperCase().trim()
 var needN = (resStr === '1S' || resStr === '5S') ? 5 : 3
 
@@ -62,6 +75,10 @@ var checks = [
   ['市值', effMcap > 0 && effMcap < MCAP_MAX, effMcap.toFixed(0)],
   ['垃圾钱包%', num(logearn.shit_volume) < 5, num(logearn.shit_volume).toFixed(1)],
   ['买入次数', buyTxD1 > 50, buyTxD1],
+  ['上线到买入时长(分)', launchToBuyDuration < 500, Number.isFinite(launchToBuyDuration) ? launchToBuyDuration.toFixed(1) : 'NA'],
+  ['前10持仓%', top10HolderRatePct < TOP10_HOLDER_RATE_MAX, top10HolderRatePct.toFixed(1)],
+  ['机器人degen%', botDegenRatePct > BOT_DEGEN_RATE_MIN, botDegenRatePct.toFixed(1)],
+  ['创建者持仓%', creatorHoldRatePct < CREATOR_HOLD_RATE_MAX, creatorHoldRatePct.toFixed(1)],
   ['偏离%', deviationPct > DEV_MIN && deviationPct < DEV_MAX, deviationPct.toFixed(1)],
   ['AO', aoOk, ao0.toFixed(0) + '/' + ao1.toFixed(0)],
   ['AC', acOk, (ac0 === null ? 'NA' : ac0.toFixed(1)) + '/' + (ac1 === null ? 'NA' : ac1.toFixed(1))]

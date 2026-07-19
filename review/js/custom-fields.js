@@ -289,7 +289,7 @@ function renderCustomFieldList() {
       <div class="cf-head">
         <span class="cf-name">${escapeHtml(cf.name)}</span>${depBadge}
         <button type="button" class="secondary cf-edit" data-idx="${i}">编辑</button>
-        <button type="button" class="secondary cf-del" data-idx="${i}">删除</button>
+        <button type="button" class="danger cf-del" data-idx="${i}">删除</button>
       </div>
       <div class="cf-code">${escapeHtml(cf.code)}</div>
       ${statHtml}
@@ -322,7 +322,7 @@ function cancelEditCustomField() {
   document.getElementById('customFieldResult').textContent = '';
 }
 
-function deleteCustomField(idx) {
+async function deleteCustomField(idx) {
   const cf = customFields[idx];
   if (!cf) return;
   // 删除保护（design doc §13.3）：删除前先检测是否有其他字段依赖它，有的话明确警告具体会影响哪些字段，
@@ -332,7 +332,7 @@ function deleteCustomField(idx) {
   const msg = dependentNames.length
     ? `删除 ${cf.name} 后，依赖它的字段 ${dependentNames.join('\u3001')} 将无法正常计算（会显示为空），是否继续？`
     : `确定删除自定义字段 ${cf.name}？`;
-  if (!confirm(msg)) return;
+  if (!await showConfirm(msg, { danger: true, okText: '删除' })) return;
   customFields.splice(idx, 1);
   saveCustomFields();
   removeCustomFieldValues(cf.name);
@@ -432,7 +432,7 @@ async function importCustomFieldsFromFile(file) {
   const list = Array.isArray(payload) ? payload : payload && payload.fields;
   if (!Array.isArray(list)) { showToast('文件里没有找到自定义字段列表，请确认是本工具导出的配置文件'); return; }
   if (!Array.isArray(payload) && payload.version !== undefined && payload.version !== CUSTOM_FIELDS_CONFIG_VERSION) {
-    if (!confirm(`该配置文件版本号(${payload.version})与当前工具（v${CUSTOM_FIELDS_CONFIG_VERSION}）不一致，部分设置可能无法正确导入，是否继续？`)) return;
+    if (!await showConfirm(`该配置文件版本号(${payload.version})与当前工具（v${CUSTOM_FIELDS_CONFIG_VERSION}）不一致，部分设置可能无法正确导入，是否继续？`)) return;
   }
   // 校验：字段名格式合法 + 公式能编译通过，两者都复用现有的校验/编译逻辑，不重新写一套
   const valid = [];

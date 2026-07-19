@@ -1,7 +1,12 @@
-// 1.5段策略 v29
-// 【依赖 kline_and_indicators 与 chip_analysis，单币深度分析场景，非实时流批量场景】
+// 1.5段策略 v30
+// 【依赖 kline_and_indicators 与 chip_analysis 与 gmgn，单币深度分析场景，非实时流批量场景】
 //
-// 本版改动（相对 v28）：
+// 本版改动（相对 v29）：
+// 新增"买卖地址比"限制：buy_sell_count_ratio = buyer_count_d1 / seller_count_d1 < 1.5。
+// 新增"前10持有占比"限制：gmgn.stat.top_10_holder_rate（原始0-1小数×100转%）< 30。
+// 新增"创建者持仓"限制：gmgn.stat.creator_hold_rate（原始0-1小数×100转%）< 1。
+//
+// v29改动（相对 v28）：
 // 新增"筹码限制"：chip_analysis.below_percent（当前价下方筹码占比）> above_percent（上方筹码占比）。
 //
 // v28改动（相对 v27）：
@@ -17,6 +22,9 @@ try {
   const MIN_V_DURATION = 120 // V转回撤持续时间下限（秒）= 2分钟
   const MCAP_LIMIT = 120000  // 买入市值上限（USD）
   const NEW_LIMIT = 70       // 新钱包持仓上限（%，已扣关注地址）
+  const BUY_SELL_COUNT_RATIO_LIMIT = 1.5 // buyer_count_d1/seller_count_d1 上限
+  const TOP10_HOLDER_RATE_LIMIT = 30 // gmgn.stat.top_10_holder_rate 上限（%）
+  const CREATOR_HOLD_RATE_LIMIT = 1  // gmgn.stat.creator_hold_rate 上限（%）
 
   const hasChip = !!ctx.chip_analysis
   const hasKline = !!ctx.kline_and_indicators && Array.isArray(ctx.kline_and_indicators.avg_price_bars)
@@ -56,6 +64,17 @@ try {
 
   const shitVolume = ctx.logearn?.shit_volume ?? 999
   const shitOk = shitVolume < 7
+
+  const buyerCountD1 = ctx.logearn?.buyer_count_d1 ?? 0
+  const sellerCountD1 = ctx.logearn?.seller_count_d1 ?? 0
+  const buySellCountRatio = sellerCountD1 > 0 ? (buyerCountD1 / sellerCountD1) : Infinity
+  const buySellCountRatioOk = buySellCountRatio < BUY_SELL_COUNT_RATIO_LIMIT
+
+  const gmgnStat = ctx.gmgn?.stat || {}
+  const top10HolderRatePct = (gmgnStat.top_10_holder_rate ?? 0) * 100
+  const top10HolderRateOk = top10HolderRatePct < TOP10_HOLDER_RATE_LIMIT
+  const creatorHoldRatePct = (gmgnStat.creator_hold_rate ?? 0) * 100
+  const creatorHoldRateOk = creatorHoldRatePct < CREATOR_HOLD_RATE_LIMIT
 
   // 关注地址集合 + 关注地址持仓占比
   const followedSet = new Set()
@@ -154,12 +173,15 @@ try {
   const checks = [
     ['毕业', graduated, launchTime, '>0'],
     ['平台', isTargetPlatform, platformLabel, 'Pump/four'],
-    ['时长h', withinWindow, ageHour === Infinity ? 'NA' : ageHour.toFixed(1), '<=15'],
+    //['时长h', withinWindow, ageHour === Infinity ? 'NA' : ageHour.toFixed(1), '<=15'],
     ['市值', mcapOk, mcap.toFixed(0), '<120k'],
     ['内盘卖出', innerSellOk, innerSellRatio, '>=60'],
     ['筹码下大于上', chipBelowAboveOk, `below=${belowPercent.toFixed(1)}/above=${abovePercent.toFixed(1)}`, '下>上'],
     ['成本线上', deviationOk, avgPriceDeviationPct, '>0'],
     ['垃圾盘', shitOk, shitVolume, '<7'],
+    ['买卖地址比', buySellCountRatioOk, `${buyerCountD1}/${sellerCountD1}=${buySellCountRatio === Infinity ? 'Inf' : buySellCountRatio.toFixed(2)}`, '<1.5'],
+    ['前10持有占比', top10HolderRateOk, top10HolderRatePct.toFixed(1), '<30'],
+    ['创建者持仓', creatorHoldRateOk, creatorHoldRatePct.toFixed(2), '<1'],
     ['新钱包', newOk, `${newVolumeAdj.toFixed(1)}(原${newVolumeRaw}-关注${followedHoldPercent.toFixed(1)})`, '<70'],
     ['单地址持仓', holdOk, maxHold.toFixed(1), '<10'],
     ['单地址转账', transferOk, maxTransferIn.toFixed(1), '<10'],

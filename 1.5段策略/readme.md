@@ -14,9 +14,9 @@ import.txt 可以直接导入策略。已经与code 同步
 
 v29:增加筹码检测，必须要下面筹码占多数。
 
-v30:增加"量价背离"过滤。仅当V转最低点跌破成本价时才启用：计算V转最低点→反弹高点区间的成交量，与V转下跌段(top_price_time→low_price_time)成交量对比，若反弹量 < 下跌量*0.3（缩量反弹），视为量价背离，排除该信号。若最低点未跌破成本价，则不做此项限制。
+v30:
+ 新增"前10持有占比"限制：gmgn.stat.top_10_holder_rate（原始0-1小数×100转%）< 30。
+ 新增"创建者持仓"限制：gmgn.stat.creator_hold_rate（原始0-1小数×100转%）< 0.5。
+ 新增"top_rat_trader占比"限制：gmgn.stat.top_rat_trader_percentage（原始0-1小数×100转%）< 1。
+ 新增"dev团队持仓"限制：gmgn.stat.dev_team_hold_rate（原始0-1小数×100转%）< 1。
 
-
-todo 
-1.基于盘形进一步筛选。
-2.

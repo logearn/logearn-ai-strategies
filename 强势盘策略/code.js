@@ -1,20 +1,34 @@
-// 单代币策略：年龄(>=1分钟 且 <=3天) + 市值(取max卡上限) + 垃圾钱包 + 平台白名单(含 four.meme) + 成本线偏离 + AO上升 + AC上升
-// 调整：日志精简——未命中只列失败项，命中只出关键摘要；去掉冗长的[期望..]描述
-// 新增：上线到买入时长 launch_to_buy_duration = (now - launch_time) 分钟 < 500
-// 新增：gmgn.stat.top_10_holder_rate < 30%、bot_degen_rate > 20%、creator_hold_rate < 10%
-var num = function (x) { var n = Number(x); return Number.isFinite(n) ? n : 0 }
-var sma = function (arr) { return arr.length ? arr.reduce(function (a, b) { return a + b }, 0) / arr.length : 0 }
+// ==============================================================
+// 单代币强势盘策略  v1.0.0
+// 条件：平台白名单(含 four.meme) + 年龄 1分钟~500分钟 + 市值<12w
+//       + Top10持仓<30% + 创建者持仓<1% + 内鬼<10% + 垃圾钱包<5%
+//       + 买入次数>50 + 成本线偏离 2~120% + AO 上升 + AC 上升
+// 说明：checks 顺序 = 判定优先级，先排最便宜、最易 false 的结构性硬条件，
+//       AO/AC 动量类计算放最后；全程仅一条日志输出。
+// 注：gmgn 里的占比字段均为 0-1 小数，×100 转成百分比。
+// ==============================================================
 
-var MCAP_MAX = 120000
-var DEV_MIN = 2
-var DEV_MAX = 120
-var AGE_MAX_DAYS = 3
-var AGE_MIN_SEC = 60
-var TOP10_HOLDER_RATE_MAX = 30
-var BOT_DEGEN_RATE_MIN = 20
-var CREATOR_HOLD_RATE_MAX = 10
+// ---------- 版本号 ----------
+const VERSION = 'v1.0.0'
 
-var allow = [
+// ---------- 工具函数 ----------
+const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : 0 }
+const sma = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0)
+
+// ---------- 阈值常量 ----------
+const MCAP_MAX = 120000     // 有效市值上限（USD）
+const DEV_MIN = 2           // 成本线偏离下限（%）
+const DEV_MAX = 120         // 成本线偏离上限（%）
+const AGE_MIN_SEC = 60      // 生命周期下限：< 1 分钟直接淘汰
+const AGE_MAX_MIN = 500     // 生命周期上限（分钟）
+const TOP10_MAX = 30        // Top10 持仓% 上限
+const CREATOR_MAX = 1       // 创建者持仓% 上限
+const RAT_MAX = 10          // 内鬼/插队交易者% 上限
+const SHIT_MAX = 5          // 垃圾钱包占比上限（%）
+const BUYTX_MIN = 50        // 24h 买入次数下限
+
+// 发射平台白名单
+const ALLOW_PLATFORMS = [
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump 内盘
   'FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4g6W1', // LetsBonk 1
   'BuM6KDpWiTcxvrpXywWFiw45R2RNH8WURdvqoTDV1BW4', // LetsBonk 2
@@ -22,75 +36,81 @@ var allow = [
   'binance_four.meme'                             // Binance Four.meme
 ]
 
-var ki = ctx.kline_and_indicators || {}
-var aoBars = Array.isArray(ki.ao_bars) ? ki.ao_bars : []
-var logearn = ctx.logearn || {}
-var symbol = logearn.symbol || ki.symbol || 'UNKNOWN'
+// ---------- 取数据 ----------
+const ki = ctx.kline_and_indicators || {}
+const aoBars = Array.isArray(ki.ao_bars) ? ki.ao_bars : []
+const logearn = ctx.logearn || {}
+const gmgn = ctx.gmgn || {}
+const dev = gmgn.dev || {}
+const stat = gmgn.stat || {}
+const symbol = logearn.symbol || ki.symbol || 'UNKNOWN'
 
-var visitingCount = (ctx.gmgn && ctx.gmgn.visiting_count != null) ? ctx.gmgn.visiting_count : 0
+const visitingCount = gmgn.visiting_count != null ? gmgn.visiting_count : 0
 
-var nowTs = Math.floor(Date.now() / 1000)
+// gmgn 占比字段（0-1 小数 → 百分比）
+const top10Pct = num(dev.top_10_holder_rate) * 100
+const creatorPct = num(stat.creator_hold_rate) * 100
+const ratPct = num(stat.top_rat_trader_percentage) * 100
 
-var launchTime = num(logearn.swap_begin_time)
-var ageSec = launchTime > 0 ? (nowTs - launchTime) : -1
-var ageDays = launchTime > 0 ? ageSec / 86400 : Infinity
+// ---------- 年龄 ----------
+const nowTs = Math.floor(Date.now() / 1000)
+const launchTime = num(logearn.swap_begin_time)
+const ageSec = launchTime > 0 ? nowTs - launchTime : -1
+const ageMin = launchTime > 0 ? ageSec / 60 : Infinity
 
-var mcapCandidates = [num(logearn.current_mcap), num(logearn.mcap), num(logearn.fdv)]
-var effMcap = Math.max(mcapCandidates[0], mcapCandidates[1], mcapCandidates[2])
+// ---------- 市值（三字段取最大，卡上限更严）----------
+const mcapCur = num(logearn.current_mcap)
+const mcapMc = num(logearn.mcap)
+const mcapFdv = num(logearn.fdv)
+const effMcap = Math.max(mcapCur, mcapMc, mcapFdv)
 
-var deviationPct = num(ki.avg_price_deviation_pct)
-var buyTxD1 = num(logearn.buy_tx_count_d1)
+// ---------- 偏离 / 热度 ----------
+const deviationPct = num(ki.avg_price_deviation_pct)
+const buyTxD1 = num(logearn.buy_tx_count_d1)
 
-var graduateTime = num(logearn.launch_time)
-var launchToBuyDuration = graduateTime > 0 ? (nowTs - graduateTime) / 60 : Infinity
+// ---------- AO 动量：最新一根为正且高于上一根 ----------
+const resStr = String(ki.resolution || '').toUpperCase().trim()
+const needN = resStr === '1S' || resStr === '5S' ? 5 : 3
+const aoVals = []
+for (let i = 0; i < needN; i++) aoVals.push(num(aoBars[i] ? aoBars[i].value : 0))
+const ao0 = aoVals[0]
+const ao1 = aoVals[1]
+const aoOk = aoBars.length >= needN && ao0 > 0 && ao0 > ao1
 
-var gmgnStat = (ctx.gmgn && ctx.gmgn.stat) || {}
-var top10HolderRatePct = num(gmgnStat.top_10_holder_rate) * 100
-var botDegenRatePct = num(gmgnStat.bot_degen_rate) * 100
-var creatorHoldRatePct = num(gmgnStat.creator_hold_rate) * 100
-
-var resStr = String(ki.resolution || '').toUpperCase().trim()
-var needN = (resStr === '1S' || resStr === '5S') ? 5 : 3
-
-var aoVals = []
-for (var i = 0; i < needN; i++) aoVals.push(num(aoBars[i] ? aoBars[i].value : 0))
-var ao0 = aoVals[0], ao1 = aoVals[1]
-var aoOk = aoBars.length >= needN && ao0 > 0 && ao0 > ao1
-
-var calcAC = function (idx) {
+// ---------- AC 加速度：AO 相对自身近 5 根均值的偏离，为正且放大 ----------
+const calcAC = (idx) => {
   if (idx + 5 > aoBars.length) return null
-  var win = aoBars.slice(idx, idx + 5).map(function (b) { return num(b.value) })
+  const win = aoBars.slice(idx, idx + 5).map((b) => num(b.value))
   return num(aoBars[idx].value) - sma(win)
 }
-var acVals = []
-for (var k = 0; k < needN; k++) acVals.push(calcAC(k))
-var ac0 = acVals[0], ac1 = acVals[1]
-var acOk = ac0 !== null && ac1 !== null && ac0 > 0 && ac0 > ac1
+const ac0 = calcAC(0)
+const ac1 = calcAC(1)
+const acOk = ac0 !== null && ac1 !== null && ac0 > 0 && ac0 > ac1
 
-// 顺序=判定优先级：先排最便宜、最容易 false 的结构性硬条件，最后才是 AO/AC 动量条件
-var checks = [
-  ['平台', allow.indexOf(logearn.platform) !== -1, String(logearn.platform)],
-  ['年龄秒', launchTime > 0 && ageSec >= AGE_MIN_SEC, ageSec],
-  ['年龄天', launchTime > 0 && ageDays <= AGE_MAX_DAYS, Number.isFinite(ageDays) ? ageDays.toFixed(2) : 'NA'],
-  ['市值', effMcap > 0 && effMcap < MCAP_MAX, effMcap.toFixed(0)],
-  ['垃圾钱包%', num(logearn.shit_volume) < 5, num(logearn.shit_volume).toFixed(1)],
-  ['买入次数', buyTxD1 > 50, buyTxD1],
-  ['上线到买入时长(分)', launchToBuyDuration < 500, Number.isFinite(launchToBuyDuration) ? launchToBuyDuration.toFixed(1) : 'NA'],
-  ['前10持仓%', top10HolderRatePct < TOP10_HOLDER_RATE_MAX, top10HolderRatePct.toFixed(1)],
-  ['机器人degen%', botDegenRatePct > BOT_DEGEN_RATE_MIN, botDegenRatePct.toFixed(1)],
-  ['创建者持仓%', creatorHoldRatePct < CREATOR_HOLD_RATE_MAX, creatorHoldRatePct.toFixed(1)],
-  ['偏离%', deviationPct > DEV_MIN && deviationPct < DEV_MAX, deviationPct.toFixed(1)],
-  ['AO', aoOk, ao0.toFixed(0) + '/' + ao1.toFixed(0)],
-  ['AC', acOk, (ac0 === null ? 'NA' : ac0.toFixed(1)) + '/' + (ac1 === null ? 'NA' : ac1.toFixed(1))]
+// ---------- 逐条判定（顺序=优先级）----------
+const checks = [
+  ['平台', ALLOW_PLATFORMS.indexOf(logearn.platform) !== -1, String(logearn.platform), '白名单(含four.meme)'],
+  ['年龄(秒)', launchTime > 0 && ageSec >= AGE_MIN_SEC, ageSec, '>= ' + AGE_MIN_SEC],
+  ['年龄(分)', launchTime > 0 && ageMin <= AGE_MAX_MIN, Number.isFinite(ageMin) ? ageMin.toFixed(1) : 'NA', '<= ' + AGE_MAX_MIN],
+  ['市值', effMcap > 0 && effMcap < MCAP_MAX, effMcap.toFixed(0), '>0 且 < ' + MCAP_MAX],
+  ['Top10持仓%', top10Pct < TOP10_MAX, top10Pct.toFixed(1), '< ' + TOP10_MAX],
+  ['创建者持仓%', creatorPct < CREATOR_MAX, creatorPct.toFixed(2), '< ' + CREATOR_MAX],
+  ['内鬼%', ratPct < RAT_MAX, ratPct.toFixed(1), '< ' + RAT_MAX],
+  ['垃圾钱包%', num(logearn.shit_volume) < SHIT_MAX, num(logearn.shit_volume).toFixed(1), '< ' + SHIT_MAX],
+  ['买入次数', buyTxD1 > BUYTX_MIN, buyTxD1, '> ' + BUYTX_MIN],
+  ['偏离%', deviationPct > DEV_MIN && deviationPct < DEV_MAX, deviationPct.toFixed(1), DEV_MIN + '~' + DEV_MAX],
+  ['AO', aoOk, ao0.toFixed(0) + '/' + ao1.toFixed(0), 'ao0>0 且 ao0>ao1'],
+  ['AC', acOk, (ac0 === null ? 'NA' : ac0.toFixed(1)) + '/' + (ac1 === null ? 'NA' : ac1.toFixed(1)), 'ac0>0 且 ac0>ac1']
 ]
 
-var head = '访问' + visitingCount + ' [' + symbol + '] K' + ki.resolution
-var passed = checks.every(function (c) { return c[1] })
+// ---------- 输出（全程仅一条日志）----------
+const head = VERSION + ' 访问' + visitingCount + ' [' + symbol + '] K' + ki.resolution
+const detail = checks.map(([name, ok, actual, expect]) => `${name}(${ok}): ${actual} [期望 ${expect}]`).join('  |  ')
+const passed = checks.every((c) => c[1])
 if (!passed) {
-  var fails = checks.filter(function (c) { return !c[1] }).map(function (c) { return c[0] + '=' + c[2] }).join(' ')
-  ctx.log.error('未命中 ' + head + ' | 失败:' + fails)
+  const fails = checks.filter((c) => !c[1]).map((c) => `${c[0]}=${c[2]}`).join(' ')
+  ctx.log.error('未命中 ' + head + ' | 失败:' + fails + '  ||  ' + detail)
   return false
 }
-var hit = checks.map(function (c) { return c[0] + '=' + c[2] }).join(' ')
-ctx.log.success('命中<强势盘> ' + head + ' | ' + hit)
+ctx.log.success('命中<强势盘> ' + head + '  ' + detail)
 return true

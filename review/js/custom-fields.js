@@ -169,7 +169,7 @@ function invokeCustomField(fn, features, meta, zscoreFn) {
 function customRowMeta(r) {
   return {
     id: r.id, symbol: r.symbol, token_address: r.tokenAddress, signalType: r.signalType,
-    returnCurrent: r.returnCurrent, returnMax: r.returnMax,
+    returnMax: r.returnMax,
     initialMcap: r.initialMcap, currentMcap: r.currentMcap, maxMcap: r.maxMcap,
     // 原始数组字段（如 holders/kline_bars/v_breakout_volume_list），配合聚合函数使用（design doc §20.0）
     arrays: r.arrays || {},

@@ -604,7 +604,7 @@ function logearnUrl(addr) {
   return `https://logearn.com/cn/${chainSlug}/tokens/${addr}`;
 }
 
-// 收益分布：直方图 + P10~P99 分位数表。目标字段（returnCurrent/returnMax）恒为正，对数轴默认开启，
+// 收益分布：直方图 + P10~P99 分位数表。目标字段（returnMax）恒为正，对数轴默认开启，
 // 但保留"含 0/负值时自动关闭对数轴"这层保护，以防未来复用到其他可能含 0/负值的字段。
 function renderDistribution() {
   const panel = document.getElementById('distPanel');

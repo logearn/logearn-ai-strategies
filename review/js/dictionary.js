@@ -4,9 +4,7 @@
 // 字段中文含义备注（ctx / snapshot.signal 通用）
 const FIELD_DESC = {
   // 收益
-  'returnCurrent': '当前倍数 = current_mcap / initial_mcap（1=不涨不跌，2=涨一倍）',
   'returnMax': '期间最大倍数 = max_mcap / initial_mcap（1=不涨不跌，2=涨一倍）',
-  'logReturnCurrent': 'log(returnCurrent)：对当前倍数取自然对数，收窄重尾分布，使 Pearson r/p 值/置信区间更稳健',
   'logReturnMax': 'log(returnMax)：对期间最大倍数取自然对数，收窄重尾分布，使 Pearson r/p 值/置信区间更稳健',
 
   // GMGN 风险/持仓比例类字段：原始值是 0-1 小数，这里已 ×100 转成百分比数值（如 3.31 表示 3.31%）
@@ -108,6 +106,8 @@ const FIELD_DESC = {
 
   // 组装字段（design doc §20 新增）
   'buy_max_retracement': 'buy 之前最大回撤（v_breakout_volume_list 中 n_pattern_retracement 的最大值，无数据为 0）',
+  'v_turn_current_stage_pct': '当前生效 V 转信号所处的反弹阶段：0=仅回撤确认还未反弹，20/40/60=已依次突破 fibon_break1/2/3（对应反弹 20%/40%/60%）；反弹突破前高（fibon_break4）视为已收尾，不算"生效"，不参与；若没有生效的 V 转信号（n_pattern_confirmed=true 且未收尾）则缺失',
+  'v_turn_break_cost_line_duration_min': '最近一个生效 V 转信号从"收盘价跌破回撤高点(top_price_time)对应的成本价"到"收盘价重新涨破该成本价"经历的时长，单位分钟（按K线根数×resolution换算，兼容不同K线粒度 1s/5s/...）；没有生效V转信号、没跌破过、或跌破后到快照时刻仍未涨破（尚未走完）则缺失',
   'last_alert_low_lower_than_pre_low': '最近一个 V 转信号的最低点是否比上一个 V 转信号的最低点更低（1=更低/连续创新低，0=未创新低；任一侧数据缺失不参与）',
 
   // K线/指标（ctx.kline_and_indicators）
@@ -187,6 +187,9 @@ const FIELD_DESC = {
   'chip_analysis.pressure_net': '筹码净压力指标 = chip_analysis.above_percent - chip_analysis.below_percent（正数=上方套牢盘更多抛压大，负数=下方支撑更强）',
   'open_to_buy_duration': '开盘到买入时长 = 快照时间（买入点）- swap_begin_time（第一笔交易时间），单位分钟',
   'launch_to_buy_duration': '上线到买入时长 = 快照时间（买入点）- launch_time（代币上线时间），单位分钟',
+  'above_cost_line': '是否在成本线之上（1=当前 mcap > 成本线 current_avg_price，0=未在成本线之上）',
+  'cost_line_distance_pct': '当前 mcap 与成本线（current_avg_price）的距离 = (mcap - current_avg_price) / current_avg_price × 100（%）',
+  'v_turn_low_cost_line_distance_pct': '最近一次 V 转信号最低点（last_alert.low_price_mcap）与"当时"成本线的距离（%）；成本线按最低点发生时间从 avg_price_bars 历史数组回溯取值，找不到历史数据时退回当前成本线',
 };
 
 // 数据源/前缀说明
@@ -248,7 +251,7 @@ const TERM_MAP = {
   'smart_buy_sell_ratio': '聪明钱买入数/聪明钱卖出数（1天）',
   'mcap_liquidity_ratio': '市值/池子流动性',
   'avg_buy_amount': '平均每笔买入金额', 'avg_sell_amount': '平均每笔卖出金额',
-  'returnCurrent': '当前倍数(current_mcap/initial_mcap)', 'returnMax': '期间最大倍数(max_mcap/initial_mcap)', 'id': '记录ID',
+  'returnMax': '期间最大倍数(max_mcap/initial_mcap)', 'id': '记录ID',
   'token_address': 'token 合约地址', 'symbol': 'token 代码', 'token_name': 'token 名称',
   'total_supply': '总供应量', 'decimals': '精度', 'chain': '链ID',
   'creator_address': '创建者地址', 'creator_tag': '创建者标签', 'main_pool_address': '主池地址',
@@ -362,7 +365,7 @@ function updateCurrentFieldDesc() {
 function renderAllDescTable() {
   const tbody = document.getElementById('allDescBody');
   if (!tbody) return;
-  const fields = ['returnCurrent', 'returnMax', ...allNumericKeys].sort();
+  const fields = ['returnMax', ...allNumericKeys].sort();
   tbody.innerHTML = fields.map(f => {
     const desc = getFieldDesc(f);
     return `<tr><td>${escapeHtml(f)}</td><td>${escapeHtml(desc) || '暂无备注'}</td></tr>`;

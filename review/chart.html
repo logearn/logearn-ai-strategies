@@ -263,6 +263,12 @@
     .desc-table th { background: var(--surface-2); }
     .desc-table td:first-child { font-family: "SF Mono", "SFMono-Regular", Consolas, monospace; color: var(--text); vertical-align: top; font-size: 11.5px; }
     .desc-table td:last-child { color: var(--text-muted); }
+    /* 策略诊断：每个目标 CA 一张卡片（命中状态 + checks 明细），卡片之间留白，避免多个 CA 的
+       checks 表格连成一片分不清哪张是哪个 CA 的 */
+    .strategy-diag-card { border: 1px solid var(--border-subtle); border-radius: 8px; padding: 12px; margin: 0 0 12px; background: var(--surface-2); }
+    .strategy-diag-head { font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .strategy-diag-card .desc-table { background: var(--surface); border-radius: 6px; overflow: hidden; }
+    .strategy-diag-log { font-size: 11.5px; background: var(--surface); border-radius: 6px; padding: 8px 10px; margin: 6px 0 0; white-space: pre-wrap; word-break: break-all; color: var(--text-muted); }
     .coverage-bar-wrap { position: relative; background: var(--surface-2); border-radius: 4px; height: 16px; width: 120px; overflow: hidden; }
     .coverage-bar-fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); opacity: .5; }
     .coverage-bar-text { position: relative; z-index: 1; font-size: 11px; line-height: 16px; text-align: center; }
@@ -425,7 +431,7 @@
     }
     .ac-item-desc { font-size: 11px; color: var(--text-muted); margin-top: 2px; line-height: 1.4; }
     .ac-empty { padding: 10px; font-size: 12px; color: var(--text-muted); text-align: center; }
-    /* 用户手动核实过、认为有统计/预测意义的常用字段：联想框里排到最前面并高亮，减少每次都要
+    /* 常用字段（手工核实过的原始字段 + 全部组装字段）：联想框里排到最前面并高亮，减少每次都要
        重新在几十上百个字段里找"哪些是真的靠谱的"这个负担 */
     .ac-item.trusted { background: rgba(255,159,10,.08); }
     .ac-item.trusted:hover, .ac-item.trusted.active { background: rgba(255,159,10,.16); }
@@ -677,7 +683,7 @@
         <div class="table-scroll" style="margin-top: 10px; max-height: 300px;">
           <table class="desc-table">
             <thead>
-              <tr><th>symbol</th><th>token_address (CA)</th><th class="num">returnCurrent</th><th class="num">匹配值</th></tr>
+              <tr><th>symbol</th><th>token_address (CA)</th><th class="num">returnMax</th><th class="num">匹配值</th></tr>
             </thead>
             <tbody id="filterBody"></tbody>
           </table>
@@ -706,7 +712,6 @@
         <div class="control" style="flex: 0; min-width: 140px;">
           <label for="distTargetField">目标字段</label>
           <select id="distTargetField">
-            <option value="returnCurrent">returnCurrent</option>
             <option value="returnMax" selected>returnMax</option>
           </select>
         </div>
@@ -796,10 +801,7 @@
         <div class="control" style="flex: 0 0 auto; min-width: auto;">
           <label for="corrTarget">目标</label>
           <select id="corrTarget">
-            <option value="all">全部（不含 log 目标）</option>
-            <option value="returnCurrent">returnCurrent</option>
             <option value="returnMax" selected>returnMax</option>
-            <option value="logReturnCurrent">log(returnCurrent)（重尾稳健）</option>
             <option value="logReturnMax">log(returnMax)（重尾稳健）</option>
           </select>
         </div>
@@ -915,7 +917,7 @@
       <button type="button" class="collapse-toggle">▾</button>
     </div>
     <div class="panel-body" id="customFieldBody_">
-      <p class="hint" style="margin: -6px 0 12px;">用 JS 代码自己组装新字段：<code>f</code> 是当前行全部扁平化字段（如 <code>f['pool_liquidity']</code>），<code>row</code> 是行元信息（<code>row.returnMax</code> / <code>row.returnCurrent</code> / <code>row.symbol</code> / <code>row.token_address</code>）。支持单表达式（如 <code>f['mcap'] / f['pool_liquidity']</code>）或带 <code>return</code> 的函数体。返回有限数值才会写入该行，返回 null/undefined/NaN 视为该行无值。后定义的字段可以引用先定义的自定义字段。定义保存在浏览器本地（localStorage），刷新不丢失。</p>
+      <p class="hint" style="margin: -6px 0 12px;">用 JS 代码自己组装新字段：<code>f</code> 是当前行全部扁平化字段（如 <code>f['pool_liquidity']</code>），<code>row</code> 是行元信息（<code>row.returnMax</code> / <code>row.symbol</code> / <code>row.token_address</code>）。支持单表达式（如 <code>f['mcap'] / f['pool_liquidity']</code>）或带 <code>return</code> 的函数体。返回有限数值才会写入该行，返回 null/undefined/NaN 视为该行无值。后定义的字段可以引用先定义的自定义字段。定义保存在浏览器本地（localStorage），刷新不丢失。</p>
       <p class="hint" style="margin: -6px 0 12px;"><strong>数组字段聚合</strong>（holders/kline_bars/各类 _list 事件数组）：<code>row.arrays</code> 存放原始数组（如 <code>row.arrays.holders</code>），配合内置聚合函数使用——<code>countWhere(arr, item =&gt; ...)</code> 按条件计数、<code>avgField(arr, 'field')</code>/<code>sumField(arr, 'field')</code>/<code>maxField</code>/<code>minField</code> 对某字段求均值/求和/最大/最小、<code>giniCoefficient(arr, 'field')</code> 算基尼系数（衡量分布集中度，0=平均 1=集中）。例：<code>giniCoefficient(row.arrays.holders, 'amount_percentage')</code>。</p>
       <p class="hint" style="margin: -6px 0 12px;"><strong>公共函数库</strong>：<code>safeDiv(a, b)</code> 除数为0/缺失时返回 null（不用自己判断除以0）、<code>pct(a, b)</code> 等价于 <code>safeDiv(a,b)*100</code>（占比类专用）、<code>clamp(x, min, max)</code> 把值限制在区间内、<code>log1p(x)</code> 即 <code>log(1+x)</code>（给长尾字段做压缩变换）、<code>zscore(x, 'field')</code> 按该字段在当前数据集里的均值/标准差做标准化。例：<code>pct(f['buy_wcoin_amount_d1'], f['buy_wcoin_amount_d1'] + f['sell_wcoin_amount_d1'])</code>。</p>
       <div class="row" style="margin: 0 0 10px; gap: 8px; align-items: center;">
@@ -974,7 +976,7 @@
         <div style="margin-top: 8px;">
           <button type="button" id="batchXImportToggle" class="secondary">📋 粘贴 JSON 片段快速添加</button>
           <button type="button" id="fieldBrowserToggle" class="secondary">📚 按分组浏览字段</button>
-          <button type="button" id="loadTrustedFieldsBtn" class="secondary" title="把已核实过的常用字段（联想框里带 ★ 常用标记的那批）一次性加入 X">★ 一键加载常用字段</button>
+          <button type="button" id="loadTrustedFieldsBtn" class="secondary" title="把常用字段（联想框里带 ★ 常用标记的那批：已核实过的原始字段 + 全部组装字段）一次性加入 X">★ 一键加载常用字段</button>
           <button type="button" id="batchXClearBtn" class="danger">🗑 一键清空 X</button>
           <div id="batchXImportPanel" class="hidden" style="margin-top: 8px;">
             <p class="hint" style="margin: 0 0 6px;">粘贴任意包含字段的 JSON/对象片段（严格 JSON "key": 、单引号 'key': 、不带引号的 key: 都支持；行内 // 注释、末尾逗号、外层不闭合、甚至只贴一两行 key: value 都可以），会自动提取里面的 key，按名称匹配到当前数据里已存在的字段（无需带 gmgn.stat. 等前缀），一次性加入 X 列表。</p>
@@ -1057,10 +1059,10 @@
       <button type="button" class="collapse-toggle">▾</button>
     </div>
     <div class="panel-body" id="binBarBody_">
-    <p class="hint">把分箱字段（如 returnCurrent）按自定义区间切分，计算每个区间内数值字段的均值和误差棒（标准差 或 95% 置信区间）。</p>
+    <p class="hint">把分箱字段（如 returnMax）按自定义区间切分，计算每个区间内数值字段的均值和误差棒（标准差 或 95% 置信区间）。</p>
     <div class="row">
       <div class="control" style="position: relative;">
-        <label for="binField">分箱字段（如 returnCurrent）</label>
+        <label for="binField">分箱字段（如 returnMax）</label>
         <input type="text" id="binField" class="field-search" placeholder="输入字段名..." autocomplete="off">
       </div>
       <div class="control" style="position: relative;">
@@ -1086,7 +1088,6 @@
       <div class="control" style="flex: 0; min-width: 140px;">
         <label for="binRecommendTarget">推荐依据目标</label>
         <select id="binRecommendTarget">
-          <option value="returnCurrent">returnCurrent</option>
           <option value="returnMax">returnMax</option>
         </select>
       </div>
@@ -1124,6 +1125,7 @@
         <a href="#proSectionCategoryCompare" class="chart-tool-btn">5.分类对比</a>
         <a href="#proSectionRoc" class="chart-tool-btn">6.ROC-AUC</a>
         <a href="#proSectionSimilarCase" class="chart-tool-btn">7.相似Case</a>
+        <a href="#proSectionCaAdvisor" class="chart-tool-btn">8.CA过滤建议</a>
       </div>
       <div id="proContent">
 
@@ -1190,9 +1192,7 @@
             <div class="control" style="flex: 0; min-width: 140px;">
               <label for="groupTargetField">目标</label>
               <select id="groupTargetField">
-                <option value="returnCurrent">returnCurrent</option>
-                <option value="returnMax" selected>returnMax</option>
-                <option value="logReturnCurrent">log(returnCurrent)</option>
+                    <option value="returnMax" selected>returnMax</option>
                 <option value="logReturnMax">log(returnMax)</option>
               </select>
             </div>
@@ -1229,10 +1229,8 @@
             <div class="control" style="flex: 0; min-width: 140px;">
               <label for="importanceTargetField">目标</label>
               <select id="importanceTargetField">
-                <option value="returnCurrent">returnCurrent</option>
-                <option value="returnMax" selected>returnMax</option>
-                <option value="logReturnCurrent">log(returnCurrent)（重尾稳健）</option>
-                <option value="logReturnMax">log(returnMax)（重尾稳健）</option>
+                    <option value="returnMax" selected>returnMax</option>
+                    <option value="logReturnMax">log(returnMax)（重尾稳健）</option>
               </select>
             </div>
             <div class="control" style="flex: 1 1 100%; position: relative;">
@@ -1285,9 +1283,7 @@
             <div class="control" style="flex: 0; min-width: 140px;">
               <label for="interactionTargetField">目标</label>
               <select id="interactionTargetField">
-                <option value="returnCurrent">returnCurrent</option>
-                <option value="returnMax" selected>returnMax</option>
-                <option value="logReturnCurrent">log(returnCurrent)</option>
+                    <option value="returnMax" selected>returnMax</option>
                 <option value="logReturnMax">log(returnMax)</option>
               </select>
             </div>
@@ -1331,9 +1327,7 @@
             <div class="control" style="flex: 0; min-width: 160px;">
               <label for="compositeTargetField">目标</label>
               <select id="compositeTargetField">
-                <option value="returnCurrent">returnCurrent</option>
-                <option value="returnMax" selected>returnMax</option>
-                <option value="logReturnCurrent">log(returnCurrent)</option>
+                    <option value="returnMax" selected>returnMax</option>
                 <option value="logReturnMax">log(returnMax)</option>
               </select>
             </div>
@@ -1405,8 +1399,7 @@
             <div class="control" style="flex: 0; min-width: 140px;">
               <label for="timeTargetField">目标</label>
               <select id="timeTargetField">
-                <option value="returnCurrent">returnCurrent</option>
-                <option value="returnMax" selected>returnMax</option>
+                    <option value="returnMax" selected>returnMax</option>
               </select>
             </div>
             <div class="control" style="flex: 0; min-width: 120px;">
@@ -1438,8 +1431,7 @@
             <div class="control" style="flex: 0; min-width: 140px;">
               <label for="rollingTargetField">目标</label>
               <select id="rollingTargetField">
-                <option value="returnCurrent">returnCurrent</option>
-                <option value="returnMax" selected>returnMax</option>
+                    <option value="returnMax" selected>returnMax</option>
               </select>
             </div>
             <div class="control" style="flex: 0; min-width: 110px;">
@@ -1507,13 +1499,12 @@
             <div class="control" style="flex: 0; min-width: 140px;">
               <label for="rocTargetField">目标</label>
               <select id="rocTargetField">
-                <option value="returnCurrent">returnCurrent</option>
-                <option value="returnMax" selected>returnMax</option>
+                    <option value="returnMax" selected>returnMax</option>
               </select>
             </div>
             <div class="control" style="flex: 0; min-width: 160px;">
               <label for="rocWinThreshold">盈利判定阈值（目标 &gt; 该值算赢）</label>
-              <input type="number" id="rocWinThreshold" value="1" step="0.1">
+              <input type="number" id="rocWinThreshold" value="2" step="0.1">
             </div>
             <div class="control" style="flex: 0; min-width: 160px;">
               <label for="rocDirection">方向</label>
@@ -1584,10 +1575,69 @@
           <div id="similarSummary" class="hint" style="margin: 10px 0;"></div>
           <div class="table-scroll" style="max-height: 320px;">
             <table class="desc-table">
-              <thead><tr><th>symbol</th><th>token_address</th><th class="num">相似度距离</th><th class="num">returnCurrent</th><th class="num">returnMax</th></tr></thead>
+              <thead><tr><th>symbol</th><th>token_address</th><th class="num">相似度距离</th><th class="num">returnMax</th></tr></thead>
               <tbody id="similarBody"></tbody>
             </table>
           </div>
+        </div>
+
+        <div class="pro-section" id="proSectionCaAdvisor">
+          <h4>8. CA 定位 &amp; 过滤建议</h4>
+          <p class="hint" style="margin: 0 0 10px;">粘贴几个你想让未来过滤规则排除掉的 CA（或 symbol），看它们在"常用字段"上分别处于全量数据分布的什么位置（百分位），并自动推荐能挡住这些 CA、同时尽量不误伤好样本（returnMax&gt;2，即翻倍）的过滤规则。</p>
+          <div class="row">
+            <div class="control" style="flex: 1 1 100%;">
+              <label for="caAdvisorInput">目标 CA / symbol（换行、逗号或空格分隔，可多个）</label>
+              <textarea id="caAdvisorInput" rows="3" style="width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;" placeholder="如：&#10;5wAr8gMm8KpgkGEiAhiBBdKBXFQsyChuLdw4KHuVpump&#10;Argos"></textarea>
+            </div>
+          </div>
+          <div class="row">
+            <div class="control" style="flex: 1 1 100%; position: relative;">
+              <label for="caAdvisorFieldsInput">选择字段（即"常用字段"，可多选）</label>
+              <div class="tag-input" id="caAdvisorFieldsTagBox">
+                <input type="text" id="caAdvisorFieldsInput" placeholder="输入字段名联想，选中自动添加..." autocomplete="off">
+              </div>
+            </div>
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
+              <button type="button" id="loadCaAdvisorTrustedBtn" class="secondary">导入常用字段</button>
+            </div>
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
+              <button type="button" id="importCaAdvisorTop10Btn" class="secondary">导入相关性表 Top10</button>
+            </div>
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
+              <button type="button" id="genCaAdvisorBtn">分析</button>
+            </div>
+          </div>
+          <div id="caAdvisorSummary" class="hint" style="margin: 10px 0;"></div>
+          <div class="table-scroll" style="max-height: 320px;">
+            <table class="desc-table">
+              <thead id="caAdvisorPosHead"></thead>
+              <tbody id="caAdvisorPosBody"></tbody>
+            </table>
+          </div>
+          <h5 style="margin: 16px 0 6px;">过滤建议（按代价从低到高排序）</h5>
+          <div class="table-scroll" style="max-height: 320px;">
+            <table class="desc-table">
+              <thead><tr><th>字段</th><th>建议规则</th><th class="num">命中目标CA</th><th class="num">连带排除比例（全量）</th><th class="num">连带排除比例（好样本）</th></tr></thead>
+              <tbody id="caAdvisorAdviceBody"></tbody>
+            </table>
+          </div>
+
+          <h5 style="margin: 20px 0 6px;">策略诊断：为什么被拦截</h5>
+          <p class="hint" style="margin: 0 0 10px;">把策略代码原样粘进来跑一遍，看上面那几个目标 CA 到底卡在哪一条 check、当时的实际值是多少，并列出策略真正读到的字段。适用于以 <code>ctx</code> 为入参、内部构造 <code>checks = [[名称, 是否通过, 实际值], ...]</code> 再 <code>return true/false</code> 的策略写法。回放用买入时刻的快照 ctx，策略里的 <code>Date.now()</code> 会被替换成快照抓取时刻，年龄/新鲜度类判断才有意义。</p>
+          <div class="row">
+            <div class="control" style="flex: 1 1 100%;">
+              <label for="strategyCodeInput">策略代码（粘贴 code.js 的内容）</label>
+              <textarea id="strategyCodeInput" rows="8" placeholder="var ki = ctx.kline_and_indicators || {}&#10;...&#10;var checks = [&#10;  ['平台', allow.indexOf(logearn.platform) !== -1, String(logearn.platform)],&#10;  ...&#10;]&#10;..." spellcheck="false" style="font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px;"></textarea>
+            </div>
+          </div>
+          <div class="row">
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
+              <button type="button" id="genStrategyDiagBtn">回放策略</button>
+            </div>
+          </div>
+          <div id="strategyDiagSummary" class="hint" style="margin: 10px 0;"></div>
+          <div id="strategyDiagFields" style="margin: 10px 0;"></div>
+          <div id="strategyDiagBody"></div>
         </div>
 
       </div>

@@ -18,7 +18,12 @@ const DERIVED_KEYS = [
   'open_to_buy_duration',
   'launch_to_buy_duration',
   'buy_max_retracement',
+  'v_turn_current_stage_pct',
+  'v_turn_break_cost_line_duration_min',
   'last_alert_low_lower_than_pre_low',
+  'above_cost_line',
+  'cost_line_distance_pct',
+  'v_turn_low_cost_line_distance_pct',
 ];
 
 // 以下字段原始值是 0-1 的小数比例（比如 "0.0331" 实际代表 3.31%），
@@ -199,7 +204,6 @@ async function buildRows(calls, snapshots, onProgress) {
     const init = num(c.initial_mcap), cur = num(c.current_mcap), mx = num(c.max_mcap);
     if (init === null || init === 0 || cur === null || mx === null) continue;
     // 收益以“倍数”表示（1 = 不涨不跌，2 = 涨一倍），与平台展示口径保持一致
-    const returnCurrent = cur / init;
     const returnMax = mx / init;
 
     // 同时展开 snapshot.signal 和 snapshot.ctx；
@@ -222,6 +226,7 @@ async function buildRows(calls, snapshots, onProgress) {
     const smartSell = features['smart_money_address_sell_count_d1'];
     const liq = features['pool_liquidity'];
     const mcap = features['mcap'] || features['current_mcap'] || features['fdv'];
+    const currentAvgPrice = features['kline_and_indicators.current_avg_price'];
     const chipAbove = features['chip_analysis.above_percent'];
     const chipBelow = features['chip_analysis.below_percent'];
 
@@ -267,6 +272,72 @@ async function buildRows(calls, snapshots, onProgress) {
     }
     features['buy_max_retracement'] = maxRetracement;
 
+    // 当前生效 V 转信号所处的反弹阶段（用户需求新增字段）：0=仅回撤确认、还未开始反弹，
+    // 20/40/60=已依次突破 fibon_break1/2/3（对应反弹 20%/40%/60%）。反弹突破前高（fibon_break4）
+    // 视为该轮 V 转已收尾、不再是"生效"信号，不参与统计（与 1.5段策略/code.js、PVP策略/code.js
+    // 里 vFinished/vStageLabel 的判定逻辑保持一致：n_pattern_confirmed=true 且未收尾里取 signalTime 最新的一个）。
+    const vReached = (val, t) => (Number(val) > 0) || (t !== undefined && t !== null && Number(t) > 0);
+    let recentV = null;
+    if (Array.isArray(breakouts) && breakouts.length) {
+      for (const ev of breakouts) {
+        if (!ev || ev.n_pattern_confirmed !== true) continue;
+        if (vReached(ev.fibon_break4, ev.fibon_break4_time)) continue; // 已收尾，排除
+        if (!recentV || (ev.signalTime || 0) > (recentV.signalTime || 0)) recentV = ev;
+      }
+      if (recentV) {
+        let stage = 0;
+        if (vReached(recentV.fibon_break3, recentV.fibon_break3_time)) stage = 60;
+        else if (vReached(recentV.fibon_break2, recentV.fibon_break2_time)) stage = 40;
+        else if (vReached(recentV.fibon_break1, recentV.fibon_break1_time)) stage = 20;
+        features['v_turn_current_stage_pct'] = stage;
+      }
+    }
+
+    // 最近一个生效 V 转信号"跌破成本线"到"涨破回该成本价"的持续时间，单位分钟（用户需求新增字段）：
+    // 1) 取生效 V 转信号（recentV，与上面 v_turn_current_stage_pct 用同一套"生效"判定）的回撤高点 top_price_time；
+    // 2) 用 avg_price_bars 按该时间点回溯取"对应的成本价"（同 v_turn_low_cost_line_distance_pct 的回溯逻辑，
+    //    找不到历史数据时退回当前成本线 current_avg_price）；
+    // 3) 从该高点开始按时间顺序扫描 kline_bars，找到收盘价首次跌破该成本价的那根K线，开始计数；
+    // 4) 往后数K线根数，直到收盘价重新涨破该成本价为止（不含涨破那一根）；
+    // 5) K线粒度不固定（1s/5s/...），用 resolution（每根K线跨越的秒数）把"跌破期间经历的K线根数"换算
+    //    成分钟数，而不是直接拿首尾时间戳相减（bar 数组可能有缺口，"根数 × 粒度"更贴近实际K线跨度）。
+    // 若没有生效V转信号、没跌破过、或跌破后到快照时刻仍未涨破（尚未走完），都不参与统计。
+    const klineBars = arrays['kline_and_indicators.kline_bars'] || [];
+    const resolutionSec = features['kline_and_indicators.resolution'];
+    if (recentV && fin(recentV.top_price_time) && klineBars.length && fin(resolutionSec) && resolutionSec > 0) {
+      const topTimeSec = recentV.top_price_time >= 1e12 ? Math.floor(recentV.top_price_time / 1000) : recentV.top_price_time;
+      const avgBars = arrays['kline_and_indicators.avg_price_bars'] || [];
+      let costAtTop = currentAvgPrice;
+      for (let i = 0; i < avgBars.length; i++) {
+        const bar = avgBars[i];
+        const barTimeSec = bar && Number(bar.time) >= 1e12 ? Math.floor(Number(bar.time) / 1000) : Number(bar && bar.time);
+        if (Number.isFinite(barTimeSec) && barTimeSec <= topTimeSec && typeof bar.value === 'number') { costAtTop = bar.value; break; }
+      }
+      if (fin(costAtTop) && costAtTop > 0) {
+        // kline_bars 原始是新→旧排列，按时间正序排好、只保留高点之后的部分，再顺序扫描跌破/涨破
+        const chrono = klineBars
+          .map(b => ({
+            time: b && (Number(b.time) >= 1e12 ? Math.floor(Number(b.time) / 1000) : Number(b.time)),
+            close: b && Number(b.close),
+          }))
+          .filter(b => Number.isFinite(b.time) && Number.isFinite(b.close) && b.time >= topTimeSec)
+          .sort((a, b) => a.time - b.time);
+        let breakdownIdx = -1;
+        for (let i = 0; i < chrono.length; i++) {
+          if (chrono[i].close < costAtTop) { breakdownIdx = i; break; }
+        }
+        if (breakdownIdx >= 0) {
+          let breakoutIdx = -1;
+          for (let i = breakdownIdx + 1; i < chrono.length; i++) {
+            if (chrono[i].close > costAtTop) { breakoutIdx = i; break; }
+          }
+          if (breakoutIdx >= 0) {
+            features['v_turn_break_cost_line_duration_min'] = (breakoutIdx - breakdownIdx) * resolutionSec / 60;
+          }
+        }
+      }
+    }
+
     // 最近一个 V 转信号（last_alert）的最低点是否比上一个 V 转信号的最低点更低（用户需求新增字段）：
     // 1 = 更低（连续创新低，形态可能更弱），0 = 未创新低。last_alert.low_price/pre_low_price
     // 由 flattenObject 对 signal.last_alert 递归展开自动产生，不需要单独处理嵌套结构；
@@ -275,6 +346,38 @@ async function buildRows(calls, snapshots, onProgress) {
     const lastAlertPreLow = features['last_alert.pre_low_price'];
     if (fin(lastAlertLow) && fin(lastAlertPreLow)) {
       features['last_alert_low_lower_than_pre_low'] = lastAlertLow < lastAlertPreLow ? 1 : 0;
+    }
+
+    // 是否在成本线之上 / 与成本线的距离（用户需求新增字段）：current_avg_price 是"当前整体持仓
+    // 用户的平均价"，与 mcap 同为市值(USD)口径可直接比较（strategy 侧 强势盘策略/v1/code.js 里
+    // 已验证过这个用法：curCostMcap = kline_and_indicators.current_avg_price）。
+    if (fin(mcap) && fin(currentAvgPrice) && currentAvgPrice !== 0) {
+      features['above_cost_line'] = mcap > currentAvgPrice ? 1 : 0;
+      features['cost_line_distance_pct'] = (mcap - currentAvgPrice) / currentAvgPrice * 100;
+    }
+
+    // V 转信号最低点与"当时"成本线之间的距离（用户需求新增字段）：成本线随时间变化，不能直接用
+    // current_avg_price（那是快照抓取时刻的成本线），要用 avg_price_bars 历史数组按最低点发生时间
+    // 回溯找最近的一根（同 强势盘策略/v1/code.js 的 costMcapAt 逻辑）；找不到历史数据时退回当前成本线。
+    // low_price_mcap 与 current_avg_price 同为市值(USD)口径（用 low_price/low_price_mcp 会是价格/另一种
+    // 口径，与成本线单位不一致，不能直接相减）。
+    const lowMcap = features['last_alert.low_price_mcap'];
+    const lowTimeRaw = features['last_alert.low_price_time'];
+    if (fin(lowMcap) && fin(lowTimeRaw)) {
+      const avgBars = arrays['kline_and_indicators.avg_price_bars'] || [];
+      const lowTimeSec = lowTimeRaw >= 1e12 ? Math.floor(lowTimeRaw / 1000) : lowTimeRaw;
+      let costAtLow = currentAvgPrice; // 找不到历史 bar 时退回当前成本线
+      for (let i = 0; i < avgBars.length; i++) {
+        const bar = avgBars[i];
+        const barTimeSec = bar && Number(bar.time) >= 1e12 ? Math.floor(Number(bar.time) / 1000) : Number(bar && bar.time);
+        if (Number.isFinite(barTimeSec) && barTimeSec <= lowTimeSec && typeof bar.value === 'number') {
+          costAtLow = bar.value;
+          break;
+        }
+      }
+      if (fin(costAtLow) && costAtLow !== 0) {
+        features['v_turn_low_cost_line_distance_pct'] = (lowMcap - costAtLow) / costAtLow * 100;
+      }
     }
 
     // 冗余字段合并（design doc §20.1，已用真实快照数据核实：65 条样本里 mcap/fdv/current_mcap 100% 完全相同）。
@@ -302,7 +405,6 @@ async function buildRows(calls, snapshots, onProgress) {
       initialMcap: init,
       currentMcap: cur,
       maxMcap: mx,
-      returnCurrent,
       returnMax,
       features,
       // 非数值分类字段（如 platform），供"分组对比""分类字段分析"等 Pro 功能使用；
@@ -310,7 +412,11 @@ async function buildRows(calls, snapshots, onProgress) {
       categorical,
       // 原始数组字段（如 holders/kline_bars/v_breakout_volume_list），供自定义字段公式里的
       // countWhere/avgField/sumField/giniCoefficient 等聚合函数读取；不参与 getFeature 数值体系
-      arrays
+      arrays,
+      // 快照原始 ctx 的【引用】（不是拷贝，不额外占内存）：策略回放（"8. CA 定位"里的策略诊断）需要
+      // 把策略源码原样跑一遍，而策略读的是 ctx.logearn / ctx.gmgn / ctx.kline_and_indicators 这套
+      // 原始嵌套结构，扁平化后的 features 无法还原。只有这一个功能会用到，其它分析一律走 getFeature。
+      rawCtx: s.ctx || null
     });
   }
   buildRows.lastSkippedByTimeDiff = skippedByTimeDiff;
@@ -341,22 +447,22 @@ function correlationPoolExclusionReason(key) {
   return null;
 }
 
-// 目标筛选口径：corrTarget 下拉的"全部"不包含 log 目标——log(returnMax) 与 returnMax 是同一结果的
-// 单调变换而非独立假设，同时计入会把多重比较校正的 m 无理由翻倍，拖累真字段的校正后 p；
-// 想看 log 目标请在下拉里单独选。相关性表/Bootstrap CI 两处筛选逻辑共用这一条判断。
+// 目标筛选口径：收益目标只剩 returnMax 一个（原来的 returnCurrent 已下线），下拉里也就没有"全部"
+// 选项了；这里仍保留 'all' 分支，是为了兼容早期版本存在 localStorage 里的 target='all'——它的语义
+// 是"不含 log 目标"，即只匹配 returnMax。log(returnMax) 与 returnMax 是同一结果的单调变换而非独立
+// 假设，同时计入会把多重比较校正的 m 无理由翻倍，拖累真字段的校正后 p，所以要看 log 目标得单独选。
+// 相关性表/Bootstrap CI 两处筛选逻辑共用这一条判断。
 function matchCorrTarget(c, target) {
-  return target === 'all' ? (c.target === 'returnCurrent' || c.target === 'returnMax') : c.target === target;
+  return target === 'all' ? c.target === 'returnMax' : c.target === target;
 }
 
 function computeCorrelations(rows) {
   const targets = [
-    { key: 'returnCurrent', get: r => r.returnCurrent },
     { key: 'returnMax', get: r => r.returnMax },
     // log 目标：收益倍数是重尾分布，原始尺度上的 Pearson r 容易被少数极端倍数主导；对数变换后
     // 分布更接近对称，Pearson/p 值/CI 都更稳健（Spearman 是秩相关，对单调变换不敏感，
     // log 前后 ρ 不变，所以 log 目标的意义主要在修正线性相关那一列）。收益倍数理论上 > 0，
     // 非正值（脏数据）直接记 NaN 不参与。
-    { key: 'logReturnCurrent', get: r => (Number.isFinite(r.returnCurrent) && r.returnCurrent > 0) ? Math.log(r.returnCurrent) : NaN },
     { key: 'logReturnMax', get: r => (Number.isFinite(r.returnMax) && r.returnMax > 0) ? Math.log(r.returnMax) : NaN }
   ];
   const featureKeys = new Set();
@@ -374,8 +480,8 @@ function computeCorrelations(rows) {
       if (distinctValues.size > 1) break;
     }
     if (distinctValues.size <= 1) { excluded.constant.push(fkey); continue; }
-    // 4 个目标（returnCurrent/Max + log 版本）共用同一份 v 有效性判断，之前是每个目标各自完整扫一遍
-    // rows（4 次全量扫描），改成扫一遍 rows、同时往 4 个 pairs 数组里分流，减少 75% 的行扫描次数——
+    // 2 个目标（returnMax + log 版本）共用同一份 v 有效性判断，之前是每个目标各自完整扫一遍
+    // rows，改成扫一遍 rows、同时往 2 个 pairs 数组里分流，减少一半的行扫描次数——
     // 字段数多、样本量大时（每次过滤/分析都会触发一次 computeCorrelations）这个常数因子有实际意义。
     const pairsByTarget = targets.map(() => []);
     for (const r of rows) {
@@ -473,9 +579,7 @@ function computeCorrelations(rows) {
 const ROW_LEVEL_FIELDS = ['symbol', 'signalType', 'id', 'token_address'];
 
 function getFeature(row, field) {
-  if (field === 'returnCurrent') return row.returnCurrent;
   if (field === 'returnMax') return row.returnMax;
-  if (field === 'logReturnCurrent') return (Number.isFinite(row.returnCurrent) && row.returnCurrent > 0) ? Math.log(row.returnCurrent) : undefined;
   if (field === 'logReturnMax') return (Number.isFinite(row.returnMax) && row.returnMax > 0) ? Math.log(row.returnMax) : undefined;
   if (field === 'token_address') return row.tokenAddress;
   if (ROW_LEVEL_FIELDS.includes(field)) return row[field];
@@ -484,7 +588,7 @@ function getFeature(row, field) {
 }
 
 function isNumericColumn(col) {
-  if (col === 'returnCurrent' || col === 'returnMax' || col === 'logReturnCurrent' || col === 'logReturnMax') return true;
+  if (col === 'returnMax' || col === 'logReturnMax') return true;
   if (ROW_LEVEL_FIELDS.includes(col)) return false;
   for (const r of matchedRows) {
     const v = getFeature(r, col);

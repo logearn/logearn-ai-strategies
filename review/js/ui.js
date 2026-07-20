@@ -44,10 +44,8 @@ function updateSummary() {
     </div>`;
     return;
   }
-  const cur = activeRows.map(r => r.returnCurrent);
   const mx = activeRows.map(r => r.returnMax);
-  const cs = calcStats(cur, 1);
-  const ms = calcStats(mx, 1);
+  const ms = calcStats(mx, WIN_THRESHOLD);
   const filterNote = activeRows.length !== matchedRows.length
     ? `<div class="stat-row-note">已应用全局过滤，原始 ${matchedRows.length} 条</div>` : '';
   // 观察窗口偏差检测：returnMax 的 max_mcap 只统计到导出时刻，观察时长太短的样本还没机会创出
@@ -81,9 +79,8 @@ function updateSummary() {
     <div class="stat-row">
       <div class="stat-tile"><div class="stat-label">匹配样本数</div><div class="stat-value accent">${activeRows.length}</div></div>
       <div class="stat-tile"><div class="stat-label" title="去重后的不同 token 个数；和样本数差距大说明存在同一 token 的重复信号">去重 token 数</div><div class="stat-value">${uniqueTokens || '-'}</div></div>
-      <div class="stat-tile"><div class="stat-label">returnCurrent 平均倍数</div><div class="stat-value">${cs.mean.toFixed(4)}x</div></div>
-      <div class="stat-tile"><div class="stat-label">胜率（倍数&gt;1）</div><div class="stat-value">${(cs.winRate * 100).toFixed(1)}%</div></div>
       <div class="stat-tile"><div class="stat-label">returnMax 平均倍数</div><div class="stat-value">${ms.mean.toFixed(4)}x</div></div>
+      <div class="stat-tile"><div class="stat-label">胜率（倍数&gt;2，翻倍）</div><div class="stat-value">${(ms.winRate * 100).toFixed(1)}%</div></div>
       <div class="stat-tile"><div class="stat-label">最大倍数</div><div class="stat-value">${ms.max.toFixed(4)}x</div></div>
       ${obsTile}
       ${filterNote}
@@ -316,12 +313,8 @@ function computeQualityAlerts(rows) {
   const alerts = [];
   for (const r of rows) {
     const reasons = [];
-    const rc = r.returnCurrent, rm = r.returnMax;
-    if (Number.isFinite(rc) && rc <= 0) reasons.push(`returnCurrent(${rc.toFixed(2)}x) ≤ 0，收益倍数理论上应该 > 0`);
+    const rm = r.returnMax;
     if (Number.isFinite(rm) && rm <= 0) reasons.push(`returnMax(${rm.toFixed(2)}x) ≤ 0，收益倍数理论上应该 > 0`);
-    if (Number.isFinite(rc) && Number.isFinite(rm) && rm < rc) {
-      reasons.push(`returnMax(${rm.toFixed(2)}x) 小于 returnCurrent(${rc.toFixed(2)}x)，逻辑矛盾（期间最大值不应小于当前值）`);
-    }
     // m5 窗口买卖金额量级异常：design doc §20.1 发现的真实数据笔误案例（少写小数点导致量级相差几个数量级）
     const buyM5 = getFeature(r, 'buy_wcoin_amount_m5'), sellM5 = getFeature(r, 'sell_wcoin_amount_m5');
     if (isFiniteNumber(buyM5) && isFiniteNumber(sellM5) && buyM5 > 0 && sellM5 > 0) {
@@ -519,11 +512,11 @@ function renderFieldQuality() {
 // 从字段质量表跳转到相关性表定位该字段：数值字段直接在相关性表里高亮对应行；
 // 分类字段本身不参与相关性计算（pearson 只对数值有意义），提示改去 Pro 分析的分组/分类视图看
 function jumpToCorrField(field) {
-  if (!scatterOptions.includes(field) && field !== 'returnCurrent' && field !== 'returnMax') {
+  if (!scatterOptions.includes(field) && field !== 'returnMax') {
     showToast('该字段是分类字段，不参与相关性计算；可以在下方“Pro 分析”里的“分组对比”或“分类字段分析”中查看。');
     return;
   }
-  document.getElementById('corrTarget').value = 'all';
+  document.getElementById('corrTarget').value = 'returnMax';
   document.getElementById('corrSource').value = 'all';
   document.getElementById('topN').value = '99999';
   renderCorrTable();
@@ -581,13 +574,13 @@ function attachAutocomplete(input, anchorEl, datalistId, onSelect) {
     const opts = getOptions().filter(o => !q || o.value.toLowerCase().includes(q) || o.label.toLowerCase().includes(q));
     // 常用字段排到最前面（Array.sort 是稳定排序，组内保持原有顺序不变），并单独高亮+打标，
     // 不用每次都从几十上百个字段里重新找"哪些是核实过靠谱的"
-    opts.sort((a, b) => (TRUSTED_FIELDS.has(b.value) ? 1 : 0) - (TRUSTED_FIELDS.has(a.value) ? 1 : 0));
+    opts.sort((a, b) => (isTrustedField(b.value) ? 1 : 0) - (isTrustedField(a.value) ? 1 : 0));
     if (!opts.length) {
       panel.innerHTML = '<div class="ac-empty">无匹配字段</div>';
     } else {
-      const trustedCount = opts.findIndex(o => !TRUSTED_FIELDS.has(o.value));
+      const trustedCount = opts.findIndex(o => !isTrustedField(o.value));
       panel.innerHTML = opts.slice(0, 300).map((o, i) => {
-        const trusted = TRUSTED_FIELDS.has(o.value);
+        const trusted = isTrustedField(o.value);
         // 常用字段和其余字段之间插一条分隔线，明确"上面是常用的，下面是其它"，避免用户以为
         // 排序乱了看不懂
         const divider = i > 0 && i === trustedCount ? '<div class="ac-divider">其它字段</div>' : '';
@@ -653,9 +646,9 @@ function getValidColorField() {
 let scatterSelectsInitialized = false;
 
 function updateScatterSelects() {
-  scatterOptions = ['returnCurrent', 'returnMax', 'logReturnCurrent', 'logReturnMax', ...allNumericKeys].filter(isNumericColumn);
+  scatterOptions = ['returnMax', 'logReturnMax', ...allNumericKeys].filter(isNumericColumn);
   const defaultX = scatterOptions.includes('buyer_count_d1') ? 'buyer_count_d1' :
-    scatterOptions.find(c => c !== 'returnCurrent' && c !== 'returnMax') || scatterOptions[0] || '';
+    scatterOptions.find(c => c !== 'returnMax') || scatterOptions[0] || '';
   const defaultY = scatterOptions.includes('returnMax') ? 'returnMax' : scatterOptions[0] || '';
   fillDatalist('xFieldList', scatterOptions);
   fillDatalist('yFieldList', scatterOptions);
@@ -811,14 +804,14 @@ function applyFilter() {
   const caTextarea = document.getElementById('filterCaText');
   caTextarea.value = caText;
   caTextarea.style.display = results.length ? 'block' : 'none';
-  const avgReturn = results.length ? (results.reduce((a, b) => a + b.returnCurrent, 0) / results.length).toFixed(4) : '-';
+  const avgReturn = results.length ? (results.reduce((a, b) => a + b.returnMax, 0) / results.length).toFixed(4) : '-';
   const usedConditionsNote = `已生效 ${conditions.length} 个条件`;
-  document.getElementById('filterStats').innerHTML = `命中 <b>${results.length}</b> / ${matchedRows.length} 条，平均 returnCurrent = <b>${avgReturn}</b> &nbsp; <span style="color:var(--text-muted)">（${usedConditionsNote}，已同步应用于上方相关性/总览/散点图/分箱图）</span>`;
+  document.getElementById('filterStats').innerHTML = `命中 <b>${results.length}</b> / ${matchedRows.length} 条，平均 returnMax = <b>${avgReturn}</b> &nbsp; <span style="color:var(--text-muted)">（${usedConditionsNote}，已同步应用于上方相关性/总览/散点图/分箱图）</span>`;
   document.getElementById('filterBody').innerHTML = results.length ? results.map(r => `
     <tr>
       <td>${escapeHtml(r.symbol || '')}</td>
       <td>${escapeHtml(r.tokenAddress || '')}</td>
-      <td class="num">${r.returnCurrent.toFixed(4)}x</td>
+      <td class="num">${r.returnMax.toFixed(4)}x</td>
       <td class="num">${conditions.map(c => { const v = getFeature(r, c.field); return `${escapeHtml(c.field)}: ${escapeHtml(typeof v === 'number' ? formatNumberSmart(v) : v)}`; }).join('<br>')}</td>
     </tr>
   `).join('') : `<tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:20px 12px;">没有满足条件的样本，试试放宽阈值</td></tr>`;
@@ -1107,7 +1100,17 @@ const TRUSTED_FIELDS = new Set([
   'gmgn.stat.top_rat_trader_percentage',
   'old_volume', 'new_volume', 'frequent_volume',
   'price_change_5m', 'price_change_1h', 'price_change_6h', 'price_change_1d',
+  'above_cost_line',
 ]);
+
+// "常用字段"的实际判定口径 = 上面这份手工核实过的原始字段清单 ∪ 全部组装字段（DERIVED_KEYS 里的
+// 比率/差值等衍生字段 + composite_score + 用户自定义字段）。组装字段之所以整体算常用：它们本来就是
+// 为了分析才专门造出来的（原始字段是数据源给什么就有什么，组装字段是有目的地挑出来的），没有
+// "需要人工筛一遍哪些靠谱"的问题。另外用户自定义字段是运行时动态增删的，写死进 TRUSTED_FIELDS
+// 这个静态 Set 也维护不了，只能靠 isAssembledField 动态判断。
+function isTrustedField(f) {
+  return TRUSTED_FIELDS.has(f) || isAssembledField(f);
+}
 
 function renderFieldBrowser() {
   const originalBox = document.getElementById('fieldBrowserOriginal');
@@ -1191,9 +1194,9 @@ function downloadCsv() {
   const featureKeys = [...new Set([
     ...scatterOptions,
     ...customFields.map(c => c.name),
-  ])].filter(f => f !== 'returnCurrent' && f !== 'returnMax' && !ROW_LEVEL_FIELDS.includes(f)).sort();
+  ])].filter(f => f !== 'returnMax' && !ROW_LEVEL_FIELDS.includes(f)).sort();
   const categoricalKeys = [...new Set(rows.flatMap(r => Object.keys(r.categorical || {})))].sort();
-  const cols = ['id','symbol','tokenAddress','signalType','initialMcap','currentMcap','maxMcap','returnCurrent','returnMax', ...featureKeys, ...categoricalKeys];
+  const cols = ['id','symbol','tokenAddress','signalType','initialMcap','currentMcap','maxMcap','returnMax', ...featureKeys, ...categoricalKeys];
   const lines = [cols.map(csvEscape).join(',')];
   for (const r of rows) {
     const row = cols.map(c => {
@@ -1201,7 +1204,7 @@ function downloadCsv() {
       if (c === 'symbol') return r.symbol;
       if (c === 'tokenAddress') return r.tokenAddress;
       if (c === 'signalType') return r.signalType;
-      if (['initialMcap','currentMcap','maxMcap','returnCurrent','returnMax'].includes(c)) return r[c];
+      if (['initialMcap','currentMcap','maxMcap','returnMax'].includes(c)) return r[c];
       if (categoricalKeys.includes(c)) return r.categorical && r.categorical[c] !== undefined ? r.categorical[c] : '';
       return r.features[c] === undefined || r.features[c] === null ? '' : r.features[c];
     });
@@ -1379,9 +1382,10 @@ document.getElementById('fieldBrowserAddAllAssembled').addEventListener('click',
 document.getElementById('fieldBrowserCopyOriginal').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.original));
 document.getElementById('fieldBrowserCopyAssembled').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.assembled));
 document.getElementById('loadTrustedFieldsBtn').addEventListener('click', async () => {
-  // TRUSTED_FIELDS 是全局的字段白名单，不是所有数据集都包含这些字段，按 scatterOptions（当前数据集
-  // 实际存在、可作为 X 轴的字段）过滤一遍，避免加进去一堆当前数据里根本没有的死字段
-  const fields = [...TRUSTED_FIELDS].filter(f => scatterOptions.includes(f));
+  // 直接从 scatterOptions（当前数据集实际存在、可作为 X 轴的字段）里筛，而不是遍历 TRUSTED_FIELDS
+  // 再过滤：一来避免加进去一堆当前数据里根本没有的死字段，二来组装字段（含用户自定义字段）本来就
+  // 只在 scatterOptions 里才有完整的一份
+  const fields = scatterOptions.filter(isTrustedField);
   if (!fields.length) { showToast('当前数据集里没有已核实过的常用字段（可能字段名对不上，或者还没加载数据）'); return; }
   const added = await addFieldsToX(fields);
   showToast(`已加入 ${fields.length} 个常用字段（新增 ${added}，其余之前已在列表中）`);
@@ -1603,10 +1607,8 @@ function describeCurrentFilter() {
 function saveCurrentSnapshot() {
   if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   const label = document.getElementById('snapshotLabelInput').value.trim() || `快照 ${analysisSnapshots.length + 1}`;
-  const cur = activeRows.map(r => r.returnCurrent);
   const mx = activeRows.map(r => r.returnMax);
-  const cs = calcStats(cur, 1);
-  const ms = calcStats(mx, 1);
+  const ms = calcStats(mx, WIN_THRESHOLD);
   const topByTarget = target => allCorrelations
     .filter(c => c.target === target)
     .slice()
@@ -1619,8 +1621,8 @@ function saveCurrentSnapshot() {
     savedAt: new Date().toISOString(),
     n: activeRows.length,
     filterDesc: describeCurrentFilter(),
-    summary: { meanCurrent: cs.mean, winRate: cs.winRate, meanMax: ms.mean, maxMax: ms.max },
-    topCorr: { returnCurrent: topByTarget('returnCurrent'), returnMax: topByTarget('returnMax') },
+    summary: { winRate: ms.winRate, meanMax: ms.mean, maxMax: ms.max },
+    topCorr: { returnMax: topByTarget('returnMax') },
   };
   analysisSnapshots.push(snapshot);
   saveAnalysisSnapshotsToStorage();
@@ -1668,10 +1670,10 @@ function compareSelectedSnapshots() {
   hintEl.textContent = `对比：「${a.label}」(${a.n}条, ${a.filterDesc}) vs 「${b.label}」(${b.n}条, ${b.filterDesc})`;
   wrap.classList.remove('hidden');
 
-  // 两份快照可能是不同 target（returnCurrent/returnMax）或字段结构不完全一致（比如数据结构升级新增字段），
+  // 两份快照的字段结构可能不完全一致（比如数据结构升级新增字段），
   // 用 Map 按字段名对齐，缺失的一侧显示"该快照中不存在此字段"而不是报错或留空造成误解
   const mapA = new Map(), mapB = new Map();
-  ['returnCurrent', 'returnMax'].forEach(t => {
+  ['returnMax'].forEach(t => {
     (a.topCorr[t] || []).forEach(c => mapA.set(`${t}|${c.feature}`, c.r));
     (b.topCorr[t] || []).forEach(c => mapB.set(`${t}|${c.feature}`, c.r));
   });
@@ -1820,9 +1822,8 @@ function saveBenchmarkIndexToStorage() {
 }
 
 function computeBenchmarkStats(rows) {
-  const s = calcStats(rows.map(r => r.returnCurrent), 1);
-  const m = calcStats(rows.map(r => r.returnMax), 1);
-  return { winRate: s.winRate, avgReturn: s.mean, medianReturn: s.median, avgReturnMax: m.mean, medianReturnMax: m.median };
+  const m = calcStats(rows.map(r => r.returnMax), WIN_THRESHOLD);
+  return { winRate: m.winRate, avgReturn: m.mean, medianReturn: m.median };
 }
 
 function createBenchmarkLibrary() {
@@ -2020,20 +2021,17 @@ async function compareAgainstBenchmark() {
     ? `<div class="hint" style="color:var(--warn, #ff9f0a); margin: 0 0 10px;">⚠️ 新数据样本量过小（n=${newRows.length} < 20），对比结果仅供参考。</div>` : '';
 
   const statsFn = arr => {
-    const s = calcStats(arr.map(r => r.returnCurrent), 1);
-    const m = calcStats(arr.map(r => r.returnMax), 1);
-    return { winRate: s.winRate, avgReturn: s.mean, medianReturn: s.median, avgReturnMax: m.mean, medianReturnMax: m.median };
+    const m = calcStats(arr.map(r => r.returnMax), WIN_THRESHOLD);
+    return { winRate: m.winRate, avgReturn: m.mean, medianReturn: m.median };
   };
   const diffs = bootstrapDiffCI(newRows, benchmarkRows, statsFn, BENCHMARK_BOOTSTRAP_B);
   const newStats = statsFn(newRows);
   const benchStats = statsFn(benchmarkRows);
 
   const rowsHtml = [
-    ['胜率（倍数>1）', newStats.winRate, benchStats.winRate, diffs && diffs.winRate, v => (v * 100).toFixed(1) + '%'],
-    ['returnCurrent 均值', newStats.avgReturn, benchStats.avgReturn, diffs && diffs.avgReturn, v => v.toFixed(4) + 'x'],
-    ['returnCurrent 中位数', newStats.medianReturn, benchStats.medianReturn, diffs && diffs.medianReturn, v => v.toFixed(4) + 'x'],
-    ['returnMax 均值', newStats.avgReturnMax, benchStats.avgReturnMax, diffs && diffs.avgReturnMax, v => v.toFixed(4) + 'x'],
-    ['returnMax 中位数', newStats.medianReturnMax, benchStats.medianReturnMax, diffs && diffs.medianReturnMax, v => v.toFixed(4) + 'x'],
+    ['胜率（倍数>2，翻倍）', newStats.winRate, benchStats.winRate, diffs && diffs.winRate, v => (v * 100).toFixed(1) + '%'],
+    ['returnMax 均值', newStats.avgReturn, benchStats.avgReturn, diffs && diffs.avgReturn, v => v.toFixed(4) + 'x'],
+    ['returnMax 中位数', newStats.medianReturn, benchStats.medianReturn, diffs && diffs.medianReturn, v => v.toFixed(4) + 'x'],
   ].map(([label, newV, benchV, ci, fmt]) => {
     const verdict = benchmarkVerdict(ci);
     const ciText = ci && Number.isFinite(ci.lo) ? `[${fmt(ci.lo)}, ${fmt(ci.hi)}]` : '-';
@@ -2127,11 +2125,9 @@ async function buildReportSections(options) {
   parts.push(`# 分析报告\n\n生成时间：${new Date().toLocaleString()}\n\n过滤条件：${describeCurrentFilter()}\n\n样本数：${activeRows.length}（原始 ${matchedRows.length} 条）\n`);
 
   if (options.summary && activeRows.length) {
-    const cur = activeRows.map(r => r.returnCurrent);
     const mx = activeRows.map(r => r.returnMax);
-    const cs = calcStats(cur, 1);
-    const ms = calcStats(mx, 1);
-    parts.push(`## 总览统计\n\n- returnCurrent 平均倍数：${cs.mean.toFixed(4)}x\n- 胜率（倍数>1）：${(cs.winRate * 100).toFixed(1)}%\n- returnMax 平均倍数：${ms.mean.toFixed(4)}x\n- 最大倍数：${ms.max.toFixed(4)}x\n`);
+    const ms = calcStats(mx, WIN_THRESHOLD);
+    parts.push(`## 总览统计\n\n- returnMax 平均倍数：${ms.mean.toFixed(4)}x\n- 胜率（倍数>2，翻倍）：${(ms.winRate * 100).toFixed(1)}%\n- 最大倍数：${ms.max.toFixed(4)}x\n`);
   }
 
   if (options.quality && activeRows.length) {

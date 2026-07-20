@@ -22,7 +22,7 @@ function readSplitOptions(prefix, extra = {}) {
 
 // "导入相关性表 Top10"按钮：从已计算好的 allCorrelations（按 |r| 降序排好）里取前 N 个不重复字段
 // 批量塞进某个字段标签选择器，四个 Pro 子面板（相关矩阵/ROC批量/相似Case/组合评分）共用同一套逻辑。
-// presetFields：调用前先固定加入的字段（如相关矩阵额外预填 returnCurrent/returnMax），可留空。
+// presetFields：调用前先固定加入的字段（如相关矩阵额外预填 returnMax），可留空。
 function wireImportTop10Btn(btnId, selector, presetFields = [], topN = 10) {
   document.getElementById(btnId).addEventListener('click', () => {
     if (!allCorrelations.length) { showToast('请先点击"分析"加载数据'); return; }
@@ -168,22 +168,21 @@ function renderSimilarCases(baseInputText, fields, k) {
 
   const missingNote = result.missingInBase.length
     ? `基准 token 的以下字段缺失，相似度计算未纳入这些维度：${result.missingInBase.join('、')}。` : '';
-  const rc = result.top.map(t => t.row.returnCurrent).filter(Number.isFinite);
+  const rc = result.top.map(t => t.row.returnMax).filter(Number.isFinite);
   const meanRc = rc.length ? rc.reduce((a, b) => a + b, 0) / rc.length : NaN;
   const winRate = rc.length ? rc.filter(v => v > 1).length / rc.length : NaN;
   summaryEl.innerHTML = `基准 token：<b>${escapeHtml(baseRow.symbol || baseRow.tokenAddress)}</b>，实际参与相似度计算的字段数：${result.usedFieldCount}/${fields.length}。`
     + (missingNote ? `<br>${escapeHtml(missingNote)}` : '')
-    + (result.top.length ? `<br>这 ${result.top.length} 个相似 case 的 returnCurrent 均值为 ${formatNumberSmart(meanRc)}x，胜率(&gt;1x)为 ${(winRate * 100).toFixed(1)}%。<span style="color:var(--text-muted)">（历史相似性参考，不是预测）</span>` : '');
+    + (result.top.length ? `<br>这 ${result.top.length} 个相似 case 的 returnMax 均值为 ${formatNumberSmart(meanRc)}x，胜率(&gt;1x)为 ${(winRate * 100).toFixed(1)}%。<span style="color:var(--text-muted)">（历史相似性参考，不是预测）</span>` : '');
 
   tbody.innerHTML = result.top.map(t => `
     <tr>
       <td>${escapeHtml(t.row.symbol || '-')}</td>
       <td class="ellip" title="${escapeHtml(t.row.tokenAddress || '')}">${escapeHtml(t.row.tokenAddress || '-')}</td>
       <td class="num">${t.dist.toFixed(4)}</td>
-      <td class="num">${Number.isFinite(t.row.returnCurrent) ? t.row.returnCurrent.toFixed(3) + 'x' : '-'}</td>
       <td class="num">${Number.isFinite(t.row.returnMax) ? t.row.returnMax.toFixed(3) + 'x' : '-'}</td>
     </tr>
-  `).join('') || '<tr><td colspan="5" style="text-align:center; color:var(--text-muted);">无匹配结果</td></tr>';
+  `).join('') || '<tr><td colspan="4" style="text-align:center; color:var(--text-muted);">无匹配结果</td></tr>';
 }
 
 function refreshSimilarBaseOptions() {
@@ -1112,7 +1111,7 @@ async function renderCatAnalysis(catField, breakpointsText, valueField, sigTestE
   // 汇总表里仍展示这些分类，但均值/中位数标注"样本过少，仅供参考"
   const MIN_SIG_N = 5;
   const rows = entries.map(([key, vals]) => {
-    const stats = calcStats(vals, 1);
+    const stats = calcStats(vals, WIN_THRESHOLD);
     return { key, n: stats.count, mean: stats.mean, median: stats.median, winRate: stats.winRate, vals, tooFew: stats.count < MIN_SIG_N };
   });
   document.getElementById('catAnalysisBody').innerHTML = rows.map(s => `
@@ -1234,6 +1233,348 @@ function renderRocBatch(fields, targetField, winThreshold) {
   `).join('');
 }
 
+// ---------- 8. CA 定位 & 过滤建议 ----------
+// 目标问题：手上有几个"想让未来的过滤规则排除掉"的 CA（比如事后看是坑的 token），
+// 想知道它们在"常用字段"上分别处于全量分布的什么位置，以及该往哪个字段加过滤条件、
+// 加多严的阈值，才能把这几个 CA 挡掉，同时尽量不误伤"好样本"（returnMax > 2，即翻倍）。
+//
+// 与 7.相似Case检索 的区别：那个是"给一个基准 token，找历史上像它的其它 token"；
+// 这个是"给几个已知目标 token，反推能挡住它们的过滤规则"，输出的是可直接抄进
+// 策略过滤条件的 字段+方向+阈值，而不是相似案例列表。
+
+// 按 token_address 优先、symbol 兜底，返回全部匹配行（同一个 CA 可能有多条 call 记录，
+// 全部纳入统计而不是只取第一条，避免"这个 CA 到底算高还是算低"因为漏看了其它记录而失真）。
+function findRowsByInput(text) {
+  const t = text.trim();
+  if (!t) return [];
+  const byAddr = activeRows.filter(r => r.tokenAddress === t);
+  if (byAddr.length) return byAddr;
+  return activeRows.filter(r => r.symbol === t);
+}
+
+// 二分查找 value 在已排序数组里的百分位排名（0~1，即 <= value 的比例）。
+function percentileRankOf(sortedVals, value) {
+  if (!sortedVals.length || !isFiniteNumber(value)) return NaN;
+  let lo = 0, hi = sortedVals.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sortedVals[mid] <= value) lo = mid + 1; else hi = mid;
+  }
+  return lo / sortedVals.length;
+}
+
+function renderCaAdvisor(caInputText, fields) {
+  const summaryEl = document.getElementById('caAdvisorSummary');
+  const posHead = document.getElementById('caAdvisorPosHead');
+  const posBody = document.getElementById('caAdvisorPosBody');
+  const advBody = document.getElementById('caAdvisorAdviceBody');
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  const inputs = [...new Set(caInputText.split(/[\n,，;；\s]+/).map(s => s.trim()).filter(Boolean))];
+  if (!inputs.length) { showToast('请输入至少一个 CA 或 symbol（换行/逗号/空格分隔均可）'); return; }
+  if (!fields.length) { showToast('请至少选择 1 个字段（可点“导入常用字段”或“导入相关性表 Top10”）'); return; }
+
+  const targetMap = new Map(); // input -> rows[]
+  const unmatched = [];
+  inputs.forEach(inp => {
+    const rows = findRowsByInput(inp);
+    if (!rows.length) unmatched.push(inp);
+    else targetMap.set(inp, rows);
+  });
+  if (!targetMap.size) {
+    summaryEl.innerHTML = `⚠️ 输入的 ${inputs.length} 个 CA/symbol 在当前工作集里都没有匹配到，请检查拼写，或者它们是否已被上方的全局过滤条件排除。`;
+    posHead.innerHTML = ''; posBody.innerHTML = ''; advBody.innerHTML = '';
+    return;
+  }
+
+  // 每个字段预排序好全量取值（用于百分位查找 + 过滤代价计算），只算一次复用给所有目标 CA。
+  const sortedByField = new Map();
+  fields.forEach(f => {
+    sortedByField.set(f, activeRows.map(r => getFeature(r, f)).filter(isFiniteNumber).sort((a, b) => a - b));
+  });
+  const winRows = activeRows.filter(r => isFiniteNumber(r.returnMax) && r.returnMax > WIN_THRESHOLD);
+
+  // ---- 定位表：每行 = 一条目标 CA 的匹配记录，每列 = 字段取值 + 百分位 ----
+  posHead.innerHTML = `<tr><th>symbol</th><th>token_address</th>${fields.map(f => `<th class="num">${escapeHtml(f)}</th>`).join('')}</tr>`;
+  const posRowsHtml = [];
+  targetMap.forEach(rows => {
+    rows.forEach(r => {
+      const cells = fields.map(f => {
+        const v = getFeature(r, f);
+        const pr = percentileRankOf(sortedByField.get(f), v);
+        if (!isFiniteNumber(v) || Number.isNaN(pr)) return '<td class="num" style="color:var(--text-muted);">缺失</td>';
+        const pct = Math.round(pr * 100);
+        const extreme = pct <= 10 || pct >= 90;
+        return `<td class="num"${extreme ? ' style="color:var(--accent); font-weight:600;"' : ''}>${formatNumberSmart(v)}（P${pct}）</td>`;
+      }).join('');
+      posRowsHtml.push(`<tr><td>${escapeHtml(r.symbol || '-')}</td><td class="ellip" title="${escapeHtml(r.tokenAddress || '')}">${escapeHtml(r.tokenAddress || '-')}</td>${cells}</tr>`);
+    });
+  });
+  posBody.innerHTML = posRowsHtml.join('') || '<tr><td colspan="99" style="text-align:center;color:var(--text-muted);">无匹配结果</td></tr>';
+
+  // ---- 过滤建议表：每个字段推荐一条能排除全部目标 CA 的规则，按"代价"（连带排除掉的好样本比例）升序排 ----
+  const allTargetRows = [...targetMap.values()].flat();
+  const adviceRows = fields.map(f => {
+    const sorted = sortedByField.get(f);
+    const tVals = allTargetRows.map(r => getFeature(r, f)).filter(isFiniteNumber);
+    if (!sorted.length || !tVals.length) return null;
+    const avgPr = tVals.reduce((a, v) => a + percentileRankOf(sorted, v), 0) / tVals.length;
+    // 目标值平均偏在分布高位 → 建议"小于阈值才保留"（挡住高值）；反之建议"大于阈值才保留"（挡住低值）
+    const dir = avgPr >= 0.5 ? 'high' : 'low';
+    const threshold = dir === 'high' ? Math.min(...tVals) : Math.max(...tVals);
+    const rule = `${f} ${dir === 'high' ? '<' : '>'} ${formatNumberSmart(threshold)}`;
+    const hitCount = dir === 'high' ? tVals.filter(v => v >= threshold).length : tVals.filter(v => v <= threshold).length;
+    const excludedAll = dir === 'high' ? sorted.filter(v => v >= threshold).length : sorted.filter(v => v <= threshold).length;
+    const cost = excludedAll / sorted.length;
+    const winVals = winRows.map(r => getFeature(r, f)).filter(isFiniteNumber);
+    let winCost = NaN;
+    if (winVals.length) {
+      const winExcluded = dir === 'high' ? winVals.filter(v => v >= threshold).length : winVals.filter(v => v <= threshold).length;
+      winCost = winExcluded / winVals.length;
+    }
+    return { field: f, rule, hitCount, total: tVals.length, cost, winCost };
+  }).filter(Boolean);
+  adviceRows.sort((a, b) => (Number.isFinite(a.winCost) ? a.winCost : a.cost) - (Number.isFinite(b.winCost) ? b.winCost : b.cost));
+
+  advBody.innerHTML = adviceRows.map(a => `
+    <tr>
+      <td>${escapeHtml(a.field)}</td>
+      <td><code>${escapeHtml(a.rule)}</code></td>
+      <td class="num">${a.hitCount}/${a.total}</td>
+      <td class="num">${(a.cost * 100).toFixed(1)}%</td>
+      <td class="num">${Number.isFinite(a.winCost) ? (a.winCost * 100).toFixed(1) + '%' : 'NA（无好样本可参照）'}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);">没有可用字段</td></tr>';
+
+  const matchedCount = allTargetRows.length;
+  summaryEl.innerHTML = `匹配到 ${targetMap.size}/${inputs.length} 个输入，共 ${matchedCount} 条记录，参与统计的字段 ${fields.length} 个。`
+    + (unmatched.length ? `<br>⚠️ 未匹配到：${escapeHtml(unmatched.join('、'))}（检查拼写或是否被全局过滤条件排除）。` : '')
+    + `<br>下方"过滤建议"按代价（该规则连带排除掉的好样本 returnMax&gt;2 的比例）从低到高排序，代价越低说明这条规则越"精准打击"目标 CA、越不容易误伤好样本。`;
+}
+
+// ---------- 8b. 策略诊断：把策略源码原样回放，看目标 CA 到底卡在哪一条 check ----------
+// 目标问题：上面的"过滤建议"是【反推】——从数据分布里找能挡住目标 CA 的阈值。但很多时候策略本来
+// 就已经上线跑了，真正想问的是【正推】：这个 CA 当时被我的策略拦了吗？卡在哪一条？实际值是多少？
+// 靠人肉读策略代码 + 翻快照 JSON 对答案非常慢且容易看错，所以这里直接把策略源码跑一遍。
+//
+// 依赖的约定（本仓库 强势盘/PVP/1.5段/苏醒接力 四个策略均遵守）：策略是一段以 ctx 为入参的函数体，
+// 内部构造 checks = [[名称, 是否通过, 实际值], ...]，然后 return true/false。
+// 这里不解析源码语义，只做两件事：把 checks 抓出来、把 ctx 的属性读取路径记下来。
+
+// 策略里的 checks 是函数内的局部变量，外部拿不到；把它的声明改写成对外部变量赋值，
+// 就能在策略 return 之后（try/finally 保证一定执行）把整张表捞出来。
+// 只改写第一处声明——四个策略都只有一个 checks 变量；万一改写没命中，回退到解析 ctx.log 的输出文本。
+const STRATEGY_CHECKS_DECL_RE = /\b(?:var|const|let)\s+checks\s*=/;
+const STRATEGY_CODE_STORAGE_KEY = 'chart_strategy_diag_code';
+
+// 历史回放的时间基准：策略里的年龄/新鲜度判断走 Date.now()，直接用浏览器当前时间的话，
+// 几个月前的样本会被算成"年龄几个月"，年龄类 check 全线失败，回放结果就没有意义了。
+// 把 Date 整个替换成"当下 = 快照抓取时刻"的版本（同时覆盖 Date.now() 和 new Date() 两种写法）。
+const RealDate = Date;
+function makeFrozenDate(nowMs) {
+  return class FrozenDate extends RealDate {
+    constructor(...args) { if (args.length === 0) super(nowMs); else super(...args); }
+    static now() { return nowMs; }
+  };
+}
+
+// 用 Proxy 递归包一层 ctx，把策略实际读到的属性路径记下来——这比正则扫源码可靠得多：
+// 策略普遍会先起别名（var ki = ctx.kline_and_indicators、var gmgnStat = ctx.gmgn.stat），
+// 正则只认 ctx.a.b 的写法就会大面积漏掉，而运行时记录拿到的是真正被读过的字段。
+function makeCtxRecorder(ctx, seen) {
+  const wrap = (val, path) => {
+    if (val === null || typeof val !== 'object') return val;
+    return new Proxy(val, {
+      get(target, prop, recv) {
+        const v = Reflect.get(target, prop, recv);
+        if (typeof prop === 'symbol') return v;
+        // 数组下标和数组方法不记路径（ao_bars[0].value 这种记成 ao_bars.value 才是有用的信息，
+        // 记成 ao_bars.0.value 只会把清单撑爆），但仍继续往下包，保证深层字段名能被记到。
+        const isIndexLike = typeof prop === 'string' && /^\d+$/.test(prop);
+        const nextPath = (isIndexLike || Array.isArray(target)) ? path : (path ? path + '.' + prop : prop);
+        if (!isIndexLike && !Array.isArray(target) && typeof v !== 'function' && nextPath) seen.add(nextPath);
+        if (typeof v === 'function') return v.bind(target);
+        return wrap(v, nextPath);
+      }
+    });
+  };
+  return wrap(ctx, '');
+}
+
+// 策略读到的原始 ctx 路径 → 本工具的字段名。对应 data.js 里 flattenObject/flattenCtx 的展开口径：
+// ctx.logearn.* 与 signal 同源，展开时不加前缀（所以 logearn.mcap → mcap）；
+// ctx.gmgn.* / ctx.kline_and_indicators.* 保留各自前缀。其余（native_coin_price 等）不进特征体系。
+function ctxPathToFieldName(path) {
+  if (path.startsWith('logearn.')) {
+    const name = path.slice('logearn.'.length);
+    // data.js 里 current_mcap/fdv 已作为冗余字段并进 mcap（65 条样本核实过三者完全相同），
+    // 工具里查不到这两个名字，映射时统一指向 mcap，否则会误报成"本工具没有这个字段"
+    return (name === 'current_mcap' || name === 'fdv') ? 'mcap' : name;
+  }
+  if (path.startsWith('gmgn.') || path.startsWith('kline_and_indicators.')) return path;
+  return null;
+}
+
+// 记录到的路径里既有叶子字段（gmgn.stat.bot_degen_rate）也有沿途的容器对象（gmgn、gmgn.stat）。
+// 容器是访问叶子时顺带记下的，本身不是"策略用到的字段"，展示出来只会稀释清单。
+// 判定：某条路径如果是另一条路径的前缀，就是容器，丢掉。
+function dropContainerPaths(paths) {
+  // log 是回放时自己注入的 ctx.log 打桩，不是快照里的数据字段，别混进"策略用到的字段"清单
+  const list = [...paths].filter(p => p !== 'log' && !p.startsWith('log.'));
+  return list.filter(p => !list.some(q => q !== p && q.startsWith(p + '.')));
+}
+
+function compileStrategy(src) {
+  // 只去掉声明关键字（var/const/let），变量名仍然叫 checks——策略后面还会用 checks.every(...)
+  // 之类引用它，改名会直接 ReferenceError。配合在最外层预声明一个 checks，就把它从"try 块内的
+  // 局部变量"提升成了"整个函数体可见"，finally 里才拿得到（const/let 是块级作用域，
+  // 不这么改的话 PVP 那种 `const checks = [...]` 在 finally 里根本不可见）。
+  const capturedDecl = STRATEGY_CHECKS_DECL_RE.test(src);
+  const rewritten = src.replace(STRATEGY_CHECKS_DECL_RE, 'checks =');
+  // try/finally：策略未命中时会中途 return false，finally 保证 checks 仍然被交出来
+  const body = `let checks = null;\ntry {\n${rewritten}\n} finally { __emit(checks); }`;
+  let fn;
+  try {
+    fn = new Function('ctx', 'Date', '__emit', body);
+  } catch (e) {
+    return { error: `策略代码语法错误：${e.message}` };
+  }
+  return { fn, capturedDecl };
+}
+
+// 单行回放。返回 { passed, checks, logs, error, usedPaths }
+function runStrategyOnRow(compiled, row) {
+  if (!row.rawCtx) return { error: '该样本没有原始 ctx（快照数据缺失），无法回放策略' };
+  const seen = new Set();
+  const logs = [];
+  let captured = null;
+  // ctx.log 是平台注入的，快照里没有，得自己补；同时 ctx 用浅拷贝，避免策略往里写东西污染原始快照
+  const logShim = {
+    error: (...a) => logs.push({ level: 'error', text: a.join(' ') }),
+    success: (...a) => logs.push({ level: 'success', text: a.join(' ') }),
+    info: (...a) => logs.push({ level: 'info', text: a.join(' ') }),
+    warn: (...a) => logs.push({ level: 'warn', text: a.join(' ') }),
+  };
+  const baseCtx = Object.assign({}, row.rawCtx, { log: logShim });
+  const nowMs = Number.isFinite(row.buyTimestamp) ? row.buyTimestamp * 1000 : RealDate.now();
+  let passed, error = null;
+  try {
+    passed = compiled.fn(makeCtxRecorder(baseCtx, seen), makeFrozenDate(nowMs), c => { captured = c; });
+  } catch (e) {
+    error = `${e.name}: ${e.message}`;
+  }
+  // checks 没抓到（策略写法不符合约定）时，回退到 ctx.log 里那条"未命中 ... | 失败:xxx"文本，
+  // 至少还能把失败原因原样展示出来，而不是整个功能失效
+  const checks = Array.isArray(captured)
+    ? captured.map(c => ({ name: String(c[0]), ok: !!c[1], value: c[2] === undefined ? '' : String(c[2]) }))
+    : null;
+  return { passed: !!passed, checks, logs, error, usedPaths: seen, nowMs };
+}
+
+function renderStrategyDiag(caInputText, src) {
+  const summaryEl = document.getElementById('strategyDiagSummary');
+  const fieldsEl = document.getElementById('strategyDiagFields');
+  const body = document.getElementById('strategyDiagBody');
+  if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
+  if (!src.trim()) { showToast('请先粘贴策略代码（以 ctx 为入参、内部构造 checks 数组的那段）'); return; }
+  const inputs = [...new Set(caInputText.split(/[\n,，;；\s]+/).map(s => s.trim()).filter(Boolean))];
+  if (!inputs.length) { showToast('请在上方"目标 CA / symbol"里输入至少一个 CA'); return; }
+
+  const compiled = compileStrategy(src);
+  if (compiled.error) {
+    summaryEl.innerHTML = `⚠️ ${escapeHtml(compiled.error)}`;
+    fieldsEl.innerHTML = ''; body.innerHTML = '';
+    return;
+  }
+
+  const unmatched = [];
+  const results = [];   // { input, row, res }
+  inputs.forEach(inp => {
+    const rows = findRowsByInput(inp);
+    if (!rows.length) { unmatched.push(inp); return; }
+    rows.forEach(row => results.push({ input: inp, row, res: runStrategyOnRow(compiled, row) }));
+  });
+  if (!results.length) {
+    summaryEl.innerHTML = `⚠️ 输入的 ${inputs.length} 个 CA/symbol 在当前工作集里都没有匹配到，请检查拼写，或者它们是否已被上方的全局过滤条件排除。`;
+    fieldsEl.innerHTML = ''; body.innerHTML = '';
+    return;
+  }
+
+  // ---- 策略用到的字段：把每行回放期间记录到的 ctx 路径并起来 ----
+  const allPaths = new Set();
+  results.forEach(({ res }) => (res.usedPaths || new Set()).forEach(p => allPaths.add(p)));
+  const fieldRows = dropContainerPaths(allPaths).sort().map(p => {
+    const mapped = ctxPathToFieldName(p);
+    // 映射得到的字段名在不在 scatterOptions 里，决定了它能不能拿去做散点图/过滤条件/相关性分析
+    const inTool = mapped && scatterOptions.includes(mapped);
+    return { path: p, mapped, inTool };
+  });
+  const usableCount = fieldRows.filter(f => f.inTool).length;
+  fieldsEl.innerHTML = `
+    <div class="hint" style="margin: 0 0 6px;">策略回放期间实际读到的 ctx 字段共 ${fieldRows.length} 个，其中 ${usableCount} 个在本工具里有对应字段（可直接拿去做散点图/相关性/过滤条件）。<span style="color:var(--text-muted)">这是运行时记录的真实读取路径，不是正则扫源码，策略里起了别名也能抓到。</span></div>
+    <div class="table-scroll" style="max-height: 260px;">
+      <table class="desc-table">
+        <thead><tr><th>策略读取的 ctx 路径</th><th>本工具字段名</th><th>可用于分析</th></tr></thead>
+        <tbody>${fieldRows.map(f => `
+          <tr>
+            <td><code>ctx.${escapeHtml(f.path)}</code></td>
+            <td>${f.mapped ? escapeHtml(f.mapped) : '<span style="color:var(--text-muted)">—</span>'}</td>
+            <td>${f.inTool ? '<span style="color:var(--ok,#30d158)">是</span>' : '<span style="color:var(--text-muted)">否</span>'}</td>
+          </tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+
+  // ---- 逐个目标 CA：命中/未命中 + 卡在哪几条 check ----
+  body.innerHTML = results.map(({ input, row, res }) => {
+    const title = `${escapeHtml(row.symbol || input)} <span style="color:var(--text-muted); font-size:12px;">${escapeHtml(row.tokenAddress || '')}</span>`;
+    if (res.error) {
+      return `<div class="strategy-diag-card">
+        <div class="strategy-diag-head">${title} <span class="tag" style="background:rgba(255,69,58,.18);">回放报错</span></div>
+        <div class="hint" style="margin:6px 0 0; color:var(--danger,#ff453a);">${escapeHtml(res.error)}</div>
+        <div class="hint" style="margin:4px 0 0;">常见原因：策略用到了平台注入、但快照里没有的 ctx 字段。</div>
+      </div>`;
+    }
+    if (!res.checks) {
+      const logText = res.logs.map(l => l.text).join('\n');
+      return `<div class="strategy-diag-card">
+        <div class="strategy-diag-head">${title} <span class="tag">${res.passed ? '命中' : '未命中'}</span></div>
+        <div class="hint" style="margin:6px 0 0;">没能从策略里抓到 checks 数组（策略写法与约定不同），下面是策略自己打的日志：</div>
+        <pre class="strategy-diag-log">${escapeHtml(logText || '（无日志输出）')}</pre>
+      </div>`;
+    }
+    const failed = res.checks.filter(c => !c.ok);
+    const badge = res.passed
+      ? '<span class="tag" style="background:rgba(48,209,88,.18);">命中（策略不会拦它）</span>'
+      : `<span class="tag" style="background:rgba(255,69,58,.18);">未命中，卡在 ${failed.length} 条</span>`;
+    const replayTime = Number.isFinite(res.nowMs) ? new RealDate(res.nowMs).toLocaleString() : '-';
+    return `<div class="strategy-diag-card">
+      <div class="strategy-diag-head">${title} ${badge}</div>
+      <div class="hint" style="margin:6px 0 8px;">回放基准时刻（= 快照抓取时刻）：${escapeHtml(replayTime)}；returnMax = ${isFiniteNumber(row.returnMax) ? row.returnMax.toFixed(3) + 'x' : '-'}</div>
+      <table class="desc-table">
+        <thead><tr><th style="width:34px;"></th><th>check</th><th>实际值</th></tr></thead>
+        <tbody>${res.checks.map(c => `
+          <tr${c.ok ? '' : ' style="background:rgba(255,69,58,.08);"'}>
+            <td>${c.ok ? '<span style="color:var(--ok,#30d158)">✓</span>' : '<span style="color:var(--danger,#ff453a)">✗</span>'}</td>
+            <td>${escapeHtml(c.name)}</td>
+            <td><code>${escapeHtml(c.value)}</code></td>
+          </tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+  }).join('');
+
+  // ---- 汇总：哪条 check 拦掉的目标 CA 最多 ----
+  const blockCount = new Map();
+  results.forEach(({ res }) => (res.checks || []).filter(c => !c.ok).forEach(c => {
+    blockCount.set(c.name, (blockCount.get(c.name) || 0) + 1);
+  }));
+  const ranked = [...blockCount.entries()].sort((a, b) => b[1] - a[1]);
+  const passedCount = results.filter(r => !r.error && r.passed).length;
+  const errorCount = results.filter(r => r.error).length;
+  summaryEl.innerHTML = `回放 ${results.length} 条记录：命中 ${passedCount} 条，未命中 ${results.length - passedCount - errorCount} 条${errorCount ? `，报错 ${errorCount} 条` : ''}。`
+    + (unmatched.length ? `<br>⚠️ 未匹配到：${escapeHtml(unmatched.join('、'))}（检查拼写或是否被全局过滤条件排除）。` : '')
+    + (ranked.length ? `<br>拦得最多的 check：${ranked.slice(0, 5).map(([n, c]) => `<b>${escapeHtml(n)}</b>(${c}条)`).join('、')}。` : '')
+    + `<br><span style="color:var(--text-muted)">注意：回放用的是【买入时刻快照】里的 ctx，而策略上线时读的是实时数据，两者在时间上对齐但数据源可能有细微差异；另外这里只跑了目标 CA，不代表策略在全量样本上的表现。</span>`;
+}
+
 // ---------- 初始化：各 section 的输入联想/按钮绑定 ----------
 function initProAnalytics() {
   const corrMatrixSelector = makeFieldTagSelector('corrMatrixInput', 'corrMatrixTagBox');
@@ -1242,9 +1583,9 @@ function initProAnalytics() {
     Number(document.getElementById('corrMatrixThreshold').value),
     document.getElementById('corrMatrixHighlight').checked
   ));
-  // 默认预填"相关性表 Top10 字段 + returnCurrent + returnMax"——从当前已计算好的 allCorrelations 里取
+  // 默认预填"相关性表 Top10 字段 + returnMax"——从当前已计算好的 allCorrelations 里取
   // |r| 最大的前 10 个不重复字段（allCorrelations 本身已按 |r| 降序排好，直接取前几个去重即可）
-  wireImportTop10Btn('importTop10CorrBtn', corrMatrixSelector, ['returnCurrent', 'returnMax']);
+  wireImportTop10Btn('importTop10CorrBtn', corrMatrixSelector, ['returnMax']);
 
   const importanceSelector = makeFieldTagSelector('importanceInput', 'importanceTagBox');
   document.getElementById('genImportanceBtn').addEventListener('click', () => {
@@ -1362,6 +1703,40 @@ function initProAnalytics() {
       similarFieldsSelector.getSelected(),
       Number(document.getElementById('similarK').value)
     );
+  });
+
+  const caAdvisorSelector = makeFieldTagSelector('caAdvisorFieldsInput', 'caAdvisorFieldsTagBox');
+  wireImportTop10Btn('importCaAdvisorTop10Btn', caAdvisorSelector);
+  document.getElementById('loadCaAdvisorTrustedBtn').addEventListener('click', () => {
+    const fields = scatterOptions.filter(isTrustedField);
+    if (!fields.length) { showToast('当前数据集里没有已核实过的常用字段'); return; }
+    let added = 0;
+    fields.forEach(f => { if (!caAdvisorSelector.getSelected().includes(f)) { caAdvisorSelector.addField(f); added++; } });
+    showToast(`已加入 ${fields.length} 个常用字段（新增 ${added}，其余之前已在列表中）`);
+  });
+  document.getElementById('genCaAdvisorBtn').addEventListener('click', () => {
+    renderCaAdvisor(
+      document.getElementById('caAdvisorInput').value,
+      caAdvisorSelector.getSelected()
+    );
+  });
+
+  // 策略诊断复用同一个"目标 CA"输入框——问的是同一批 CA 的两个问题：
+  // 上面是"该加什么规则才能挡住它们"，这里是"现有策略当时到底拦没拦住、卡在哪"
+  document.getElementById('genStrategyDiagBtn').addEventListener('click', () => {
+    renderStrategyDiag(
+      document.getElementById('caAdvisorInput').value,
+      document.getElementById('strategyCodeInput').value
+    );
+  });
+  // 策略代码通常是从编辑器里粘过来的一大段，每次切换页面都要重贴太折腾，存本地
+  const strategyCodeEl = document.getElementById('strategyCodeInput');
+  try {
+    const saved = localStorage.getItem(STRATEGY_CODE_STORAGE_KEY);
+    if (saved) strategyCodeEl.value = saved;
+  } catch (e) {}
+  strategyCodeEl.addEventListener('change', () => {
+    try { localStorage.setItem(STRATEGY_CODE_STORAGE_KEY, strategyCodeEl.value); } catch (e) {}
   });
 }
 

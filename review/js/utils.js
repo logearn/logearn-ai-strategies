@@ -163,6 +163,12 @@ function pearson(pairs) {
   return denominator ? numerator / denominator : 0;
 }
 
+// "赢"的统一口径：returnMax > 2，即期间最高点相对买入至少翻倍（+100%）。
+// 为什么不是 > 1：returnMax 是【期间最大倍数】，只要买入后任何一刻高于买入价就 > 1，
+// 几乎所有样本都能满足，胜率会虚高到没有区分度。翻倍才算赢，胜率这个指标才有信息量。
+// 改这个值会同时影响：总览胜率、分类字段分析的分组胜率、基准库对比、CA 定位里"好样本"的定义。
+const WIN_THRESHOLD = 2;
+
 function calcStats(arr, winThreshold = 0) {
   const sorted = arr.slice().sort((a, b) => a - b);
   const n = sorted.length;

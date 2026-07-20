@@ -139,11 +139,10 @@ async function makeMinimalCallSnapshot() {
   };
   return { call, snapshot };
 }
-await testAsync('buildRows: 正常样本应正确匹配并计算 returnCurrent/returnMax', async () => {
+await testAsync('buildRows: 正常样本应正确匹配并计算 returnMax', async () => {
   const { call, snapshot } = await makeMinimalCallSnapshot();
   const rows = await sandbox.buildRows([call], [snapshot]);
   assert.strictEqual(rows.length, 1);
-  assert.strictEqual(rows[0].returnCurrent, 2); // 200/100
   assert.strictEqual(rows[0].returnMax, 3); // 300/100
   assert.ok(Math.abs(rows[0].features['buy_sell_amount_ratio'] - 2) < 1e-9); // 10/5
 });
@@ -188,6 +187,109 @@ await testAsync('buildRows: last_alert_low_lower_than_pre_low 在缺少 pre_low_
   const rows = await sandbox.buildRows([call], [snapshot]);
   assert.strictEqual(rows[0].features.last_alert_low_lower_than_pre_low, undefined);
 });
+await testAsync('buildRows: v_turn_current_stage_pct 应取最新生效 V 转信号已突破的最高阶段', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.v_breakout_volume_list = [
+    { n_pattern_confirmed: true, signalTime: 100, fibon_break1: 1, fibon_break2: 1, fibon_break3: 0, fibon_break4: 0 },
+    { n_pattern_confirmed: true, signalTime: 200, fibon_break1: 1, fibon_break2: 0, fibon_break3: 0, fibon_break4: 0 }, // 更新的信号，只到20%
+  ];
+  const rows = await sandbox.buildRows([call], [snapshot]);
+  assert.strictEqual(rows[0].features.v_turn_current_stage_pct, 20);
+});
+await testAsync('buildRows: v_turn_current_stage_pct 应在仅回撤确认、还未反弹时记为 0', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.v_breakout_volume_list = [
+    { n_pattern_confirmed: true, signalTime: 100, fibon_break1: 0, fibon_break2: 0, fibon_break3: 0, fibon_break4: 0 },
+  ];
+  const rows = await sandbox.buildRows([call], [snapshot]);
+  assert.strictEqual(rows[0].features.v_turn_current_stage_pct, 0);
+});
+await testAsync('buildRows: v_turn_current_stage_pct 在已反弹突破前高（fibon_break4，已收尾）时不应参与', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.v_breakout_volume_list = [
+    { n_pattern_confirmed: true, signalTime: 100, fibon_break1: 1, fibon_break2: 1, fibon_break3: 1, fibon_break4: 1 },
+  ];
+  const rows = await sandbox.buildRows([call], [snapshot]);
+  assert.strictEqual(rows[0].features.v_turn_current_stage_pct, undefined);
+});
+await testAsync('buildRows: v_turn_break_cost_line_duration_min 应按跌破/涨破成本价之间的K线根数×resolution换算成分钟', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  // 回撤高点 top_price_time=100，对应成本价从 avg_price_bars 回溯取到 60；
+  // kline_bars（newest first）从 100 开始：100(70,>=60未跌破) 105(50,跌破,计数开始) 110(55,仍<60)
+  // 115(65,涨破,结束，不计入)。跌破期间经历 2 根K线（105、110），resolution=5s → 2*5/60 分钟。
+  snapshot.signal.v_breakout_volume_list = [
+    { n_pattern_confirmed: true, signalTime: 90, top_price_time: 100, fibon_break4: 0 },
+  ];
+  snapshot.ctx.kline_and_indicators = {
+    resolution: 5,
+    current_avg_price: 60,
+    avg_price_bars: [{ time: 100, value: 60 }],
+    kline_bars: [
+      { time: 115, close: 65 },
+      { time: 110, close: 55 },
+      { time: 105, close: 50 },
+      { time: 100, close: 70 },
+    ],
+  };
+  const rows = await sandbox.buildRows([call], [snapshot]);
+  assert.ok(Math.abs(rows[0].features.v_turn_break_cost_line_duration_min - (2 * 5 / 60)) < 1e-9);
+});
+await testAsync('buildRows: v_turn_break_cost_line_duration_min 在跌破后到快照时刻仍未涨破（尚未走完）时不应参与', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.v_breakout_volume_list = [
+    { n_pattern_confirmed: true, signalTime: 90, top_price_time: 100, fibon_break4: 0 },
+  ];
+  snapshot.ctx.kline_and_indicators = {
+    resolution: 5,
+    current_avg_price: 60,
+    avg_price_bars: [{ time: 100, value: 60 }],
+    kline_bars: [
+      { time: 110, close: 55 }, // 仍在成本价以下，还没涨破
+      { time: 105, close: 50 },
+      { time: 100, close: 70 },
+    ],
+  };
+  const rows = await sandbox.buildRows([call], [snapshot]);
+  assert.strictEqual(rows[0].features.v_turn_break_cost_line_duration_min, undefined);
+});
+await testAsync('buildRows: above_cost_line/cost_line_distance_pct 应在 mcap 高于成本线时记为 1 且距离为正', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.mcap = 150;
+  snapshot.ctx.kline_and_indicators = { current_avg_price: 100 };
+  const rows = await sandbox.buildRows([call], [snapshot]);
+  assert.strictEqual(rows[0].features.above_cost_line, 1);
+  assert.ok(Math.abs(rows[0].features.cost_line_distance_pct - 50) < 1e-9); // (150-100)/100*100
+});
+await testAsync('buildRows: above_cost_line 应在 mcap 低于成本线时记为 0', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.mcap = 80;
+  snapshot.ctx.kline_and_indicators = { current_avg_price: 100 };
+  const rows = await sandbox.buildRows([call], [snapshot]);
+  assert.strictEqual(rows[0].features.above_cost_line, 0);
+});
+await testAsync('buildRows: v_turn_low_cost_line_distance_pct 应按最低点发生时间从 avg_price_bars 回溯取成本线', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.mcap = 150;
+  snapshot.signal.last_alert = { low_price_mcap: 90, low_price_time: 500 };
+  snapshot.ctx.kline_and_indicators = {
+    current_avg_price: 100, // 快照时刻的成本线，不应被用到（低点发生在更早的时间）
+    avg_price_bars: [
+      { time: 900, value: 100 }, // newest first
+      { time: 400, value: 60 },  // <= 500，应取这一根
+      { time: 100, value: 50 },
+    ],
+  };
+  const rows = await sandbox.buildRows([call], [snapshot]);
+  assert.ok(Math.abs(rows[0].features.v_turn_low_cost_line_distance_pct - 50) < 1e-9); // (90-60)/60*100
+});
+await testAsync('buildRows: v_turn_low_cost_line_distance_pct 在 avg_price_bars 里找不到历史 bar 时应退回当前成本线', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.mcap = 150;
+  snapshot.signal.last_alert = { low_price_mcap: 90, low_price_time: 500 };
+  snapshot.ctx.kline_and_indicators = { current_avg_price: 100, avg_price_bars: [] };
+  const rows = await sandbox.buildRows([call], [snapshot]);
+  assert.ok(Math.abs(rows[0].features.v_turn_low_cost_line_distance_pct - (-10)) < 1e-9); // (90-100)/100*100
+});
 
 // ---------- pearson / linearRegression / percentile ----------
 test('pearson: 完全正相关数据 r 应为 1', () => {
@@ -212,45 +314,47 @@ test('percentile: 中位数应等于排序后数组的中间值', () => {
   const sorted = [1, 2, 3, 4, 5];
   assert.strictEqual(sandbox.percentile(sorted, 0.5), 3);
 });
+test('WIN_THRESHOLD: "赢"的口径应是 returnMax > 2（翻倍），不是 > 1', () => {
+  // returnMax 是期间最大倍数，>1 只要买入后任何一刻高于买入价就成立，几乎全样本命中、胜率没区分度；
+  // 这条锁住"翻倍才算赢"的口径，避免以后有人手滑把阈值改回 1
+  assert.strictEqual(ctxEval('WIN_THRESHOLD'), 2);
+});
+test('calcStats: winRate 应按 winThreshold 严格大于计数（等于阈值不算赢）', () => {
+  const s = sandbox.calcStats([0.5, 1.5, 2, 2.5, 10], ctxEval('WIN_THRESHOLD'));
+  assert.strictEqual(s.positive, 2); // 只有 2.5 和 10 严格大于 2；2 本身不算
+  assert.ok(Math.abs(s.winRate - 0.4) < 1e-9);
+});
 test('spearman: 单调但非线性关系应得到 ρ=1（Pearson r 会明显小于1）', () => {
   const pairs = [[1, 1], [2, 4], [3, 9], [4, 16]]; // y = x^2，单调递增但非线性
   assert.ok(Math.abs(sandbox.spearman(pairs) - 1) < 1e-9);
 });
 
 // ---------- #6 log 目标（getFeature） ----------
-test('getFeature: logReturnCurrent/logReturnMax 应返回自然对数值', () => {
-  const row = { returnCurrent: Math.E, returnMax: Math.E * Math.E, features: {}, categorical: {} };
-  assert.ok(Math.abs(sandbox.getFeature(row, 'logReturnCurrent') - 1) < 1e-9);
+test('getFeature: logReturnMax 应返回自然对数值', () => {
+  const row = { returnMax: Math.E * Math.E, features: {}, categorical: {} };
   assert.ok(Math.abs(sandbox.getFeature(row, 'logReturnMax') - 2) < 1e-9);
 });
-test('getFeature: returnCurrent/returnMax 非正值（脏数据）的 log 目标应返回 undefined，不参与计算', () => {
-  const row = { returnCurrent: 0, returnMax: -1, features: {}, categorical: {} };
-  assert.strictEqual(sandbox.getFeature(row, 'logReturnCurrent'), undefined);
+test('getFeature: returnMax 非正值（脏数据）的 log 目标应返回 undefined，不参与计算', () => {
+  const row = { returnMax: -1, features: {}, categorical: {} };
   assert.strictEqual(sandbox.getFeature(row, 'logReturnMax'), undefined);
 });
 
-// ---------- computeCorrelations（性能优化：4 次行扫描合并为 1 次后的正确性回归） ----------
+// ---------- computeCorrelations（性能优化：多次行扫描合并为 1 次后的正确性回归） ----------
 test('computeCorrelations: 合并行扫描后仍应对每个目标（含 log 目标）算出正确的 r 和 n', () => {
-  // x 与 returnMax 完全正相关；returnCurrent 故意在一行留空，验证每个目标的有效样本集合互相独立
-  const rows = [
-    { returnCurrent: 2, returnMax: 2, features: { x: 1 }, categorical: {} },
-    { returnCurrent: undefined, returnMax: 4, features: { x: 2 }, categorical: {} },
-    { returnCurrent: 8, returnMax: 8, features: { x: 4 }, categorical: {} },
-    { returnCurrent: 16, returnMax: 16, features: { x: 8 }, categorical: {} },
-    { returnCurrent: 32, returnMax: 32, features: { x: 16 }, categorical: {} },
-    { returnCurrent: 64, returnMax: 64, features: { x: 32 }, categorical: {} },
-  ];
+  // x 与 log(returnMax) 完全正相关；最后一行 returnMax 为负（脏数据），returnMax 目标仍收下它，
+  // log 目标则跳过，用来验证两个目标的有效样本集合互相独立、不会因为合并扫描而串味
+  const rows = [1, 2, 3, 4, 5, 6].map(k => ({
+    returnMax: Math.exp(k), features: { x: k }, categorical: {}
+  }));
+  rows.push({ returnMax: -1, features: { x: 7 }, categorical: {} });
   const list = sandbox.computeCorrelations(rows);
   const rm = list.find(c => c.target === 'returnMax' && c.feature === 'x');
-  const rc = list.find(c => c.target === 'returnCurrent' && c.feature === 'x');
   const logRm = list.find(c => c.target === 'logReturnMax' && c.feature === 'x');
   assert.ok(rm, 'returnMax 应有 x 的相关性结果');
-  assert.strictEqual(rm.n, 6);
-  assert.ok(Math.abs(rm.r - 1) < 1e-9);
-  assert.ok(rc, 'returnCurrent 应有 x 的相关性结果');
-  assert.strictEqual(rc.n, 5); // 有一行 returnCurrent 缺失，不应污染其它目标的 n
+  assert.strictEqual(rm.n, 7);
   assert.ok(logRm, 'logReturnMax 应有 x 的相关性结果');
-  assert.strictEqual(logRm.n, 6);
+  assert.strictEqual(logRm.n, 6); // 有一行 returnMax 非正，log 目标不应收下它
+  assert.ok(Math.abs(logRm.r - 1) < 1e-9);
 });
 
 // ---------- #9 锁定切分（mulberry32 / splitTrainTest） ----------

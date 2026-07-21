@@ -97,7 +97,8 @@ function makeFieldTagSelector(inputId, tagBoxId) {
 
   return {
     getSelected: () => selected,
-    addField: f => { if (scatterOptions.includes(f) && !selected.includes(f)) { selected.push(f); render(); } }
+    addField: f => { if (scatterOptions.includes(f) && !selected.includes(f)) { selected.push(f); render(); } },
+    clear: () => { const n = selected.length; selected = []; render(); return n; }
   };
 }
 
@@ -245,6 +246,10 @@ function renderCorrMatrix(fields, threshold, onlyHighlight) {
   }), { responsive: true });
 
   const chartEl = document.getElementById('corrMatrixChart');
+  // 这里每次渲染都重新绑定（不像散点图那样做过"只绑一次"的缓存），本身不会丢监听器；
+  // 加一道 removeAllListeners 是防重复累积——实测 Plotly 2.27 的 newPlot 会清掉旧监听器，
+  // 但不依赖这个实现细节更稳妥，否则一次点击可能触发多次跳转。
+  if (typeof chartEl.removeAllListeners === 'function') chartEl.removeAllListeners('plotly_click');
   chartEl.on('plotly_click', evt => {
     const p = evt.points && evt.points[0];
     if (!p || p.x === p.y) return;
@@ -911,7 +916,7 @@ function applyCompositeScore() {
     else delete r.features.composite_score;
   }
   FIELD_DESC['composite_score'] = `组合评分：基于字段 ${lastCompositeSpec.fields.map(f => f.field).join('、')} 在训练集上确定方向/权重后合成（目标 ${lastCompositeSpec.targetField}）`;
-  allNumericKeys = [...new Set([...matchedRows.flatMap(r => Object.keys(r.features)), ...DERIVED_KEYS, ...customFields.map(c => c.name)])].sort();
+  allNumericKeys = [...new Set([...matchedRows.flatMap(r => Object.keys(r.features)), ...DERIVED_KEYS, ...SIGNAL_KEYS, ...customFields.map(c => c.name)])].sort();
   updateScatterSelects();
   refreshAnalysisViews();
   showToast(`已把组合评分写入 composite_score（${written}/${matchedRows.length} 条样本有效），可在散点图/过滤/分箱柱状图里直接使用`);
@@ -1144,6 +1149,19 @@ async function renderCatAnalysis(catField, breakpointsText, valueField, sigTestE
 }
 
 // ---------- 6. 阈值优化（ROC-AUC 分析） ----------
+// AUC 置信区间的重抽样次数。单字段和批量对比用不同的档位：单字段只算一次，可以给足次数换精度；
+// 批量对比要对几十个字段各跑一遍，次数太高会明显拖慢，300 次已经够把"跨没跨过 0.5"这件事判准。
+const ROC_BOOTSTRAP_B = 1000;
+const ROC_BATCH_BOOTSTRAP_B = 300;
+
+// AUC 显著性判定：置信区间完全落在 0.5 一侧才算"优于随机猜测"。
+// 跨过 0.5 就意味着——这个字段和抛硬币在统计上分不出高下，点估计再好看也不能用。
+function aucVerdict(auc, ci) {
+  if (!ci || !Number.isFinite(ci.lo)) return { text: '-', color: 'var(--text-muted)', significant: false };
+  if (ci.lo > 0.5) return { text: '优于随机', color: 'var(--ok, #30d158)', significant: true };
+  if (ci.hi < 0.5) return { text: '反向有效', color: 'var(--ok, #30d158)', significant: true };
+  return { text: '不显著', color: 'var(--text-muted)', significant: false };
+}
 function collectRocSamples(field, targetField, winThreshold) {
   const values = [], labels = [];
   for (const row of activeRows) {
@@ -1178,7 +1196,12 @@ function renderRocSingle(field, targetField, winThreshold, directionParam) {
   }
 
   const { direction, roc } = resolveRocDirection(values, labels, directionParam);
-  const { points, auc, best, positives: P, negatives: N } = roc;
+  const { points, best, positives: P, negatives: N } = roc;
+  // 点估计和置信区间必须用同一个算法：computeROC 的 AUC 是对下采样后的 100 个阈值做梯形积分，
+  // 样本数 > 100 时是近似值（实测偏差在 1e-4 量级），而 CI 用的 rankAuc 是秩和精确解。
+  // 两边混用会出现"点估计落在自己置信区间外"这种没法解释的展示，这里统一取精确值。
+  // roc.points 仍用于画曲线——曲线本来就是按候选阈值逐点画的，下采样不影响观感。
+  const auc = rankAuc(values, labels, direction);
   const precision = Number.isFinite(best.precision) ? best.precision : 0;
   const recall = best.tpr;
 
@@ -1203,8 +1226,28 @@ function renderRocSingle(field, targetField, winThreshold, directionParam) {
     margin: { t: 50 }
   }), { responsive: true });
 
+  const ci = bootstrapAucCI(values, labels, direction, ROC_BOOTSTRAP_B);
+  const verdict = aucVerdict(auc, ci);
+  const ciText = Number.isFinite(ci.lo) ? `[${ci.lo.toFixed(3)}, ${ci.hi.toFixed(3)}]` : '样本不足，无法估计';
+  // Youden 最优点落在多少个样本上——精确率是从这几个样本里算出来的，样本太少时这个百分比
+  // 极不稳定（用户很容易把"16 个样本里 9 个赢"的 56% 当成真实提升），必须显式标出来
+  const tpAtBest = Number.isFinite(best.tp) ? best.tp : NaN;
+  const fpAtBest = Number.isFinite(best.fp) ? best.fp : NaN;
+  const nAtBest = tpAtBest + fpAtBest;
+  const baseRate = P / (P + N);
+  const precisionNote = Number.isFinite(nAtBest) && nAtBest > 0
+    ? `该精确率只由 <b>${nAtBest}</b> 个被选中样本算出（${tpAtBest} 赢 / ${fpAtBest} 输），基准率为 ${(baseRate * 100).toFixed(1)}%。`
+      + (nAtBest < 30 ? `<span style="color:var(--warn, #ff9f0a)">选中样本不足 30 个，这个百分比的波动范围很大，不要直接当成真实提升。</span>` : '')
+    : '';
+
   document.getElementById('rocSummary').innerHTML =
-    `该字段 AUC=${auc.toFixed(3)}，作为筛选条件时建议阈值设为 <b>${formatNumberSmart(best.threshold)}</b>（${direction === 'higher' ? `${escapeHtml(field)} ≥ 该值` : `${escapeHtml(field)} ≤ 该值`}），此时能筛出 <b>${(recall * 100).toFixed(1)}%</b> 的赢家（召回率），同时预测为"赢"的样本里有 <b>${(precision * 100).toFixed(1)}%</b> 真的赢了（精确率）。<span style="color:var(--text-muted)">（正样本 n=${P}，负样本 n=${N}）</span>`;
+    `该字段 AUC=<b>${auc.toFixed(3)}</b>，95% 置信区间 <b>${ciText}</b>（重抽样 ${ROC_BOOTSTRAP_B} 次），<b style="color:${verdict.color}">${verdict.text}</b>。`
+    + (verdict.significant
+        ? ''
+        : `<span style="color:var(--warn, #ff9f0a)"> 区间跨过 0.5，说明该字段与随机猜测在统计上无法区分，下面的建议阈值不具备参考价值。</span>`)
+    + `<br>作为筛选条件时建议阈值设为 <b>${formatNumberSmart(best.threshold)}</b>（${direction === 'higher' ? `${escapeHtml(field)} ≥ 该值` : `${escapeHtml(field)} ≤ 该值`}），此时能筛出 <b>${(recall * 100).toFixed(1)}%</b> 的赢家（召回率），同时预测为"赢"的样本里有 <b>${(precision * 100).toFixed(1)}%</b> 真的赢了（精确率）。<span style="color:var(--text-muted)">（正样本 n=${P}，负样本 n=${N}）</span>`
+    + (precisionNote ? `<br>${precisionNote}` : '')
+    + `<br><span style="color:var(--text-muted)">注意：Youden 最优点是在所有候选阈值里挑出来的，天然偏乐观；同理，若这个字段是从几十上百个字段里挑出来的，还需要考虑多重比较问题。</span>`;
 }
 
 function renderRocBatch(fields, targetField, winThreshold) {
@@ -1214,17 +1257,47 @@ function renderRocBatch(fields, targetField, winThreshold) {
     const { values, labels } = collectRocSamples(field, targetField, winThreshold);
     const positives = labels.reduce((a, b) => a + b, 0);
     if (values.length < 20 || positives === 0 || positives === values.length) {
-      return { field, n: values.length, auc: NaN };
+      return { field, n: values.length, auc: NaN, reason: '样本不足/单一类别' };
+    }
+    // 取值恒定检测：字段所有样本取值相同（典型如 amm_volume/exchange_volume/scam_volume 常年全 0）时，
+    // 秩和 AUC 恰好等于 0.5、bootstrap 每次重抽样结果也一样 → 置信区间宽度为 0（形如 [0.500, 0.500]）。
+    // 这不是"测过了没用"，而是【根本没法测】：零方差字段不含任何信息。混在结果里会让人误判成
+    // "这个字段试过了、不显著"，实际应该先去数据源确认它为什么恒定。
+    const distinct = new Set(values);
+    if (distinct.size <= 1) {
+      return { field, n: values.length, auc: NaN, reason: `取值恒定（全为 ${formatNumberSmart(values[0])}）` };
     }
     const { direction, roc } = resolveRocDirection(values, labels, 'auto');
-    return { field, n: values.length, auc: roc.auc, direction, threshold: roc.best.threshold, precision: roc.best.precision, recall: roc.best.tpr };
+    const ci = bootstrapAucCI(values, labels, direction, ROC_BATCH_BOOTSTRAP_B);
+    // 同单字段：AUC 取秩和精确解，与置信区间同源
+    return { field, n: values.length, auc: rankAuc(values, labels, direction), ci, direction, threshold: roc.best.threshold, precision: roc.best.precision, recall: roc.best.tpr };
   });
-  results.sort((a, b) => (Number.isFinite(b.auc) ? b.auc : 0) - (Number.isFinite(a.auc) ? a.auc : 0));
+  // 先按显著性分层、层内再按 AUC 排：否则一堆"AUC 看着高但区间跨 0.5"的噪声字段会混在真信号
+  // 前面，排序结果反而误导人
+  results.sort((a, b) => {
+    // 无法计算的（恒定/样本不足）一律沉底，它们不是"结论"，只是数据问题
+    const va = Number.isFinite(a.auc) ? 1 : 0, vb = Number.isFinite(b.auc) ? 1 : 0;
+    if (va !== vb) return vb - va;
+    const sa = aucVerdict(a.auc, a.ci).significant ? 1 : 0;
+    const sb = aucVerdict(b.auc, b.ci).significant ? 1 : 0;
+    if (sa !== sb) return sb - sa;
+    return (Number.isFinite(b.auc) ? b.auc : 0) - (Number.isFinite(a.auc) ? a.auc : 0);
+  });
+  // 顶部提示：有多少字段压根没参与检验，避免"我扫了 9 个字段全不显著"的误读
+  const skipped = results.filter(r => !Number.isFinite(r.auc));
+  const noteEl = document.getElementById('rocBatchNote');
+  if (noteEl) {
+    noteEl.innerHTML = skipped.length
+      ? `<span style="color:var(--warn,#ff9f0a)">${skipped.length} 个字段未参与检验</span>（${skipped.map(r => escapeHtml(r.field) + '：' + escapeHtml(r.reason)).join('；')}）——这类字段是数据问题，不能算作"测过了不显著"。实际参与检验的是 ${results.length - skipped.length} 个。`
+      : '';
+  }
   document.getElementById('rocBatchBody').innerHTML = results.map(r => `
     <tr>
       <td>${escapeHtml(r.field)}</td>
       <td class="num">${r.n}</td>
-      <td class="num">${Number.isFinite(r.auc) ? r.auc.toFixed(4) : '样本不足/单一类别'}</td>
+      <td class="num">${Number.isFinite(r.auc) ? r.auc.toFixed(4) : `<span style="color:var(--warn,#ff9f0a)">${escapeHtml(r.reason || '无法计算')}</span>`}</td>
+      <td class="num">${r.ci && Number.isFinite(r.ci.lo) ? `[${r.ci.lo.toFixed(3)}, ${r.ci.hi.toFixed(3)}]` : '-'}</td>
+      <td style="color:${aucVerdict(r.auc, r.ci).color};">${aucVerdict(r.auc, r.ci).text}</td>
       <td>${r.direction ? (r.direction === 'higher' ? '越大越好' : '越小越好') : '-'}</td>
       <td class="num">${Number.isFinite(r.threshold) ? formatNumberSmart(r.threshold) : '-'}</td>
       <td class="num">${Number.isFinite(r.precision) ? (r.precision * 100).toFixed(1) + '%' : '-'}</td>
@@ -1351,6 +1424,123 @@ function renderCaAdvisor(caInputText, fields) {
     + `<br>下方"过滤建议"按代价（该规则连带排除掉的好样本 returnMax&gt;2 的比例）从低到高排序，代价越低说明这条规则越"精准打击"目标 CA、越不容易误伤好样本。`;
 }
 
+// 最近一次回放的逐 check 拦截明细（check 名 -> { pass, fail, soleBlock, blocked[] }），
+// 供看板表格里"查看 N 个"按钮点开时取数
+let lastCheckBlocked = new Map();
+// 策略有效性判定：不能只看中位数。
+// meme 的收益极度右偏，价值几乎全在尾部——一个策略完全可能"把中位数抬高、同时把 100x 的票
+// 全过滤掉"，那是最坏的结果，但只看中位数会判成"方向对"。所以同时看三个维度：
+//   1) 中位数     —— 典型样本表现
+//   2) 多档命中率 —— >2/>5/>10，>10 那档才真正代表能不能抓到大票
+//   3) 大票捕获   —— 未命中组里有没有出现比命中组最大值还高的票（漏掉巨鲸是致命的）
+// 三者不一致时明确指出来，而不是给一个笼统的"方向对/不对"。
+function buildStrategyVerdict(hitRets, missRets) {
+  if (!hitRets.length || !missRets.length) return '';
+  const med = a => { const x = a.slice().sort((p, q) => p - q); const m = x.length >> 1; return x.length % 2 ? x[m] : (x[m - 1] + x[m]) / 2; };
+  const rateAt = (a, t) => a.length ? a.filter(v => v > t).length / a.length * 100 : NaN;
+  const hitMed = med(hitRets), missMed = med(missRets);
+  const hitMax = Math.max(...hitRets), missMax = Math.max(...missRets);
+  const THRESHOLDS = [WIN_THRESHOLD, 5, 10];
+
+  const rows = THRESHOLDS.map(t => {
+    const h = rateAt(hitRets, t), m = rateAt(missRets, t);
+    return { t, h, m, better: h > m };
+  });
+  const medBetter = hitMed > missMed;
+  // 漏掉大票：未命中组的最大值显著超过命中组最大值（1.5 倍以上才算"显著漏"，避免小幅波动误报）
+  const missedWhale = missMax > hitMax * 1.5;
+  const tailRow = rows[rows.length - 1]; // >10 那档
+  const tailBetter = tailRow.better || (!Number.isFinite(tailRow.m) || tailRow.m === 0);
+
+  // 判定优先级：中位数反转 > 漏巨鲸 > 尾部落后。
+  // 中位数反转是更根本的问题（整体方向就错了），此时再强调"漏掉某个大票"是次要的；
+  // 反过来，中位数占优时"漏巨鲸"才是那个最该被点名的隐患。
+  let tone, headline;
+  if (medBetter && tailBetter && !missedWhale) {
+    tone = 'var(--ok,#30d158)';
+    headline = '✓ 中位数和大票捕获都占优，策略的过滤方向是对的。';
+  } else if (!medBetter) {
+    tone = 'var(--warn,#ff9f0a)';
+    headline = `⚠️ 命中组中位数【不高于】未命中组（${hitMed.toFixed(3)}x vs ${missMed.toFixed(3)}x）——策略拦掉的反而不比放行的差，过滤条件值得重新审视。`
+      + (missedWhale ? `而且被拦的样本里还有 <b>${missMax.toFixed(1)}x</b>（命中组最高才 ${hitMax.toFixed(1)}x）。` : '');
+  } else if (missedWhale) {
+    tone = 'var(--danger,#ff453a)';
+    headline = `⚠️ 严重信号：被拦掉的样本里出现了 <b>${missMax.toFixed(1)}x</b>，远高于命中组的最高 ${hitMax.toFixed(1)}x —— 策略把最大的票挡在了外面。`
+      + `中位数虽然占优（${hitMed.toFixed(3)}x vs ${missMed.toFixed(3)}x），但 meme 的收益靠尾部，漏掉巨鲸的代价通常大于提升中位数的收益。`;
+  } else if (medBetter && !tailBetter) {
+    tone = 'var(--warn,#ff9f0a)';
+    headline = `⚠️ 中位数占优但大票率落后（&gt;10x：命中 ${tailRow.h.toFixed(1)}% vs 未命中 ${tailRow.m.toFixed(1)}%）——策略在"提升平均质量"的同时牺牲了尾部，对 meme 未必划算。`;
+  } else {
+    tone = 'var(--text-muted)';
+    headline = '各维度结论不一致，建议结合下方明细判断。';
+  }
+
+  const cells = rows.map(r => `<td class="num">${Number.isFinite(r.h) ? r.h.toFixed(1) + '%' : '-'}</td><td class="num" style="color:var(--text-muted)">${Number.isFinite(r.m) ? r.m.toFixed(1) + '%' : '-'}</td>`).join('');
+  return `<div class="hint" style="margin:0 0 10px; padding:8px 10px; border-radius:6px; background:var(--surface-2);">
+    <div style="color:${tone}; margin-bottom:6px;">${headline}</div>
+    <table class="desc-table" style="background:var(--surface); border-radius:6px;">
+      <thead><tr><th>指标</th>${THRESHOLDS.map(t => `<th class="num" colspan="2">&gt;${t}x 命中率</th>`).join('')}<th class="num">中位数</th><th class="num">最高</th></tr></thead>
+      <tbody>
+        <tr><td><b>命中组</b>（n=${hitRets.length}）</td>${rows.map(r => `<td class="num" colspan="2"><b>${Number.isFinite(r.h) ? r.h.toFixed(1) + '%' : '-'}</b></td>`).join('')}<td class="num"><b>${hitMed.toFixed(3)}x</b></td><td class="num">${hitMax.toFixed(1)}x</td></tr>
+        <tr><td>未命中组（n=${missRets.length}）</td>${rows.map(r => `<td class="num" colspan="2" style="color:var(--text-muted)">${Number.isFinite(r.m) ? r.m.toFixed(1) + '%' : '-'}</td>`).join('')}<td class="num" style="color:var(--text-muted)">${missMed.toFixed(3)}x</td><td class="num" style="color:${missedWhale ? 'var(--danger,#ff453a)' : 'var(--text-muted)'}">${missMax.toFixed(1)}x</td></tr>
+      </tbody>
+    </table>
+    <div style="margin-top:6px; color:var(--text-muted)">未命中组样本量 ${missRets.length} 条${missRets.length < 30 ? '（偏少，各档比率波动很大，别据此下定论）' : ''}；此处未做显著性检验，差异可能来自抽样运气。</div>
+  </div>`;
+}
+
+// 最近一次回放的命中组 returnMax 列表，供"放宽这一条值不值"做对照
+let lastReplayHitRets = [];
+
+// 从 check 的"实际值"字符串里抠出数字。策略常把辅助信息拼进去（如 "3.30(2657/804)"、
+// "2.032x"），parseFloat 只取前导数字正好合适；纯文本（平台名等）返回 NaN，该 check 不参与扫描。
+function parseCheckNumber(v) {
+  const n = parseFloat(String(v).replace(/[,\s]/g, ''));
+  return Number.isFinite(n) ? n : NaN;
+}
+
+// 从"期望"文字推断方向：'< 2.5' → 越小越好；'> 30' → 越大越好。
+// 区间（'20~30'）和等值（'== 0'）没有单一切点，不给推荐。
+function parseCheckDirection(expect) {
+  const e = String(expect || '').trim();
+  if (/~/.test(e) || /==/.test(e)) return null;
+  if (/^<=?/.test(e)) return 'lt';
+  if (/^>=?/.test(e)) return 'gt';
+  return null;
+}
+
+// 为一条 check 扫描候选阈值：在两侧都保留足够样本的前提下，找"通过侧胜率最高"的切点。
+// 返回 { rows, best, curr }，rows 是每个候选阈值的通过数/胜率/中位数，供表格展示。
+function scanCheckThreshold(all, direction) {
+  const pts = all.map(a => ({ v: parseCheckNumber(a.val), r: a.ret }))
+                 .filter(p => Number.isFinite(p.v) && isFiniteNumber(p.r));
+  if (pts.length < 20) return null;
+  const medOf = a => { if (!a.length) return NaN; const x = a.slice().sort((p, q) => p - q); const m = x.length >> 1; return x.length % 2 ? x[m] : (x[m - 1] + x[m]) / 2; };
+  const winOf = a => a.length ? a.filter(v => v > WIN_THRESHOLD).length / a.length * 100 : NaN;
+  const baseWin = winOf(pts.map(p => p.r));
+  // 候选切点取 5%~95% 分位，避免切出一侧样本极少的极端阈值
+  const sorted = pts.map(p => p.v).slice().sort((a, b) => a - b);
+  const cands = [];
+  const seen = new Set();
+  for (let q = 5; q <= 95; q += 5) {
+    const v = sorted[Math.min(sorted.length - 1, Math.floor(q / 100 * (sorted.length - 1)))];
+    if (!seen.has(v)) { seen.add(v); cands.push(v); }
+  }
+  const minSide = Math.max(10, Math.round(pts.length * 0.15));
+  const rows = [];
+  for (const t of cands) {
+    const passSide = direction === 'lt' ? pts.filter(p => p.v < t) : pts.filter(p => p.v > t);
+    const blockSide = direction === 'lt' ? pts.filter(p => p.v >= t) : pts.filter(p => p.v <= t);
+    if (passSide.length < minSide || blockSide.length < minSide) continue;
+    rows.push({ t, nPass: passSide.length, win: winOf(passSide.map(p => p.r)), med: medOf(passSide.map(p => p.r)),
+                blockWin: winOf(blockSide.map(p => p.r)) });
+  }
+  if (!rows.length) return null;
+  // 推荐：通过侧胜率最高的那个（同胜率取通过样本更多的，保守）
+  const best = rows.slice().sort((a, b) => b.win - a.win || b.nPass - a.nPass)[0];
+  return { rows, best, baseWin, total: pts.length };
+}
+
 // ---------- 8b. 策略诊断：把策略源码原样回放，看目标 CA 到底卡在哪一条 check ----------
 // 目标问题：上面的"过滤建议"是【反推】——从数据分布里找能挡住目标 CA 的阈值。但很多时候策略本来
 // 就已经上线跑了，真正想问的是【正推】：这个 CA 当时被我的策略拦了吗？卡在哪一条？实际值是多少？
@@ -1465,19 +1655,22 @@ function runStrategyOnRow(compiled, row) {
   // checks 没抓到（策略写法不符合约定）时，回退到 ctx.log 里那条"未命中 ... | 失败:xxx"文本，
   // 至少还能把失败原因原样展示出来，而不是整个功能失效
   const checks = Array.isArray(captured)
-    ? captured.map(c => ({ name: String(c[0]), ok: !!c[1], value: c[2] === undefined ? '' : String(c[2]) }))
+    // c[3] 是可选的"期望条件"文字（如 '< 10'）——本仓库较新的策略会带上它。有它就展示，
+    // 否则光看"值=14"根本判断不出阈值是多少，阈值记混了也发现不了（真实踩过：把"创建者发币数<80"
+    // 误当成"推特发币数<80"，实际代码是 <10，8 个样本被拦却以为是工具算错）。
+    ? captured.map(c => ({ name: String(c[0]), ok: !!c[1], value: c[2] === undefined ? '' : String(c[2]), expect: c[3] === undefined ? '' : String(c[3]) }))
     : null;
   return { passed: !!passed, checks, logs, error, usedPaths: seen, nowMs };
 }
 
-function renderStrategyDiag(caInputText, src) {
+// useCurrentDataset=true 时忽略 CA 输入框，直接对整个当前工作集（activeRows）回放——
+// 手动粘 CA 只能看几个个案，跑全量才能得出"这条 check 在整体上拦了多少、放宽能多命中几个"的结论。
+function renderStrategyDiag(caInputText, src, useCurrentDataset) {
   const summaryEl = document.getElementById('strategyDiagSummary');
   const fieldsEl = document.getElementById('strategyDiagFields');
   const body = document.getElementById('strategyDiagBody');
   if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   if (!src.trim()) { showToast('请先粘贴策略代码（以 ctx 为入参、内部构造 checks 数组的那段）'); return; }
-  const inputs = [...new Set(caInputText.split(/[\n,，;；\s]+/).map(s => s.trim()).filter(Boolean))];
-  if (!inputs.length) { showToast('请在上方"目标 CA / symbol"里输入至少一个 CA'); return; }
 
   const compiled = compileStrategy(src);
   if (compiled.error) {
@@ -1488,13 +1681,22 @@ function renderStrategyDiag(caInputText, src) {
 
   const unmatched = [];
   const results = [];   // { input, row, res }
-  inputs.forEach(inp => {
-    const rows = findRowsByInput(inp);
-    if (!rows.length) { unmatched.push(inp); return; }
-    rows.forEach(row => results.push({ input: inp, row, res: runStrategyOnRow(compiled, row) }));
-  });
+  let inputs = [];
+  if (useCurrentDataset) {
+    activeRows.forEach(row => results.push({ input: row.symbol || row.tokenAddress || '', row, res: runStrategyOnRow(compiled, row) }));
+  } else {
+    inputs = [...new Set(caInputText.split(/[\n,，;；\s]+/).map(s => s.trim()).filter(Boolean))];
+    if (!inputs.length) { showToast('请在上方"目标 CA / symbol"里输入至少一个 CA，或点"用当前数据源回放"'); return; }
+    inputs.forEach(inp => {
+      const rows = findRowsByInput(inp);
+      if (!rows.length) { unmatched.push(inp); return; }
+      rows.forEach(row => results.push({ input: inp, row, res: runStrategyOnRow(compiled, row) }));
+    });
+  }
   if (!results.length) {
-    summaryEl.innerHTML = `⚠️ 输入的 ${inputs.length} 个 CA/symbol 在当前工作集里都没有匹配到，请检查拼写，或者它们是否已被上方的全局过滤条件排除。`;
+    summaryEl.innerHTML = useCurrentDataset
+      ? '⚠️ 当前工作集为空。'
+      : `⚠️ 输入的 ${inputs.length} 个 CA/symbol 在当前工作集里都没有匹配到，请检查拼写，或者它们是否已被上方的全局过滤条件排除。`;
     fieldsEl.innerHTML = ''; body.innerHTML = '';
     return;
   }
@@ -1524,7 +1726,19 @@ function renderStrategyDiag(caInputText, src) {
     </div>`;
 
   // ---- 逐个目标 CA：命中/未命中 + 卡在哪几条 check ----
-  body.innerHTML = results.map(({ input, row, res }) => {
+  // 逐币卡片限量：全量回放几百条时，每条都渲染一张带 checks 表格的卡片会撑爆 DOM 且没人会逐个看。
+  // 优先展示未命中的（那才是要排查的），命中的排后面；超出上限只留看板汇总。
+  const MAX_CARDS = 40;
+  const sortedForCards = results.slice().sort((a, b) => {
+    const fa = (a.res.error || !a.res.passed) ? 0 : 1;
+    const fb = (b.res.error || !b.res.passed) ? 0 : 1;
+    return fa - fb;
+  });
+  const cardRows = sortedForCards.slice(0, MAX_CARDS);
+  const cardsOmitted = results.length - cardRows.length;
+  body.innerHTML = (cardsOmitted > 0
+    ? `<div class="hint" style="margin:0 0 10px; color:var(--text-muted)">共 ${results.length} 条，下面只展开前 ${MAX_CARDS} 条明细（未命中的优先），其余 ${cardsOmitted} 条已计入上方看板统计。</div>`
+    : '') + cardRows.map(({ input, row, res }) => {
     const title = `${escapeHtml(row.symbol || input)} <span style="color:var(--text-muted); font-size:12px;">${escapeHtml(row.tokenAddress || '')}</span>`;
     if (res.error) {
       return `<div class="strategy-diag-card">
@@ -1550,28 +1764,99 @@ function renderStrategyDiag(caInputText, src) {
       <div class="strategy-diag-head">${title} ${badge}</div>
       <div class="hint" style="margin:6px 0 8px;">回放基准时刻（= 快照抓取时刻）：${escapeHtml(replayTime)}；returnMax = ${isFiniteNumber(row.returnMax) ? row.returnMax.toFixed(3) + 'x' : '-'}</div>
       <table class="desc-table">
-        <thead><tr><th style="width:34px;"></th><th>check</th><th>实际值</th></tr></thead>
+        <thead><tr><th style="width:34px;"></th><th>check</th><th>实际值</th><th>期望</th></tr></thead>
         <tbody>${res.checks.map(c => `
           <tr${c.ok ? '' : ' style="background:rgba(255,69,58,.08);"'}>
             <td>${c.ok ? '<span style="color:var(--ok,#30d158)">✓</span>' : '<span style="color:var(--danger,#ff453a)">✗</span>'}</td>
             <td>${escapeHtml(c.name)}</td>
             <td><code>${escapeHtml(c.value)}</code></td>
+            <td><code style="color:var(--text-muted)">${escapeHtml(c.expect || '')}</code></td>
           </tr>`).join('')}</tbody>
       </table>
     </div>`;
   }).join('');
 
-  // ---- 汇总：哪条 check 拦掉的目标 CA 最多 ----
-  const blockCount = new Map();
-  results.forEach(({ res }) => (res.checks || []).filter(c => !c.ok).forEach(c => {
-    blockCount.set(c.name, (blockCount.get(c.name) || 0) + 1);
-  }));
-  const ranked = [...blockCount.entries()].sort((a, b) => b[1] - a[1]);
-  const passedCount = results.filter(r => !r.error && r.passed).length;
-  const errorCount = results.filter(r => r.error).length;
+  // ---- 看板：逐条 check 的通过率 + 单点否决数 ----
+  // 币一多，逐张卡片就看不出规律了。这里按 check 汇总：
+  //   通过/失败数 —— 哪一条最严
+  //   单点否决数 —— 该样本【只】卡在这一条（放宽它就能直接多命中这么多个），最有行动价值
+  //   命中/未命中两组的 returnMax 中位数 —— 反过来检验"策略拦掉的是不是真的更差"
+  const checkStats = new Map(); // name -> { pass, fail, soleBlock }
+  const valid = results.filter(r => !r.error && Array.isArray(r.res.checks));
+  valid.forEach(({ row, res }) => {
+    const failedNames = res.checks.filter(c => !c.ok).map(c => c.name);
+    const sole = failedNames.length === 1 ? failedNames[0] : null;
+    res.checks.forEach(c => {
+      if (!checkStats.has(c.name)) checkStats.set(c.name, { pass: 0, fail: 0, soleBlock: 0, blocked: [], all: [], expect: c.expect || '' });
+      const st = checkStats.get(c.name);
+      // 全量样本（含通过的）都记一份 value+returnMax，供"推荐阈值"扫描——
+      // 只有被拦的那些没法搜阈值，必须两侧都有才能算"卡在哪里区分度最好"
+      st.all.push({ val: c.value, ret: row.returnMax, ok: c.ok });
+      if (c.ok) st.pass++;
+      else {
+        st.fail++;
+        // 同时记下被这条拦掉的样本明细，供表格里点开查看（值 = 该 check 当时的实际值）
+        st.blocked.push({ symbol: row.symbol || '', addr: row.tokenAddress || '', ret: row.returnMax, val: c.value, expect: c.expect || '', sole: sole === c.name });
+      }
+    });
+    // 只失败一条 = 单点否决，放宽这条这个样本就命中了
+    if (sole) checkStats.get(sole).soleBlock++;
+  });
+  // 供表格行点开时查明细（把 blocked 挂到模块级，避免闭包塞进 HTML）
+  lastCheckBlocked = checkStats;
+  lastReplayHitRets = valid.filter(r => r.res.passed).map(r => r.row.returnMax).filter(isFiniteNumber);
+  const ranked = [...checkStats.entries()].map(([name, st]) => ({ name, ...st }))
+    .sort((a, b) => b.soleBlock - a.soleBlock || b.fail - a.fail);
+  // 注意：results 的元素是 { input, row, res }，命中/报错状态在 res 里。
+  // 之前误写成 r.passed / r.error（永远 undefined），导致命中数恒为 0——手动粘几个 CA 时
+  // 恰好都未命中，一直没暴露，跑全量数据源才显出来。
+  const passedCount = results.filter(r => !r.res.error && r.res.passed).length;
+  const errorCount = results.filter(r => r.res.error).length;
+
+  // 命中 vs 未命中的收益对比：策略有效的话，命中组的 returnMax 应该更高
+  const med = arr => { if (!arr.length) return NaN; const a = arr.slice().sort((x, y) => x - y); const m = a.length >> 1; return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2; };
+  const hitRets = valid.filter(r => r.res.passed).map(r => r.row.returnMax).filter(isFiniteNumber);
+  const missRets = valid.filter(r => !r.res.passed).map(r => r.row.returnMax).filter(isFiniteNumber);
+  const hitMed = med(hitRets), missMed = med(missRets);
+  const winRate = arr => arr.length ? arr.filter(v => v > WIN_THRESHOLD).length / arr.length * 100 : NaN;
+
+  // 看板 HTML：插在逐币卡片之前
+  const boardEl = document.getElementById('strategyDiagBoard');
+  if (boardEl) {
+    boardEl.innerHTML = !valid.length ? '' : `
+      <div class="stat-row" style="margin-bottom:10px;">
+        <div class="stat-tile"><div class="stat-label">回放样本</div><div class="stat-value">${valid.length}</div></div>
+        <div class="stat-tile"><div class="stat-label">命中</div><div class="stat-value" style="color:var(--ok,#30d158)">${passedCount}</div></div>
+        <div class="stat-tile"><div class="stat-label">未命中</div><div class="stat-value" style="color:var(--danger,#ff453a)">${valid.length - passedCount}</div></div>
+        <div class="stat-tile"><div class="stat-label">命中组 returnMax 中位数</div><div class="stat-value">${Number.isFinite(hitMed) ? hitMed.toFixed(3) + 'x' : '-'}</div></div>
+        <div class="stat-tile"><div class="stat-label">未命中组 中位数</div><div class="stat-value">${Number.isFinite(missMed) ? missMed.toFixed(3) + 'x' : '-'}</div></div>
+        <div class="stat-tile"><div class="stat-label">命中组胜率(&gt;${WIN_THRESHOLD})</div><div class="stat-value">${Number.isFinite(winRate(hitRets)) ? winRate(hitRets).toFixed(1) + '%' : '-'}</div></div>
+      </div>
+      ${buildStrategyVerdict(hitRets, missRets)}
+      <div class="table-scroll" style="max-height:320px;">
+        <table class="desc-table">
+          <thead><tr><th>check</th><th class="num">通过</th><th class="num">失败</th><th class="num">通过率</th><th class="num">单点否决</th><th>说明</th><th>被拦 CA</th></tr></thead>
+          <tbody>${ranked.map(r => {
+            const rate = (r.pass + r.fail) ? r.pass / (r.pass + r.fail) * 100 : NaN;
+            return `<tr${r.soleBlock > 0 ? ' style="background:rgba(255,159,10,.10);"' : ''}>
+              <td>${escapeHtml(r.name)}</td>
+              <td class="num">${r.pass}</td>
+              <td class="num">${r.fail}</td>
+              <td class="num">${Number.isFinite(rate) ? rate.toFixed(1) + '%' : '-'}</td>
+              <td class="num"><b>${r.soleBlock || ''}</b></td>
+              <td style="font-size:11.5px;">${r.soleBlock > 0
+                ? `<span style="color:var(--warn,#ff9f0a)">放宽这一条可多命中 ${r.soleBlock} 个</span>`
+                : (r.fail === 0 ? '<span style="color:var(--text-muted)">从未拦过任何样本</span>' : '')}</td>
+              <td>${r.fail > 0 ? `<button type="button" class="secondary check-blocked-btn" data-check="${escapeHtml(r.name)}" style="padding:2px 10px; font-size:11px;">查看 ${r.fail} 个</button>` : ''}</td>
+            </tr>`;
+          }).join('')}</tbody>
+        </table>
+      </div>
+      <div id="strategyCheckBlockedDetail" style="margin-top:10px;"></div>`;
+  }
   summaryEl.innerHTML = `回放 ${results.length} 条记录：命中 ${passedCount} 条，未命中 ${results.length - passedCount - errorCount} 条${errorCount ? `，报错 ${errorCount} 条` : ''}。`
     + (unmatched.length ? `<br>⚠️ 未匹配到：${escapeHtml(unmatched.join('、'))}（检查拼写或是否被全局过滤条件排除）。` : '')
-    + (ranked.length ? `<br>拦得最多的 check：${ranked.slice(0, 5).map(([n, c]) => `<b>${escapeHtml(n)}</b>(${c}条)`).join('、')}。` : '')
+    + (ranked.length ? `<br>拦得最多的 check：${ranked.filter(r => r.fail > 0).slice(0, 5).map(r => `<b>${escapeHtml(r.name)}</b>(${r.fail}条)`).join('、') || '无'}。` : '')
     + `<br><span style="color:var(--text-muted)">注意：回放用的是【买入时刻快照】里的 ctx，而策略上线时读的是实时数据，两者在时间上对齐但数据源可能有细微差异；另外这里只跑了目标 CA，不代表策略在全量样本上的表现。</span>`;
 }
 
@@ -1687,6 +1972,27 @@ function initProAnalytics() {
 
   const rocBatchSelector = makeFieldTagSelector('rocBatchInput', 'rocBatchTagBox');
   wireImportTop10Btn('importRocTop10Btn', rocBatchSelector);
+  // 按分组批量导入候选字段：分组定义直接复用字段浏览器算好的 fieldBrowserGroups，
+  // 保证两处口径完全一致（那边怎么归组，这里导入的就是哪些）。
+  document.getElementById('importRocGroupBtn').addEventListener('click', () => {
+    const g = document.getElementById('rocBatchGroup').value;
+    if (!g) { showToast('请先选择一个字段分组'); return; }
+    // 实时算，不读 fieldBrowserGroups 缓存——那个只在字段浏览器面板渲染过之后才有内容，
+    // 用户没展开过面板时会是空数组，导致误报"该分组没有可用字段"
+    const groups = (typeof computeFieldGroups === 'function') ? computeFieldGroups() : (fieldBrowserGroups || {});
+    const fields = groups[g] || [];
+    if (!fields.length) { showToast('该分组在当前数据集里没有可用字段（可能还没点"分析"，或这批数据缺这类字段）'); return; }
+    let added = 0;
+    fields.forEach(f => { if (!rocBatchSelector.getSelected().includes(f)) { rocBatchSelector.addField(f); added++; } });
+    showToast(`已加入 ${fields.length} 个字段（新增 ${added}）`);
+  });
+  // 一键清空候选字段：批量导入几十个字段后想换一批，逐个点 × 太折腾
+  document.getElementById('clearRocBatchBtn').addEventListener('click', () => {
+    const n = rocBatchSelector.clear();
+    document.getElementById('rocBatchBody').innerHTML = '';
+    const nEl = document.getElementById('rocBatchNote'); if (nEl) nEl.innerHTML = '';
+    showToast(n ? `已清空 ${n} 个候选字段` : '候选字段本来就是空的');
+  });
   document.getElementById('genRocBatchBtn').addEventListener('click', () => {
     renderRocBatch(
       rocBatchSelector.getSelected(),
@@ -1726,9 +2032,231 @@ function initProAnalytics() {
   document.getElementById('genStrategyDiagBtn').addEventListener('click', () => {
     renderStrategyDiag(
       document.getElementById('caAdvisorInput').value,
-      document.getElementById('strategyCodeInput').value
+      document.getElementById('strategyCodeInput').value,
+      false
     );
   });
+  // 看板表格里点"查看 N 个"：展开该 check 拦掉的全部 CA。用事件委托挂在看板容器上，
+  // 因为表格每次回放都会整体重建，逐个绑定必然会漏。
+  document.getElementById('strategyDiagBoard').addEventListener('click', e => {
+    const btn = e.target.closest('.check-blocked-btn');
+    if (!btn) return;
+    const name = btn.dataset.check;
+    const st = lastCheckBlocked.get(name);
+    const detail = document.getElementById('strategyCheckBlockedDetail');
+    if (!st || !detail) return;
+    // 单点否决的排最前——那些是"只卡这一条"，放宽它立刻能救回来的，最有行动价值
+    const rows = st.blocked.slice().sort((a, b) => (b.sole ? 1 : 0) - (a.sole ? 1 : 0));
+    // 排序状态：默认按"单点否决优先"（那批才是放宽后真能救回来的）。点表头可切换，
+    // 同一列再点一次反向。数值列用 parseCheckNumber 解析（值常带括号后缀如 "3.30(2657/804)"）。
+    const SORTERS = {
+      symbol: (a, b) => String(a.symbol || '').localeCompare(String(b.symbol || '')),
+      val: (a, b) => (parseCheckNumber(a.val) || 0) - (parseCheckNumber(b.val) || 0),
+      ret: (a, b) => (isFiniteNumber(a.ret) ? a.ret : -Infinity) - (isFiniteNumber(b.ret) ? b.ret : -Infinity),
+      sole: (a, b) => (a.sole ? 1 : 0) - (b.sole ? 1 : 0),
+    };
+    let sortKey = 'sole', sortDir = -1; // -1 = 降序（单点否决在前）
+    function renderBlockedTable() {
+      const sorted = rows.slice().sort((a, b) => SORTERS[sortKey](a, b) * sortDir);
+      const arrow = k => sortKey === k ? (sortDir === 1 ? ' ▲' : ' ▼') : '';
+      const th = (k, label, cls) => `<th${cls ? ` class="${cls}"` : ''} data-sort="${k}" style="cursor:pointer; user-select:none;" title="点击按此列排序">${label}${arrow(k)}</th>`;
+      return `<table class="desc-table">
+          <thead><tr>${th('symbol', 'symbol')}<th>token_address</th>${th('val', '该 check 实际值', 'num')}<th>期望</th>${th('ret', 'returnMax', 'num')}${th('sole', '类型')}</tr></thead>
+          <tbody>${sorted.map(r => `
+            <tr${r.sole ? ' style="background:rgba(255,159,10,.10);"' : ''}>
+              <td>${escapeHtml(r.symbol || '-')}</td>
+              <td class="ellip" title="${escapeHtml(r.addr)}">${escapeHtml(r.addr || '-')}</td>
+              <td class="num"><code>${escapeHtml(r.val)}</code></td>
+              <td><code style="color:var(--text-muted)">${escapeHtml(r.expect || '')}</code></td>
+              <td class="num">${isFiniteNumber(r.ret) ? r.ret.toFixed(3) + 'x' : '-'}</td>
+              <td>${r.sole ? '<span style="color:var(--warn,#ff9f0a)">单点否决</span>' : '<span style="color:var(--text-muted)">还卡在其它条</span>'}</td>
+            </tr>`).join('')}</tbody>
+        </table>`;
+    }
+    const caList = rows.map(r => r.addr).filter(Boolean).join('\n');
+
+    // 「放宽这一条值不值」：只有单点否决的样本才是放宽后真正会被放进来的（其余还卡在别处），
+    // 所以拿这批的收益去和当前命中组比——比命中组差就说明这条 check 在正确地挡掉烂样本。
+    const soleRets = rows.filter(r => r.sole).map(r => r.ret).filter(isFiniteNumber);
+    const medOf = a => { if (!a.length) return NaN; const x = a.slice().sort((p, q) => p - q); const m = x.length >> 1; return x.length % 2 ? x[m] : (x[m - 1] + x[m]) / 2; };
+    const winOf = a => a.length ? a.filter(v => v > WIN_THRESHOLD).length / a.length * 100 : NaN;
+    const soleMed = medOf(soleRets), soleWin = winOf(soleRets);
+    const hitRetsNow = lastReplayHitRets || [];
+    const hitMedNow = medOf(hitRetsNow), hitWinNow = winOf(hitRetsNow);
+    let verdictHtml = '';
+    if (soleRets.length) {
+      const better = Number.isFinite(hitMedNow) && soleMed > hitMedNow;
+      verdictHtml = `<div class="hint" style="margin:0 0 8px; padding:8px 10px; border-radius:6px; background:var(--surface-2);">
+        <b>放宽这一条值不值？</b>只有 <b>${soleRets.length}</b> 个单点否决样本会真正被放进来（其余还卡在别处，放宽也进不来）。
+        <br>这批：胜率(&gt;${WIN_THRESHOLD}) <b>${Number.isFinite(soleWin) ? soleWin.toFixed(1) + '%' : '-'}</b>，中位数 <b>${Number.isFinite(soleMed) ? soleMed.toFixed(3) + 'x' : '-'}</b>
+        ${Number.isFinite(hitMedNow) ? `　|　当前命中组：胜率 <b>${hitWinNow.toFixed(1)}%</b>，中位数 <b>${hitMedNow.toFixed(3)}x</b>` : ''}
+        ${Number.isFinite(hitMedNow) ? `<br><span style="color:${better ? 'var(--warn,#ff9f0a)' : 'var(--ok,#30d158)'}">${better
+            ? '⚠️ 被拦的这批中位数【高于】命中组——这条 check 可能在误杀，值得考虑放宽。'
+            : '✓ 被拦的这批中位数低于命中组——这条 check 在正确地挡掉较差的样本，不建议放宽。'}</span>` : ''}
+        <span style="color:var(--text-muted)">（样本少时波动大；且这只是"放进来之后"的收益，没有考虑放宽后未来会多进来多少未知样本）</span>
+      </div>`;
+    }
+    // ---- 推荐阈值：扫这条 check 的字段值，找区分度最好的切点 ----
+    const dir = parseCheckDirection(st.expect);
+    const scan = dir ? scanCheckThreshold(st.all, dir) : null;
+    let recHtml = '';
+    if (scan) {
+      const currT = parseCheckNumber(st.expect.replace(/^[<>=]+/, ''));
+      const currRow = Number.isFinite(currT) ? scan.rows.find(r => Math.abs(r.t - currT) < 1e-9) : null;
+      const op = dir === 'lt' ? '<' : '>';
+      recHtml = `<div class="hint" style="margin:0 0 8px; padding:8px 10px; border-radius:6px; background:var(--surface-2);">
+        <b>推荐阈值</b>（扫 ${scan.total} 个有数值的样本，两侧各至少保留 15%）：
+        建议改成 <code style="color:var(--ok,#30d158)"><b>${op} ${formatNumberSmart(scan.best.t)}</b></code>
+        —— 通过 ${scan.best.nPass} 个，其中胜率(&gt;${WIN_THRESHOLD}) <b>${scan.best.win.toFixed(1)}%</b>，中位数 ${scan.best.med.toFixed(3)}x
+        <span style="color:var(--text-muted)">（全样本基准胜率 ${scan.baseWin.toFixed(1)}%${currRow ? `；当前阈值 ${op} ${formatNumberSmart(currT)} 的通过侧胜率 ${currRow.win.toFixed(1)}%` : ''}）</span>
+        <details style="margin-top:6px;"><summary>展开各候选阈值的扫描结果</summary>
+          <div class="table-scroll" style="max-height:220px; margin-top:6px;">
+            <table class="desc-table">
+              <thead><tr><th class="num">阈值</th><th class="num">通过数</th><th class="num">通过侧胜率</th><th class="num">通过侧中位数</th><th class="num">被拦侧胜率</th></tr></thead>
+              <tbody>${scan.rows.map(r => `<tr${r === scan.best ? ' style="background:rgba(48,209,88,.12);"' : ''}>
+                <td class="num">${op} ${formatNumberSmart(r.t)}</td>
+                <td class="num">${r.nPass}</td>
+                <td class="num"><b>${r.win.toFixed(1)}%</b></td>
+                <td class="num">${r.med.toFixed(3)}x</td>
+                <td class="num" style="color:var(--text-muted)">${r.blockWin.toFixed(1)}%</td>
+              </tr>`).join('')}</tbody>
+            </table>
+          </div>
+        </details>
+        <span style="color:var(--warn,#ff9f0a)">注意：这是在【历史数据上挑出来的最优切点】，天然偏乐观；换新数据大概率没这么好。样本少时尤其别当准。</span>
+      </div>`;
+    } else if (st.expect) {
+      recHtml = `<div class="hint" style="margin:0 0 8px; color:var(--text-muted)">该 check 的期望是 <code>${escapeHtml(st.expect)}</code>（区间/等值判定，或数值样本不足 20 个），没有单一切点可推荐。</div>`;
+    }
+
+    detail.innerHTML = recHtml + verdictHtml + `
+      <div class="hint" style="margin:0 0 6px;">
+        <b>${escapeHtml(name)}</b>${rows[0] && rows[0].expect ? ` <code style="color:var(--text-muted)">期望 ${escapeHtml(rows[0].expect)}</code>` : ''} 拦掉的 ${rows.length} 个样本${st.soleBlock ? `（其中 <b style="color:var(--warn,#ff9f0a)">${st.soleBlock} 个是单点否决</b>，放宽这一条就能命中）` : ''}
+        <button type="button" id="copyBlockedCaBtn" class="secondary" style="padding:2px 10px; font-size:11px; margin-left:8px;">📋 复制这些 CA</button>
+        <button type="button" id="fillBlockedCaBtn" class="secondary" style="padding:2px 10px; font-size:11px;">填入上方"目标 CA"</button>
+      </div>
+      <div class="table-scroll" style="max-height:300px;" id="blockedCaTableWrap">${renderBlockedTable()}</div>`;
+    // 表头点击排序：同列再点反向。表格每次重渲染都会换掉 DOM，所以绑在外层容器上做委托。
+    const wrap = document.getElementById('blockedCaTableWrap');
+    if (wrap) wrap.addEventListener('click', ev => {
+      const th = ev.target.closest('th[data-sort]');
+      if (!th) return;
+      const k = th.dataset.sort;
+      if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = (k === 'symbol') ? 1 : -1; }
+      wrap.innerHTML = renderBlockedTable();
+    });
+    document.getElementById('copyBlockedCaBtn').addEventListener('click', () => {
+      navigator.clipboard.writeText(caList).then(() => showToast(`已复制 ${rows.length} 个 CA`)).catch(err => showToast('复制失败：' + err, true));
+    });
+    document.getElementById('fillBlockedCaBtn').addEventListener('click', () => {
+      document.getElementById('caAdvisorInput').value = caList;
+      showToast('已填入上方"目标 CA"，可直接点"分析"看它们的字段分布，或用 CA 定位反推过滤规则');
+      document.getElementById('caAdvisorInput').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+    detail.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  });
+
+  // 用当前数据源回放：忽略 CA 输入框，跑整个工作集。样本多时耗时明显，套一层 loading。
+  document.getElementById('genStrategyDiagAllBtn').addEventListener('click', () => {
+    withLoading(`正在对 ${activeRows.length} 条样本回放策略...`, () =>
+      renderStrategyDiag('', document.getElementById('strategyCodeInput').value, true));
+  });
+  // ---- 代码编辑器交互：行号 / 统计 / 折叠 / 清空 / Tab 缩进 ----
+  (() => {
+    const ta = document.getElementById('strategyCodeInput');
+    const gutter = document.getElementById('strategyCodeGutter');
+    const meta = document.getElementById('strategyCodeMeta');
+    const editor = document.getElementById('strategyCodeEditor');
+    if (!ta || !gutter) return;
+    const sync = () => {
+      const lines = ta.value ? ta.value.split('\n').length : 1;
+      // 行号槽独立渲染，跟 textarea 用同一套字号/行高，滚动时手动对齐
+      gutter.textContent = Array.from({ length: lines }, (_, i) => i + 1).join('\n');
+      if (meta) meta.textContent = ta.value ? `${lines} 行 · ${ta.value.length} 字符` : '空';
+    };
+    ta.addEventListener('input', sync);
+    // textarea 滚动时行号跟着滚，否则长代码里行号会和代码错位
+    ta.addEventListener('scroll', () => { gutter.scrollTop = ta.scrollTop; });
+    // Tab 插入两个空格而不是跳走焦点——粘进来的代码要微调缩进时，默认行为会直接跳出输入框
+    ta.addEventListener('keydown', e => {
+      if (e.key !== 'Tab') return;
+      e.preventDefault();
+      const s0 = ta.selectionStart, e0 = ta.selectionEnd;
+      ta.value = ta.value.slice(0, s0) + '  ' + ta.value.slice(e0);
+      ta.selectionStart = ta.selectionEnd = s0 + 2;
+      sync();
+    });
+    // ---- 代码搜索：在 textarea 里定位并选中匹配 ----
+    // 267 行的策略代码里找一条 check 很费劲。用 setSelectionRange 选中 + 手动滚到该行，
+    // 比浏览器自带的 Ctrl+F 好用（自带的在 textarea 里定位不准、也不会选中）。
+    const searchInput = document.getElementById('strategyCodeSearch');
+    const searchCount = document.getElementById('strategyCodeSearchCount');
+    let matches = [], matchIdx = -1;
+    const lineHeightPx = () => {
+      const lh = parseFloat(getComputedStyle(ta).lineHeight);
+      return Number.isFinite(lh) ? lh : 18;
+    };
+    function findMatches() {
+      const q = (searchInput.value || '').trim();
+      matches = [];
+      if (q) {
+        const hay = ta.value.toLowerCase(), needle = q.toLowerCase();
+        let i = hay.indexOf(needle);
+        while (i !== -1) { matches.push(i); i = hay.indexOf(needle, i + Math.max(1, needle.length)); }
+      }
+      matchIdx = matches.length ? 0 : -1;
+      updateCount();
+      if (matches.length) jumpTo(0);
+    }
+    function updateCount() {
+      if (!searchCount) return;
+      const q = (searchInput.value || '').trim();
+      searchCount.textContent = !q ? '' : (matches.length ? `${matchIdx + 1}/${matches.length}` : '无匹配');
+      searchCount.style.color = (q && !matches.length) ? 'var(--warn, #ff9f0a)' : '';
+    }
+    function jumpTo(i) {
+      if (!matches.length) return;
+      matchIdx = (i + matches.length) % matches.length;
+      const pos = matches[matchIdx];
+      const len = (searchInput.value || '').trim().length;
+      ta.focus();
+      ta.setSelectionRange(pos, pos + len);
+      // 滚到匹配行并留几行上下文，否则匹配可能贴在视口最顶/最底看不清
+      const lineNo = ta.value.slice(0, pos).split('\n').length - 1;
+      ta.scrollTop = Math.max(0, (lineNo - 4) * lineHeightPx());
+      gutter.scrollTop = ta.scrollTop;
+      updateCount();
+    }
+    if (searchInput) {
+      searchInput.addEventListener('input', findMatches);
+      searchInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); jumpTo(matchIdx + (e.shiftKey ? -1 : 1)); }
+        else if (e.key === 'Escape') { searchInput.value = ''; findMatches(); }
+      });
+      document.getElementById('strategyCodeSearchNext').addEventListener('click', () => jumpTo(matchIdx + 1));
+      document.getElementById('strategyCodeSearchPrev').addEventListener('click', () => jumpTo(matchIdx - 1));
+    }
+    // 代码变了要重算匹配，否则计数会对不上
+    ta.addEventListener('input', () => { if (searchInput && searchInput.value.trim()) findMatches(); });
+
+    const foldBtn = document.getElementById('strategyCodeFoldBtn');
+    if (foldBtn) foldBtn.addEventListener('click', () => {
+      const folded = editor.classList.toggle('folded');
+      foldBtn.textContent = folded ? '▸ 展开' : '▾ 折叠';
+    });
+    const clearBtn = document.getElementById('strategyCodeClearBtn');
+    if (clearBtn) clearBtn.addEventListener('click', async () => {
+      if (!ta.value) return;
+      if (!await showConfirm('确定清空策略代码？', { danger: true, okText: '清空' })) return;
+      ta.value = ''; sync();
+      try { localStorage.removeItem(STRATEGY_CODE_STORAGE_KEY); } catch (err) {}
+      showToast('已清空');
+    });
+    sync();
+    // 恢复本地缓存后要再同步一次行号（下面那段 localStorage 恢复在此之后执行）
+    setTimeout(sync, 0);
+  })();
+
   // 策略代码通常是从编辑器里粘过来的一大段，每次切换页面都要重贴太折腾，存本地
   const strategyCodeEl = document.getElementById('strategyCodeInput');
   try {

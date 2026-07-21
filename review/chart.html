@@ -263,12 +263,59 @@
     .desc-table th { background: var(--surface-2); }
     .desc-table td:first-child { font-family: "SF Mono", "SFMono-Regular", Consolas, monospace; color: var(--text); vertical-align: top; font-size: 11.5px; }
     .desc-table td:last-child { color: var(--text-muted); }
+    /* 策略代码编辑器：原来是个裸 textarea，长代码里找一行、对齐缩进都很费劲。
+       加上行号槽 + 头部工具条（字符/行数、折叠、清空），并支持 Tab 缩进。 */
+    .code-editor { border: 1px solid var(--border-subtle); border-radius: 8px; overflow: hidden; background: var(--surface-2); }
+    .code-editor-bar { display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+      background: var(--surface); border-bottom: 1px solid var(--border-subtle); font-size: 11.5px; }
+    .code-editor-title { font-family: "SF Mono", "SFMono-Regular", Consolas, monospace; color: var(--text); font-weight: 500; }
+    .code-editor-meta { color: var(--text-muted); }
+    .code-editor-btn { background: transparent; border: 1px solid var(--border-subtle); color: var(--text-muted);
+      border-radius: 5px; padding: 2px 10px; font-size: 11px; cursor: pointer; }
+    .code-editor-btn:hover { color: var(--accent); border-color: var(--accent); }
+    .code-editor-search { width: 220px; background: var(--surface-2); border: 1px solid var(--border-subtle);
+      border-radius: 5px; padding: 3px 8px; font-size: 11.5px; color: var(--text); outline: none; }
+    .code-editor-search:focus { border-color: var(--accent); }
+    .code-editor-search::placeholder { color: var(--text-muted); }
+    /* 数据源里的策略名徽标：一份工作集可能通过"追加数据"混入多个策略，各自标出样本数 */
+    .strategy-badge-wrap { display: inline-flex; flex-wrap: wrap; gap: 6px; margin-left: 12px; vertical-align: middle; }
+    .strategy-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 500;
+      padding: 2px 10px; border-radius: 999px; background: rgba(10,132,255,.12); color: var(--accent);
+      border: 1px solid rgba(10,132,255,.28); }
+    .strategy-badge b { font-weight: 600; opacity: .8; }
+    .code-editor-body { display: flex; align-items: stretch; max-height: 340px; }
+    .code-editor.folded .code-editor-body { display: none; }
+    .code-gutter { flex: 0 0 auto; padding: 10px 8px 10px 12px; text-align: right; user-select: none;
+      font-family: "SF Mono", "SFMono-Regular", Consolas, monospace; font-size: 12px; line-height: 1.55;
+      color: var(--text-muted); background: var(--surface-2); border-right: 1px solid var(--border-subtle);
+      overflow: hidden; white-space: pre; opacity: .65; }
+    .code-editor-body textarea { flex: 1 1 auto; border: 0; outline: none; resize: none; background: transparent;
+      color: var(--text); padding: 10px 12px; font-family: "SF Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 12px; line-height: 1.55; tab-size: 2; overflow: auto; min-height: 200px; }
+
     /* 策略诊断：每个目标 CA 一张卡片（命中状态 + checks 明细），卡片之间留白，避免多个 CA 的
        checks 表格连成一片分不清哪张是哪个 CA 的 */
     .strategy-diag-card { border: 1px solid var(--border-subtle); border-radius: 8px; padding: 12px; margin: 0 0 12px; background: var(--surface-2); }
     .strategy-diag-head { font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .strategy-diag-card .desc-table { background: var(--surface); border-radius: 6px; overflow: hidden; }
     .strategy-diag-log { font-size: 11.5px; background: var(--surface); border-radius: 6px; padding: 8px 10px; margin: 6px 0 0; white-space: pre-wrap; word-break: break-all; color: var(--text-muted); }
+    /* 字段说明浮层：鼠标移到图表标题的字段名（或其它带 data-field-tip 的元素）上时显示，
+       给出该字段的分类、中文含义和计算公式，省去回字段字典里翻查 */
+    .field-tip {
+      position: fixed; z-index: 9999; max-width: 460px; pointer-events: none;
+      background: var(--surface); color: var(--text); border: 1px solid var(--border-subtle);
+      border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.6;
+      box-shadow: 0 8px 28px rgba(0,0,0,.35); display: none;
+    }
+    .field-tip.show { display: block; }
+    .field-tip-name { font-family: "SF Mono", "SFMono-Regular", Consolas, monospace; font-size: 12px; word-break: break-all; }
+    .field-tip-kind { display: inline-block; font-size: 10.5px; padding: 1px 6px; border-radius: 4px; margin-left: 6px; vertical-align: middle; background: var(--surface-2); color: var(--text-muted); }
+    .field-tip-desc { margin-top: 6px; color: var(--text-muted); }
+    .field-tip-code { margin-top: 6px; padding: 6px 8px; background: var(--surface-2); border-radius: 6px;
+      font-family: "SF Mono", "SFMono-Regular", Consolas, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all; color: var(--text); }
+    /* 标题里的字段名：提示可点/可悬停 */
+    .plot-title-field { cursor: help; border-bottom: 1px dashed var(--border-subtle); }
+    .plot-title-field:hover { border-bottom-color: var(--accent); color: var(--accent); }
     .coverage-bar-wrap { position: relative; background: var(--surface-2); border-radius: 4px; height: 16px; width: 120px; overflow: hidden; }
     .coverage-bar-fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); opacity: .5; }
     .coverage-bar-text { position: relative; z-index: 1; font-size: 11px; line-height: 16px; text-align: center; }
@@ -354,7 +401,7 @@
       padding: 4px 10px; font-size: 11.5px;
       font-family: "SF Mono", "SFMono-Regular", Consolas, monospace;
     }
-    #fieldBrowserOriginal, #fieldBrowserAssembled { align-content: flex-start; }
+    #fieldBrowserHolding, #fieldBrowserAssembled, #fieldBrowserSignal, #fieldBrowserVolume, #fieldBrowserDev, #fieldBrowserStat, #fieldBrowserChip, #fieldBrowserHolder { align-content: flex-start; }
     .tag-input:focus-within { border-color: var(--accent); box-shadow: 0 0 0 4px rgba(10,132,255,.25); }
     .tag-input input, .tag-input input:focus, .tag-input input:hover {
       flex: 1; min-width: 200px; background: transparent; border: none; box-shadow: none;
@@ -606,6 +653,7 @@
     <div class="section">
       <div class="panel-header-row" data-target="sourceBody">
         <h3>数据源</h3>
+        <span id="dataSourceStrategy" class="strategy-badge-wrap"></span>
         <button type="button" class="collapse-toggle">▾</button>
       </div>
       <div class="panel-body" id="sourceBody">
@@ -683,7 +731,7 @@
         <div class="table-scroll" style="margin-top: 10px; max-height: 300px;">
           <table class="desc-table">
             <thead>
-              <tr><th>symbol</th><th>token_address (CA)</th><th class="num">returnMax</th><th class="num">匹配值</th></tr>
+              <tr><th>symbol</th><th>token_address (CA)</th><th>信号类型</th><th class="num">returnMax</th><th class="num">匹配值</th><th>链接</th></tr>
             </thead>
             <tbody id="filterBody"></tbody>
           </table>
@@ -989,27 +1037,87 @@
             </div>
           </div>
           <div id="fieldBrowserPanel" class="hidden" style="margin-top: 8px;">
-            <p class="hint" style="margin: 0 0 6px;">点击字段名直接加入 X（和上面输入联想选中效果一样），按"原字段"/"组装字段"分组浏览，不用一个个打字联想。</p>
+            <p class="hint" style="margin: 0 0 6px;">点击字段名直接加入 X（和上面输入联想选中效果一样），按"持仓指标"/"组装字段"/"信号字段"/"K线量能"/"dev/stat/筹码/持有人"等分组浏览，不用一个个打字联想。</p>
             <div class="row" style="align-items: flex-start;">
               <div class="control" style="min-width: 260px;">
                 <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
-                  <span>原字段（数据里可直接统计的字段）<span id="fieldBrowserOriginalCount" class="hint" style="margin:0;"></span></span>
+                  <span>持仓指标（各类钱包持仓占比）<span id="fieldBrowserHoldingCount" class="hint" style="margin:0;"></span></span>
                   <span style="display:flex; gap:6px;">
-                    <button type="button" id="fieldBrowserCopyOriginal" class="secondary" style="padding:3px 10px; font-size:11px;">📋 复制字段名</button>
-                    <button type="button" id="fieldBrowserAddAllOriginal" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                    <button type="button" id="fieldBrowserCopyHolding" class="secondary" style="padding:3px 10px; font-size:11px;">📋 复制字段名</button>
+                    <button type="button" id="fieldBrowserAddAllHolding" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
                   </span>
                 </label>
-                <div id="fieldBrowserOriginal" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
+                <div id="fieldBrowserHolding" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
               </div>
               <div class="control" style="min-width: 260px;">
                 <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
-                  <span>组装字段（比率/差值等衍生字段 + 自定义字段）<span id="fieldBrowserAssembledCount" class="hint" style="margin:0;"></span></span>
+                  <span>组装字段（比率/差值等衍生计算 + 自定义字段）<span id="fieldBrowserAssembledCount" class="hint" style="margin:0;"></span></span>
                   <span style="display:flex; gap:6px;">
                     <button type="button" id="fieldBrowserCopyAssembled" class="secondary" style="padding:3px 10px; font-size:11px;">📋 复制字段名</button>
                     <button type="button" id="fieldBrowserAddAllAssembled" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
                   </span>
                 </label>
                 <div id="fieldBrowserAssembled" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
+              </div>
+              <div class="control" style="min-width: 260px;">
+                <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                  <span>信号字段（从六类信号列表提取）<span id="fieldBrowserSignalCount" class="hint" style="margin:0;"></span></span>
+                  <span style="display:flex; gap:6px;">
+                    <button type="button" id="fieldBrowserCopySignal" class="secondary" style="padding:3px 10px; font-size:11px;">📋 复制字段名</button>
+                    <button type="button" id="fieldBrowserAddAllSignal" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                  </span>
+                </label>
+                <div id="fieldBrowserSignal" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
+              </div>
+              <div class="control" style="min-width: 260px;">
+                <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                  <span>K线量能字段（来自 kline_bars 序列统计）<span id="fieldBrowserVolumeCount" class="hint" style="margin:0;"></span></span>
+                  <span style="display:flex; gap:6px;">
+                    <button type="button" id="fieldBrowserCopyVolume" class="secondary" style="padding:3px 10px; font-size:11px;">📋 复制字段名</button>
+                    <button type="button" id="fieldBrowserAddAllVolume" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                  </span>
+                </label>
+                <div id="fieldBrowserVolume" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
+              </div>
+              <div class="control" style="min-width: 260px;">
+                <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                  <span>dev 字段（创建者/开发者维度，gmgn.dev.*）<span id="fieldBrowserDevCount" class="hint" style="margin:0;"></span></span>
+                  <span style="display:flex; gap:6px;">
+                    <button type="button" id="fieldBrowserCopyDev" class="secondary" style="padding:3px 10px; font-size:11px;">📋 复制字段名</button>
+                    <button type="button" id="fieldBrowserAddAllDev" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                  </span>
+                </label>
+                <div id="fieldBrowserDev" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
+              </div>
+              <div class="control" style="min-width: 260px;">
+                <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                  <span>stat 字段（持仓结构/交易者画像，gmgn.stat.*）<span id="fieldBrowserStatCount" class="hint" style="margin:0;"></span></span>
+                  <span style="display:flex; gap:6px;">
+                    <button type="button" id="fieldBrowserCopyStat" class="secondary" style="padding:3px 10px; font-size:11px;">📋 复制字段名</button>
+                    <button type="button" id="fieldBrowserAddAllStat" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                  </span>
+                </label>
+                <div id="fieldBrowserStat" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
+              </div>
+              <div class="control" style="min-width: 260px;">
+                <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                  <span>筹码字段（筹码峰分析，chip_analysis.*）<span id="fieldBrowserChipCount" class="hint" style="margin:0;"></span></span>
+                  <span style="display:flex; gap:6px;">
+                    <button type="button" id="fieldBrowserCopyChip" class="secondary" style="padding:3px 10px; font-size:11px;">📋 复制字段名</button>
+                    <button type="button" id="fieldBrowserAddAllChip" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                  </span>
+                </label>
+                <div id="fieldBrowserChip" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
+              </div>
+              <div class="control" style="min-width: 260px;">
+                <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                  <span>持有人字段（Top100 持有人快照聚合，holder_*）<span id="fieldBrowserHolderCount" class="hint" style="margin:0;"></span></span>
+                  <span style="display:flex; gap:6px;">
+                    <button type="button" id="fieldBrowserCopyHolder" class="secondary" style="padding:3px 10px; font-size:11px;">📋 复制字段名</button>
+                    <button type="button" id="fieldBrowserAddAllHolder" class="secondary" style="padding:3px 10px; font-size:11px;">+ 全部加入X</button>
+                  </span>
+                </label>
+                <div id="fieldBrowserHolder" class="table-scroll" style="max-height: 220px; padding: 8px; display:flex; flex-wrap:wrap; gap:6px;"></div>
               </div>
             </div>
           </div>
@@ -1040,6 +1148,18 @@
       <button type="button" class="secondary batch-chart-op-btn" data-op="showBinned" data-val="true">全部启用分档统计</button>
       <button type="button" class="secondary" id="resetAllChartOptsBtn">重置全部为默认</button>
     </div>
+    <div class="row" style="margin-top: 8px; gap: 8px; align-items: center; flex-wrap: wrap;">
+      <label class="chart-opt" title="有效样本数 = 该字段与 Y 同时有值的行数。覆盖率太低的字段，图上点很少、置信区间极宽，结论没有意义">
+        <input type="checkbox" id="minCoverageEnabled"> 仅显示有效样本 ≥
+      </label>
+      <input type="number" id="minCoveragePct" value="50" min="1" step="5" style="width: 72px;">
+      <select id="minCoverageUnit" style="width: auto;">
+        <option value="pct" selected>% 样本集</option>
+        <option value="abs">条（绝对 n）</option>
+      </select>
+      <span class="hint" style="margin: 0;">的图（有效样本不足的字段的图会被隐藏，不影响已选中的 X 字段列表）</span>
+      <span class="hint" id="minCoverageNote" style="margin: 0; color: var(--warn, #ff9f0a);"></span>
+    </div>
     <div class="row" style="margin-top: 10px;">
       <div class="control" style="flex: 1 1 100%;">
         <label for="searchCaInput">查找 CA（支持多个，用逗号 / 空格 / 换行分隔，命中的数据点会在下方所有图表中高亮）</label>
@@ -1055,7 +1175,7 @@
 
   <div class="panel hidden" id="binBarPanel">
     <div class="panel-header-row" data-target="binBarBody_">
-      <h3>分箱柱状图（按区间分箱后看均值±误差棒，推荐用于分布不均匀的数据）</h3>
+      <h3>分箱柱状图（按区间分箱后看胜率/中位数/均值，推荐用于分布不均匀的数据）</h3>
       <button type="button" class="collapse-toggle">▾</button>
     </div>
     <div class="panel-body" id="binBarBody_">
@@ -1072,6 +1192,14 @@
       <div class="control">
         <label for="binBreakpoints">分箱断点（逗号分隔）</label>
         <input type="text" id="binBreakpoints" value="0.5,1,1.5,2">
+      </div>
+      <div class="control" style="flex: 0; min-width: 150px;">
+        <label for="binPrimaryStat">主指标（柱子高度）</label>
+        <select id="binPrimaryStat">
+          <option value="winRate" selected>胜率（倍数&gt;2）</option>
+          <option value="median">中位数</option>
+          <option value="mean">均值</option>
+        </select>
       </div>
       <div class="control" style="flex: 0; min-width: 140px;">
         <label for="binErrorType">误差棒类型</label>
@@ -1098,11 +1226,92 @@
         <span class="hint" id="binRecommendHint" style="margin: 0;">基于当前数值字段与目标收益的区分度自动计算</span>
       </div>
     </div>
-    <div class="row" style="margin: 0 0 6px;"><button type="button" class="secondary export-png-btn" data-target="binBarChart" data-filename="分箱柱状图">🖼 导出PNG</button></div>
+    <div class="row" style="margin: 0 0 6px; gap: 8px;">
+      <button type="button" class="secondary export-png-btn" data-target="binBarChart" data-filename="分箱柱状图">🖼 导出PNG</button>
+      <button type="button" class="secondary" id="copyBinBarAiBtn" title="把分箱结果、全样本基准、统计能力边界、样本外验证和已知局限一起导出成 Markdown，粘贴给 AI 让它给改进建议">🤖 复制给 AI 诊断</button>
+      <button type="button" class="secondary" id="downloadBinBarAiBtn">⬇ 下载 Markdown</button>
+    </div>
     <div id="binBarChart" style="width: 100%; height: 420px;"></div>
+    <div id="binBarSummary" class="hint" style="margin: 10px 0;"></div>
+
+    <h5 style="margin: 20px 0 6px;">胜率曲线：看形态、找波峰</h5>
+    <p class="hint" style="margin: 0 0 10px;">把样本按分箱字段排序后用滑动窗口逐点算胜率，画成连续曲线，不依赖人为选的断点。<b>橙色虚线是全样本基准，浅色带是每个位置的 95% 置信区间（Wilson）</b>。判断标准很简单：<b>只有置信带的下边缘整段抬到基准线以上，那个波峰才值得当真</b>；带子跨过基准线的起伏都是抽样噪声。单峰形态通常是真信号，上下锯齿多半是噪声。</p>
+    <div class="row">
+      <div class="control" style="flex: 0; min-width: 130px;">
+        <label for="curveWindow">窗口大小（样本数）</label>
+        <input type="number" id="curveWindow" value="30" min="10" step="5">
+      </div>
+      <div class="control" style="flex: 0; min-width: 130px;">
+        <label for="peakWinThreshold">"赢"的阈值（倍数）</label>
+        <select id="peakWinThreshold">
+          <option value="2" selected>&gt; 2（翻倍）</option>
+          <option value="5">&gt; 5（5倍）</option>
+          <option value="10">&gt; 10（大票）</option>
+        </select>
+      </div>
+      <div class="control checkbox-control" style="flex: 0 0 auto; min-width: auto;">
+        <label><input type="checkbox" id="curveLogX"> X 轴对数（取值跨度大时用）</label>
+      </div>
+      <div class="control" style="flex: 0 0 auto; min-width: auto;">
+        <button type="button" id="genWinCurveBtn">生成胜率曲线</button>
+      </div>
+    </div>
+    <div id="winCurveChart" style="width: 100%; height: 400px;"></div>
+    <div id="winCurveSummary" class="hint" style="margin: 10px 0;"></div>
+
+    <h5 style="margin: 20px 0 6px;">集体检测：一次扫完所有字段，把有真波峰的挑出来</h5>
+    <p class="hint" style="margin: 0 0 10px;">对每个字段各跑一遍上面那套滑动窗口 + 置换检验，直接列出<b>哪些字段确实存在非噪声的波峰</b>，不用一个个手动试。窗口按各字段自己的有效样本量自适应。<b>同时检验几十个字段本身又是一次多重比较</b>（46 个字段纯随机也会冒出 2~3 个 p&lt;0.05），因此对所有字段的置换 p 再做一次 BH-FDR 校正，只有校正后仍显著的才标为可用。</p>
+    <div class="row">
+      <div class="control" style="flex: 0; min-width: 150px;">
+        <label for="scanScope">扫描范围</label>
+        <select id="scanScope">
+          <option value="trusted" selected>常用字段</option>
+          <option value="all">全部数值字段</option>
+        </select>
+      </div>
+      <div class="control" style="flex: 0; min-width: 130px;">
+        <label for="scanPermN">置换次数</label>
+        <select id="scanPermN">
+          <option value="1000" selected>1000（快）</option>
+          <option value="3000">3000（准）</option>
+        </select>
+      </div>
+      <div class="control" style="flex: 0 0 auto; min-width: auto;">
+        <button type="button" id="genFieldScanBtn">开始集体检测</button>
+      </div>
+      <div class="control" style="flex: 0 0 auto; min-width: auto;">
+        <button type="button" id="addScanPassedToXBtn" class="secondary">把通过的字段加入 X 指标</button>
+      </div>
+    </div>
+    <div id="fieldScanSummary" class="hint" style="margin: 10px 0;"></div>
+    <div class="table-scroll" style="max-height: 420px;">
+      <table class="desc-table">
+        <thead><tr><th>字段</th><th class="num">有效 n</th><th class="num">窗口</th><th class="num">基准胜率</th><th class="num">最长区段</th><th class="num">随机95分位</th><th class="num">校正后 p</th><th>结论 / 波峰位置</th><th>操作</th></tr></thead>
+        <tbody id="fieldScanBody"></tbody>
+      </table>
+    </div>
+
+    <h5 style="margin: 20px 0 6px;">断点挖掘：训练段找切点，验证段检验是否延续</h5>
+    <p class="hint" style="margin: 0 0 10px;">按时间把样本切成前后两段：<b>只在前段（训练）搜索最优切点，再原样拿到后段（验证）套用</b>。过拟合出来的规则在新数据上会失效甚至反向，真实规律才会保持同向。这条路不依赖样本量达到检验功效门槛——小样本下 p 值必然全都不显著（下方会算给你看），而样本外验证仍然能给出可操作的判断。结果可一键填回断点框。</p>
+    <div class="row">
+      <div class="control" style="flex: 0; min-width: 130px;">
+        <label for="mineMinN">每侧最少样本</label>
+        <input type="number" id="mineMinN" value="20" min="5" step="5">
+      </div>
+      <div class="control" style="flex: 0 0 auto; min-width: auto;">
+        <button type="button" id="genBreakpointMineBtn">挖掘最优断点</button>
+      </div>
+    </div>
+    <div id="breakpointMineSummary" class="hint" style="margin: 10px 0;"></div>
+    <div class="table-scroll" style="max-height: 420px;">
+      <table class="desc-table">
+        <thead><tr><th class="num">切分点</th><th class="num">左侧 n / 胜率</th><th class="num">右侧 n / 胜率</th><th class="num">差异</th><th class="num">提升</th><th class="num">校正后 p</th><th>结论</th><th>操作</th></tr></thead>
+        <tbody id="breakpointMineBody"></tbody>
+      </table>
+    </div>
     <div class="table-scroll" style="margin-top: 10px; max-height: 240px;">
       <table class="desc-table">
-        <thead><tr><th>区间</th><th class="num">样本数</th><th class="num">均值</th><th class="num">标准差</th><th class="num">95% CI</th></tr></thead>
+        <thead><tr><th>区间</th><th class="num">样本数</th><th class="num">胜率(&gt;2)</th><th class="num">命中(&gt;5)</th><th class="num">命中(&gt;10)</th><th class="num">中位数</th><th class="num">均值</th><th class="num">标准差</th><th class="num">95% CI</th><th>提示</th></tr></thead>
         <tbody id="binBarBody"></tbody>
       </table>
     </div>
@@ -1530,15 +1739,38 @@
               </div>
             </div>
             <div class="control" style="flex: 0 0 auto; min-width: auto;">
+              <select id="rocBatchGroup" style="width:auto;">
+                <option value="">选择字段分组…</option>
+                <option value="holding">持仓指标</option>
+                <option value="assembled">组装字段</option>
+                <option value="signal">信号字段</option>
+                <option value="volume">K线量能字段</option>
+                <option value="dev">dev 字段</option>
+                <option value="stat">stat 字段</option>
+                <option value="chip">筹码字段</option>
+                <option value="holder">持有人字段</option>
+              </select>
+            </div>
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
+              <button type="button" id="importRocGroupBtn" class="secondary">导入该分组</button>
+            </div>
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="importRocTop10Btn">导入相关性表 Top10</button>
             </div>
             <div class="control" style="flex: 0 0 auto; min-width: auto;">
               <button type="button" id="genRocBatchBtn">批量计算 AUC</button>
             </div>
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
+              <button type="button" id="clearRocBatchBtn" class="secondary danger" title="清空候选字段和下方结果">🗑 一键清空</button>
+            </div>
+          </div>
+          <div class="row">
+            <div id="rocBatchNote" class="hint" style="margin: 0; flex: 1 1 100%;"></div>
+            </div>
           </div>
           <div class="table-scroll" style="margin-top: 10px; max-height: 260px;">
             <table class="desc-table">
-              <thead><tr><th>字段</th><th class="num">样本数</th><th class="num">AUC</th><th>方向</th><th class="num">推荐阈值</th><th class="num">精确率</th><th class="num">召回率</th></tr></thead>
+              <thead><tr><th>字段</th><th class="num">样本数</th><th class="num">AUC</th><th class="num">95% 置信区间</th><th>结论</th><th>方向</th><th class="num">推荐阈值</th><th class="num">精确率</th><th class="num">召回率</th></tr></thead>
               <tbody id="rocBatchBody"></tbody>
             </table>
           </div>
@@ -1627,15 +1859,36 @@
           <div class="row">
             <div class="control" style="flex: 1 1 100%;">
               <label for="strategyCodeInput">策略代码（粘贴 code.js 的内容）</label>
-              <textarea id="strategyCodeInput" rows="8" placeholder="var ki = ctx.kline_and_indicators || {}&#10;...&#10;var checks = [&#10;  ['平台', allow.indexOf(logearn.platform) !== -1, String(logearn.platform)],&#10;  ...&#10;]&#10;..." spellcheck="false" style="font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px;"></textarea>
+              <div class="code-editor" id="strategyCodeEditor">
+                <div class="code-editor-bar">
+                  <span class="code-editor-title">code.js</span>
+                  <span class="code-editor-meta" id="strategyCodeMeta">空</span>
+                  <span style="flex:1"></span>
+                  <input type="search" id="strategyCodeSearch" class="code-editor-search" placeholder="搜索代码…  Enter 下一个 / Shift+Enter 上一个" spellcheck="false">
+                  <span class="code-editor-meta" id="strategyCodeSearchCount"></span>
+                  <button type="button" class="code-editor-btn" id="strategyCodeSearchPrev" title="上一个匹配">↑</button>
+                  <button type="button" class="code-editor-btn" id="strategyCodeSearchNext" title="下一个匹配">↓</button>
+                  <button type="button" class="code-editor-btn" id="strategyCodeFoldBtn" title="折叠/展开代码框">▾ 折叠</button>
+                  <button type="button" class="code-editor-btn" id="strategyCodeClearBtn" title="清空代码">清空</button>
+                </div>
+                <div class="code-editor-body">
+                  <div class="code-gutter" id="strategyCodeGutter">1</div>
+                  <textarea id="strategyCodeInput" spellcheck="false" wrap="off"
+                    placeholder="粘贴 code.js 的内容，例如：&#10;&#10;const ki = ctx.kline_and_indicators || {}&#10;const logearn = ctx.logearn || {}&#10;&#10;const checks = [&#10;  ['平台', ALLOW.indexOf(logearn.platform) !== -1, String(logearn.platform), '白名单'],&#10;  ['市值', mcap < 120000, mcap.toFixed(0), '< 120000'],&#10;]&#10;if (!checks.every(c => c[1])) return false&#10;return true"></textarea>
+                </div>
+              </div>
             </div>
           </div>
           <div class="row">
             <div class="control" style="flex: 0 0 auto; min-width: auto;">
-              <button type="button" id="genStrategyDiagBtn">回放策略</button>
+              <button type="button" id="genStrategyDiagBtn">回放策略（上方 CA 列表）</button>
+            </div>
+            <div class="control" style="flex: 0 0 auto; min-width: auto;">
+              <button type="button" id="genStrategyDiagAllBtn" class="secondary" title="忽略上方 CA 输入框，直接对当前工作集的全部样本回放——能得出每条 check 在整体上拦了多少、放宽能多命中几个">▶ 用当前数据源回放（全部样本）</button>
             </div>
           </div>
           <div id="strategyDiagSummary" class="hint" style="margin: 10px 0;"></div>
+          <div id="strategyDiagBoard" style="margin: 10px 0;"></div>
           <div id="strategyDiagFields" style="margin: 10px 0;"></div>
           <div id="strategyDiagBody"></div>
         </div>

@@ -2,6 +2,50 @@
 // 依赖 utils.js（num 内部逻辑自洽，pearson 用于 computeCorrelations）；
 // isAssembledField 依赖 custom-fields.js 里的 customFields（仅在函数体内读取，加载顺序无要求）。
 
+// K线量能形态字段清单：单独列出（而不是散在 DERIVED_KEYS 里），供字段浏览器把它们从"组装字段"
+// 拆成独立分组——它们全部来自同一处计算（buildRows 里的 kline_bars 序列统计），归类上更接近
+// "同一主题的一组指标"而不是零散的比率/差值组装字段，混在一起不利于筛选/浏览。
+const KLINE_VOLUME_KEYS = [
+  'kline_volume_concentration_pct',
+  'kline_minutes_since_max_volume',
+  'kline_volume_cv',
+  'kline_volume_recent_ratio',
+  'kline_volume_trend_ratio',
+  'kline_turnover_pct',
+  'kline_max_rise_speed_pct_per_min',
+  'kline_max_rise_pct',
+  'kline_bar_minutes',
+  'kline_max_rise_window_min',
+  // Top100 持有人快照聚合
+  'holder_exchange_ratio',
+  'holder_transfer_in_ratio',
+  'holder_never_bought_ratio',
+  'holder_transfer_amount_ratio',
+  'holder_bot_ratio',
+  'holder_bundler_ratio',
+  'holder_paper_hands_ratio',
+  'holder_smart_ratio',
+  'holder_suspicious_ratio',
+  'holder_new_ratio',
+  'holder_gini',
+  'holder_hhi',
+  'holder_in_profit_ratio',
+  'holder_sold_ratio',
+  'holder_entry_concentration',
+  // gmgn 顶层字段组装
+  'gmgn_net_buy_vol_ratio_5m',
+  'gmgn_net_buy_vol_ratio_1h',
+  'gmgn_buy_sell_count_ratio_1h',
+  'gmgn_vol_accel_5m_1h',
+  'gmgn_liquidity_change_ratio',
+  'gmgn_supply_circulating_ratio',
+  'gmgn_price_to_ath_ratio',
+  'gmgn_fee_to_liq_ratio',
+  // logearn 最大涨幅组装
+  'mcap_to_max_up_ratio',
+  'max_up_speed_pct_per_min',
+];
+
 const DERIVED_KEYS = [
   'buy_sell_amount_ratio',
   'buy_sell_count_ratio',
@@ -11,20 +55,89 @@ const DERIVED_KEYS = [
   'avg_buy_amount',
   'avg_sell_amount',
   'chip_analysis.above_below_ratio',
+  'chip_analysis.price_to_peak_ratio',
+  'chip_analysis.price_concentration_hhi',
+  'chip_analysis.top5_hold_percent',
+  'chip_analysis.top5_transfer_in_ratio',
   // 设计文档 §20 新增组装字段
   'buy_tx_per_buyer',
+  'sell_tx_per_seller',
+  // K线量能形态（清单见 KLINE_VOLUME_KEYS，字段浏览器单独成组）
+  ...KLINE_VOLUME_KEYS,
   'smart_money_net_buy_count',
   'chip_analysis.pressure_net',
   'open_to_buy_duration',
   'launch_to_buy_duration',
   'buy_max_retracement',
-  'v_turn_current_stage_pct',
-  'v_turn_break_cost_line_duration_min',
+  'post_buy_max_drawdown_pct',
   'last_alert_low_lower_than_pre_low',
   'above_cost_line',
   'cost_line_distance_pct',
-  'v_turn_low_cost_line_distance_pct',
 ];
+
+// 信号字段：从六类信号的 *_list 数组里【提取】出来的（notice_mcap / cv / volume_ratio 这类直接取值，
+// 以及在此基础上算的时长、比值、换算市值）。与 DERIVED_KEYS 分开列，是因为两者性质不同：
+// DERIVED_KEYS 是对同一行已有标量做比率/差值运算得来的"组装"字段；这些则是把嵌套数组里的一条
+// 信号摊平成行级特征，来源和缺失模式都不一样（没有对应类型的信号 → 整组缺失）。
+// 分开之后字段浏览器能单独成组——信号字段占了七成多，混在"组装字段"里会把那一组彻底淹没。
+// 注意：两者都算 isAssembledField（都不是数据源直接给的原始字段），所以"常用字段"口径不受影响。
+const SIGNAL_KEYS = [
+  'v_breakout_volume_recent_stage_pct',
+  'v_breakout_volume_recent_retracement_pct',
+  'v_breakout_volume_recent_drawdown_min',
+  'v_breakout_volume_recent_drawdown_speed_pct_per_min',
+  'v_breakout_volume_recent_signal_from_top_min',
+  'v_breakout_volume_recent_rebound_from_low_pct',
+  'v_breakout_volume_recent_breakout_ratio',
+  'v_breakout_volume_recent_signal_from_open_min',
+  'v_breakout_volume_recent_signal_to_buy_min',
+  'v_breakout_volume_recent_low_to_buy_min',
+  'v_breakout_volume_recent_prior_count',
+  'v_breakout_volume_signal_count',
+  'v_breakout_volume_record_count',
+  'continue_breakout_volume_signal_count',
+  'continue_breakout_volume_recent_notice_mcap',
+  'continue_breakout_volume_recent_max_amplitude',
+  'continue_breakout_volume_recent_amplitude_before_signal_min',
+  'continue_breakout_volume_recent_all_bullish',
+  'continue_breakout_volume_recent_signal_volume',
+  'continue_breakout_volume_recent_volume_total',
+  'continue_breakout_volume_recent_volume_trend_ratio',
+  'continue_breakout_volume_recent_bullish_kline_count',
+  'continue_breakout_volume_recent_signal_from_open_min',
+  'continue_breakout_volume_recent_signal_to_buy_min',
+  'breakout_volume_10x_signal_count',
+  'breakout_volume_10x_recent_notice_mcap',
+  'breakout_volume_10x_recent_volume_ratio',
+  'breakout_volume_10x_recent_dormant_duration_min',
+  'breakout_volume_10x_recent_dormant_kline_count',
+  'breakout_volume_10x_recent_dormant_cv',
+  'breakout_volume_10x_recent_dormant_slope',
+  'breakout_volume_10x_recent_dormant_end_to_signal_min',
+  'breakout_volume_10x_recent_signal_from_open_min',
+  'breakout_volume_10x_recent_signal_to_buy_min',
+  'breakout_volume_10x_recent_kline_bullish',
+  'breakout_volume_10x_recent_kline_change_pct',
+  'breakout_volume_10x_recent_drawdown_from_high_pct',
+  // 蓝筹共振信号 whale
+  'whale_signal_count',
+  'whale_recent_wallet_count',
+  'whale_recent_tx_count',
+  'whale_recent_tx_per_wallet',
+  'whale_recent_past_minute',
+  'whale_recent_notice_mcap',
+  'whale_recent_signal_from_open_min',
+  'whale_recent_signal_to_buy_min',
+  'signal_total_count',
+  'signal_type_count',
+  'signal_span_min',
+  'signal_first_to_buy_min',
+  'v_breakout_volume_recent_break_cost_line_min',
+  'v_breakout_volume_recent_still_below_cost_line',
+  'v_breakout_volume_recent_below_cost_line_elapsed_min',
+  'v_breakout_volume_recent_low_cost_line_distance_pct',
+];
+
 
 // 以下字段原始值是 0-1 的小数比例（比如 "0.0331" 实际代表 3.31%），
 // 统一 ×100 转成百分比数值，跟其它已经是百分比口径的字段（8大持仓指标、price_change_* 等）保持同一量级，
@@ -98,6 +211,10 @@ function flattenObject(obj, prefix = '', catOut = null, arrOut = null) {
     const key = prefix ? `${prefix}.${k}` : k;
     const pct = PERCENT_FRACTION_FIELDS.has(key);
     if (isAddressLikeKey(key)) continue; // 地址类字段永远不参与数值特征展开，也不当分类字段（值太发散，没有分组意义）
+    // 键名本身就是钱包地址的子树整棵跳过（典型：followed_signal_state.walletPositionMap.<地址>.xxx）。
+    // 这类路径每个钱包生成一整套字段，只在恰好含该钱包的少数行有值（实测 n=7），既极度稀疏
+    // 又完全不可泛化——"某个具体地址的持仓"不是特征。不挡住会污染字段列表、相关性池和 AUC 候选。
+    if (looksLikeAddressString(k)) continue;
     if (v !== null && typeof v === 'number' && Number.isFinite(v)) {
       out[key] = pct ? v * 100 : v;
     } else if (typeof v === 'boolean') {
@@ -163,7 +280,15 @@ function callKey(c) {
 // 但如果最接近的那个实际时间差仍然大于此阈值，说明该 call 其实没有真正对应的快照，
 // 应该跳过而不是强行拿一个时间差很远的快照去计算特征（否则特征与收益的对应关系是错的）。
 // 单位：秒。默认 1 小时，可按数据实际采集频率调整。
+// 注意：s.timestamp / c.timestamp 实际数据里是毫秒，比较前必须经 toMilliseconds 归一并把
+// 阈值换算成毫秒——之前是裸减后直接与 3600 比，等于把阈值缩成了 3.6 秒，时间差在
+// 3.6 秒 ~ 1 小时之间的 call 全被静默跳过。
 const MAX_SNAPSHOT_MATCH_DIFF_SECONDS = 3600;
+// 时间戳缺失时按 0 处理（与匹配逻辑原有的 || 0 口径一致：缺失 → 时间差巨大 → 被阈值挡掉）
+function tsOrZeroMs(ts) {
+  const m = toMilliseconds(ts);
+  return Number.isFinite(m) ? m : 0;
+}
 
 // 大数据量处理进度反馈（design doc §14.3）：calls 数量较大时（比如上万条），逐条匹配+展开的同步循环
 // 会长时间占住主线程，页面表现为“点了分析按钮后卡死没反应”。这里改成 async 函数，每处理完一批（CHUNK_SIZE）
@@ -174,6 +299,23 @@ const BUILD_ROWS_CHUNK_SIZE = 500;
 function toMilliseconds(ts) {
   const n = Number(ts);
   return Number.isFinite(n) ? (n >= 1e12 ? n : n * 1000) : NaN;
+}
+
+// K线粒度（分钟）：用【相邻bar实际时间差的中位数】实测，而不是信任 kline_and_indicators.resolution。
+// 原因有三：(1) resolution 的单位没有文档保证——按秒解释和按 TradingView 习惯("1"=1分钟)解释差 60 倍；
+// (2) 它可能是字符串("1S")，Number.isFinite 直接判假，字段会静默缺失；(3) 实测值同时兼容两种情况。
+// 返回 NaN 表示样本不足以实测，调用方需自行决定是否回退到 resolution。
+function measureBarMinutes(bars) {
+  if (!Array.isArray(bars) || bars.length < 4) return NaN;
+  const times = bars.map(b => toMilliseconds(b && b.time)).filter(Number.isFinite).sort((a, b) => a - b);
+  const gaps = [];
+  for (let i = 1; i < times.length; i++) {
+    const d = (times[i] - times[i - 1]) / 60000;
+    if (d > 0) gaps.push(d);
+  }
+  if (gaps.length < 3) return NaN;
+  gaps.sort((a, b) => a - b);
+  return gaps[gaps.length >> 1];
 }
 
 async function buildRows(calls, snapshots, onProgress) {
@@ -193,18 +335,26 @@ async function buildRows(calls, snapshots, onProgress) {
     }
     const list = snapsByKey.get(callKey(c));
     if (!list || !list.length) continue;
+    const callMs = tsOrZeroMs(c.timestamp);
     let s = list[0];
-    let bestDiff = Math.abs((s.timestamp || 0) - (c.timestamp || 0));
+    let bestDiff = Math.abs(tsOrZeroMs(s.timestamp) - callMs);
     for (let i = 1; i < list.length; i++) {
-      const diff = Math.abs((list[i].timestamp || 0) - (c.timestamp || 0));
+      const diff = Math.abs(tsOrZeroMs(list[i].timestamp) - callMs);
       if (diff < bestDiff) { bestDiff = diff; s = list[i]; }
     }
     if (!s) continue;
-    if (bestDiff > MAX_SNAPSHOT_MATCH_DIFF_SECONDS) { skippedByTimeDiff++; continue; }
+    if (bestDiff > MAX_SNAPSHOT_MATCH_DIFF_SECONDS * 1000) { skippedByTimeDiff++; continue; }
     const init = num(c.initial_mcap), cur = num(c.current_mcap), mx = num(c.max_mcap);
     if (init === null || init === 0 || cur === null || mx === null) continue;
     // 收益以“倍数”表示（1 = 不涨不跌，2 = 涨一倍），与平台展示口径保持一致
     const returnMax = mx / init;
+    // 买入之后最大回撤（%）：min_mcap 是 call 里记录的买入之后市值最低点，与 initial_mcap（买入
+    // 时市值）算跌幅。min_mcap 缺失时不参与；min_mcap >= initial_mcap（没跌破过买入价，比较罕见但
+    // 理论可能）时回撤按 0 计，不产生负数，语义与 buy_max_retracement（回撤幅度只朝一个方向累加）保持一致。
+    const minMcap = num(c.min_mcap);
+    const postBuyMaxDrawdownPct = (minMcap !== null && minMcap > 0)
+      ? Math.max(0, (init - minMcap) / init * 100)
+      : undefined;
 
     // 同时展开 snapshot.signal 和 snapshot.ctx；
     // ctx.logearn 与 signal 完全同源重复，flattenCtx 内部已跳过；ctx 下的 gmgn/kline_and_indicators 等仍保留 gmgn. / kline_and_indicators. 前缀
@@ -214,6 +364,7 @@ async function buildRows(calls, snapshots, onProgress) {
     const signalFeatures = flattenObject(s.signal || {}, '', categorical, arrays);
     const ctxFeatures = flattenCtx(s.ctx || {}, categorical, arrays);
     const features = Object.assign({}, ctxFeatures, signalFeatures);
+    if (postBuyMaxDrawdownPct !== undefined) features['post_buy_max_drawdown_pct'] = postBuyMaxDrawdownPct;
 
     // 优先使用 signal 里的 d1 买卖字段计算组装字段
     const buy = features['buy_wcoin_amount_d1'];
@@ -243,10 +394,61 @@ async function buildRows(calls, snapshots, onProgress) {
     if (fin(chipAbove) && fin(chipBelow) && chipBelow !== 0) features['chip_analysis.above_below_ratio'] = chipAbove / chipBelow;
     // 人均买入笔数：衡量是不是少数人/机器人在刷单，而不是很多真实用户参与（design doc §20.1）
     if (fin(buyTx) && fin(buyers) && buyers !== 0) features['buy_tx_per_buyer'] = buyTx / buyers;
+    // 人均卖出笔数（与 buy_tx_per_buyer 对称）：与买入版对比能看出卖方是一次性清仓还是分批出货，
+    // 分批出货（人均笔数高）往往是有经验的钱包在慢慢派发，与散户恐慌性一次卖光是不同的行为模式
+    if (fin(sellTx) && fin(sellers) && sellers !== 0) features['sell_tx_per_seller'] = sellTx / sellers;
     // 聪明钱净买入地址数（design doc §20.1）
     if (fin(smartBuy) && fin(smartSell)) features['smart_money_net_buy_count'] = smartBuy - smartSell;
     // 筹码净压力指标：正数=上方套牢盘更多抛压大，负数=下方支撑更强（design doc §20.5）
     if (fin(chipAbove) && fin(chipBelow)) features['chip_analysis.pressure_net'] = chipAbove - chipBelow;
+
+    // ---- 筹码分布组装字段（从 chip_analysis 的数组算，标量字段由 flattenObject 自动展开，不用管）----
+    // price_bars: 按市值分 70 桶的筹码分布，percent = 该价位买入仍持有的量占总供应量的比例。
+    const priceBars = arrays['chip_analysis.price_bars'];
+    if (Array.isArray(priceBars) && priceBars.length) {
+      let peakPct = -1, peakMcap = NaN, totalPct = 0;
+      for (const bar of priceBars) {
+        const p = Number(bar && bar.percent);
+        if (!Number.isFinite(p) || p < 0) continue;
+        totalPct += p;
+        // 桶的中值市值作为该筹码堆的代表价位。mcap_range 畸形（mid 为 NaN）的 bar 不参与选峰——
+        // 否则 percent 最大但 range 坏掉的一根会把 peakMcap 永久置成 NaN，后面有效的 bar 再也接不上
+        const rng = bar && bar.mcap_range;
+        const mid = Array.isArray(rng) && rng.length === 2 ? (Number(rng[0]) + Number(rng[1])) / 2 : NaN;
+        if (Number.isFinite(mid) && p > peakPct) { peakPct = p; peakMcap = mid; }
+      }
+      // 当前市值相对筹码峰的位置：>1 = 当前价在筹码峰上方（多数持仓者已浮盈，下方支撑；但也意味着
+      // 上涨空间里没有密集套牢盘）；<1 = 当前价在筹码峰下方（头上压着一堆套牢盘，反弹遇阻）。
+      if (Number.isFinite(peakMcap) && peakMcap > 0 && fin(mcap)) {
+        features['chip_analysis.price_to_peak_ratio'] = mcap / peakMcap;
+      }
+      // 筹码集中度（HHI，取各桶占比归一化后的平方和）：接近 1 = 筹码高度集中在少数价位（庄控/单一
+      // 建仓区），接近 0 = 分散在很多价位（换手充分）。用占总量的份额，避免受 total 大小影响。
+      if (totalPct > 0) {
+        let hhi = 0;
+        for (const bar of priceBars) {
+          const p = Number(bar && bar.percent);
+          if (Number.isFinite(p) && p > 0) { const share = p / totalPct; hhi += share * share; }
+        }
+        features['chip_analysis.price_concentration_hhi'] = hhi;
+      }
+    }
+
+    // top5_holders: 头部 5 大持仓来源。转账进来的比例高 = 老鼠仓/分发，是危险信号。
+    const top5 = arrays['chip_analysis.top5_holders'];
+    if (Array.isArray(top5) && top5.length) {
+      let sumHold = 0, sumTransfer = 0;
+      for (const h of top5) {
+        const hold = Number(h && h.total_hold_percent);
+        const tin = Number(h && h.transfer_in_percent);
+        if (Number.isFinite(hold)) sumHold += hold;
+        if (Number.isFinite(tin)) sumTransfer += tin;
+      }
+      // 头部 5 大合计持仓占比（%）：集中度，越高越容易被头部砸盘控制
+      if (sumHold > 0) features['chip_analysis.top5_hold_percent'] = sumHold;
+      // 头部持仓里"转账进来"的占比（%）：高 = 头部筹码不是自己买的，是被分发/老鼠仓，重大风险信号
+      if (sumHold > 0) features['chip_analysis.top5_transfer_in_ratio'] = sumTransfer / sumHold * 100;
+    }
 
     // 开盘/上线到买入经过的时长，单位分钟：买入点时间用快照的 timestamp（s.timestamp，快照数据
     // 本身的抓取时刻，对应真实买入点）——call.timestamp 是导出数据的时间，没有业务含义，不能用。
@@ -271,6 +473,25 @@ async function buildRows(calls, snapshots, onProgress) {
       }
     }
     features['buy_max_retracement'] = maxRetracement;
+    // 24 小时内 V 转信号出现的次数（与 continue_breakout_volume_signal_count 对称）：反复回调反弹说明这币在来回震荡，
+    // 与"只出现过一次干净回调"是不同的形态，取最新那条信号的明细字段无法体现这一点
+    // 一个 V 转【周期】= 顶 → 底 → 分档反弹(20%/40%/60%/新高)。平台可能在每个反弹档位都往
+    // list 里追加一条，同一个周期就会出现多条记录——直接数 list 长度会把 1 个周期数成 3~4 次。
+    // 同一周期的顶/底时间是固定的，用 (top_price_time, low_price_time) 当周期标识去重才是正确口径。
+    // 若数据本身就是一周期一条，去重后数量不变，不会有副作用。
+    // 顶/底时间缺失时无法判断周期归属，退回用 signalTime 当标识（等价于不去重），
+    // 避免把几条互不相关、只是都缺字段的记录错误合并成同一个周期。
+    const vCycleKey = ev => {
+      const top = Number(ev && ev.top_price_time), low = Number(ev && ev.low_price_time);
+      if (Number.isFinite(top) && Number.isFinite(low) && (top || low)) return `c_${top}_${low}`;
+      return `s_${Number(ev && ev.signalTime) || Math.random()}`;
+    };
+    if (Array.isArray(breakouts)) {
+      features['v_breakout_volume_signal_count'] = new Set(breakouts.map(vCycleKey)).size;
+      // 原始条数单独留一个字段：两者差得多就说明平台确实按反弹档位重复发信号，
+      // 这个差值本身也是信息（反弹推进了几档）
+      features['v_breakout_volume_record_count'] = breakouts.length;
+    }
 
     // 当前生效 V 转信号所处的反弹阶段（用户需求新增字段）：0=仅回撤确认、还未开始反弹，
     // 20/40/60=已依次突破 fibon_break1/2/3（对应反弹 20%/40%/60%）。反弹突破前高（fibon_break4）
@@ -289,13 +510,89 @@ async function buildRows(calls, snapshots, onProgress) {
         if (vReached(recentV.fibon_break3, recentV.fibon_break3_time)) stage = 60;
         else if (vReached(recentV.fibon_break2, recentV.fibon_break2_time)) stage = 40;
         else if (vReached(recentV.fibon_break1, recentV.fibon_break1_time)) stage = 20;
-        features['v_turn_current_stage_pct'] = stage;
+        features['v_breakout_volume_recent_stage_pct'] = stage;
+
+        // 生效这条 V 转信号【之前】还有几个 V 转信号：区分"第一次干净回调"和"反复回调反弹的震荡盘"。
+        // 与 v_breakout_volume_signal_count（列表总条数）不同——那个不管先后，这个只数发生在
+        // 生效信号之前的。0 = 这是 24h 内的第一次回调反弹。
+        // 口径上数【全部】早于它的信号（不限于 n_pattern_confirmed），因为"之前震荡过几次"这件事
+        // 本身就包含那些没达到确认阈值的小回调。
+        const recentVSec = Number(recentV.signalTime);
+        if (Number.isFinite(recentVSec)) {
+          // 同样按周期去重：只数【早于生效周期】的不同周期数，而不是记录条数
+          const recentKey = vCycleKey(recentV);
+          const priorKeys = new Set();
+          for (const ev of breakouts) {
+            const t = Number(ev && ev.signalTime);
+            if (!Number.isFinite(t) || t >= recentVSec) continue;
+            const k = vCycleKey(ev);
+            if (k !== recentKey) priorKeys.add(k); // 同一周期的早期档位记录不算"之前的信号"
+          }
+          features['v_breakout_volume_recent_prior_count'] = priorKeys.size;
+        }
+
+        // ---- 命中信号的回调/反弹明细（用户需求新增字段）----
+        // 全部基于同一个 recentV（= 策略命中当时那条生效信号），保证这一组字段描述的是同一次
+        // 回调反弹，交叉分析时不会一个字段取了 A 信号、另一个取了 B 信号。
+        // 对应平台 content 文案：「反弹20%($20.99K)，此前回调70.59%，市值从$45.41K至$13.36K，回调时长21秒」
+        //
+        const retr = Number(recentV.n_pattern_retracement);
+        if (Number.isFinite(retr)) features['v_breakout_volume_recent_retracement_pct'] = retr * 100;
+
+        // 坑二：平台文案里的「回调时长」= signalTime − top_price_time（21秒），【不是】从见顶到
+        // 触底（18秒）——它把触底后反弹到 fibon_break1 的那段也算进去了。两个口径含义不同，
+        // 分别给字段，不合并：drawdown_duration 是真正的下跌时长，signal_from_top 对齐平台文案。
+        // 一律走 toMilliseconds 归一：这几个时间戳字段原本是裸减 /60（写死按"秒"），而同组后面的
+        // signal_from_open / signal_to_buy 用的是 toMilliseconds。同一批字段两套单位处理，
+        // 只要有一批数据的时间戳是毫秒，这两个就会算出 1000 倍的值而其它字段照常——
+        // 表现出来正是"部分字段数值异常、部分正常"这种最难查的数据质量问题。
+        const topMs = toMilliseconds(recentV.top_price_time);
+        const lowMs = toMilliseconds(recentV.low_price_time);
+        const sigSec = Number(recentV.signalTime);
+        const sigMs0 = toMilliseconds(sigSec);
+        if (Number.isFinite(topMs) && Number.isFinite(lowMs) && lowMs >= topMs) {
+          // 回调终点 = 本轮最低点（low_price_time）。已用真实样本逐条核对过：11 条记录里
+          // top→low 的时长与平台 content 的「回调时长」一致（个别差异来自平台按分钟向下取整）。
+          const drawdownMin = (lowMs - topMs) / 60000;
+          features['v_breakout_volume_recent_drawdown_min'] = drawdownMin;
+          // 回调速度：同样的跌幅，几秒砸下来和慢慢阴跌是两回事。时长为 0（同一根K线内完成）
+          // 时除数为 0，直接不写入而不是给 Infinity。
+          if (drawdownMin > 0 && Number.isFinite(retr)) {
+            features['v_breakout_volume_recent_drawdown_speed_pct_per_min'] = retr * 100 / drawdownMin;
+          }
+        }
+        if (Number.isFinite(topMs) && Number.isFinite(sigMs0) && sigMs0 >= topMs) {
+          features['v_breakout_volume_recent_signal_from_top_min'] = (sigMs0 - topMs) / 60000;
+        }
+
+        // 这两个平台已经算好了，直接取，不自己算——自己算要依赖"当前市值"，而 logearn.mcap 与
+        // kline 最新 bar 存在时间基准差（高波动币上能差几倍），平台内部同源计算的更可信。
+        // price_rise_ratio      = 从回调低点到当前的反弹幅度（实测 0.8361 ↔ 手算 0.836 ✓）
+        // current_breakout_ratio = 当前价在整个回调区间里的位置（实测 0.3484 ↔ 手算 0.348 ✓），
+        //                          是 v_breakout_volume_recent_stage_pct 那四档离散值的连续版本，信息量更大
+        const riseRatio = Number(recentV.price_rise_ratio);
+        if (Number.isFinite(riseRatio)) features['v_breakout_volume_recent_rebound_from_low_pct'] = riseRatio * 100;
+        const breakoutRatio = Number(recentV.current_breakout_ratio);
+        if (Number.isFinite(breakoutRatio)) features['v_breakout_volume_recent_breakout_ratio'] = breakoutRatio * 100;
+
+        // 时间位置：距开盘 / 信号新鲜度 / 抄底后多久进场。单位统一分钟（meme 场景下常见零点几分钟，
+        // 但与 open_to_buy_duration 等既有时长字段保持同一单位，避免同类字段单位不一致）。
+        // sigMs0 / lowMs 上面已归一，直接复用，不再重复声明
+        if (Number.isFinite(sigMs0) && Number.isFinite(swapBeginMs)) {
+          features['v_breakout_volume_recent_signal_from_open_min'] = (sigMs0 - swapBeginMs) / 60000;
+        }
+        if (Number.isFinite(buyMs) && Number.isFinite(sigMs0)) {
+          features['v_breakout_volume_recent_signal_to_buy_min'] = (buyMs - sigMs0) / 60000;
+        }
+        if (Number.isFinite(buyMs) && Number.isFinite(lowMs)) {
+          features['v_breakout_volume_recent_low_to_buy_min'] = (buyMs - lowMs) / 60000;
+        }
       }
     }
 
     // 最近一个生效 V 转信号"跌破成本线"到"涨破回该成本价"的持续时间，单位分钟（用户需求新增字段）：
-    // 1) 取生效 V 转信号（recentV，与上面 v_turn_current_stage_pct 用同一套"生效"判定）的回撤高点 top_price_time；
-    // 2) 用 avg_price_bars 按该时间点回溯取"对应的成本价"（同 v_turn_low_cost_line_distance_pct 的回溯逻辑，
+    // 1) 取生效 V 转信号（recentV，与上面 v_breakout_volume_recent_stage_pct 用同一套"生效"判定）的回撤高点 top_price_time；
+    // 2) 用 avg_price_bars 按该时间点回溯取"对应的成本价"（同 v_breakout_volume_low_cost_line_distance_pct 的回溯逻辑，
     //    找不到历史数据时退回当前成本线 current_avg_price）；
     // 3) 从该高点开始按时间顺序扫描 kline_bars，找到收盘价首次跌破该成本价的那根K线，开始计数；
     // 4) 往后数K线根数，直到收盘价重新涨破该成本价为止（不含涨破那一根）；
@@ -303,8 +600,13 @@ async function buildRows(calls, snapshots, onProgress) {
     //    成分钟数，而不是直接拿首尾时间戳相减（bar 数组可能有缺口，"根数 × 粒度"更贴近实际K线跨度）。
     // 若没有生效V转信号、没跌破过、或跌破后到快照时刻仍未涨破（尚未走完），都不参与统计。
     const klineBars = arrays['kline_and_indicators.kline_bars'] || [];
-    const resolutionSec = features['kline_and_indicators.resolution'];
-    if (recentV && fin(recentV.top_price_time) && klineBars.length && fin(resolutionSec) && resolutionSec > 0) {
+    // 粒度优先用实测值；实测不出来（bar 太少）才回退到 resolution 并按秒解释
+    const measuredBarMin = measureBarMinutes(klineBars);
+    const resolutionSec = Number(features['kline_and_indicators.resolution']);
+    const barMinForGap = fin(measuredBarMin) && measuredBarMin > 0
+      ? measuredBarMin
+      : (fin(resolutionSec) && resolutionSec > 0 ? resolutionSec / 60 : NaN);
+    if (recentV && fin(recentV.top_price_time) && klineBars.length && fin(barMinForGap) && barMinForGap > 0) {
       const topTimeSec = recentV.top_price_time >= 1e12 ? Math.floor(recentV.top_price_time / 1000) : recentV.top_price_time;
       const avgBars = arrays['kline_and_indicators.avg_price_bars'] || [];
       let costAtTop = currentAvgPrice;
@@ -331,12 +633,25 @@ async function buildRows(calls, snapshots, onProgress) {
           for (let i = breakdownIdx + 1; i < chrono.length; i++) {
             if (chrono[i].close > costAtTop) { breakoutIdx = i; break; }
           }
+          // 右删失处理：跌破后到快照时刻仍未涨破的样本，如果只是"不写入字段"，它们会被
+          // 静默剔除出所有统计——而这些恰恰是最差的一批（一直没能站回成本线）。结果就是
+          // break_cost_line_min 的分布被条件在"最终收复了成本线"上，系统性偏乐观。
+          // 因此：用 still_below 标记删失，用 elapsed_min 给出"至少已经跌破了多久"的下界。
+          const belowBars = (breakoutIdx >= 0 ? breakoutIdx : chrono.length) - breakdownIdx;
+          features['v_breakout_volume_recent_still_below_cost_line'] = breakoutIdx >= 0 ? 0 : 1;
+          features['v_breakout_volume_recent_below_cost_line_elapsed_min'] = belowBars * barMinForGap;
           if (breakoutIdx >= 0) {
-            features['v_turn_break_cost_line_duration_min'] = (breakoutIdx - breakdownIdx) * resolutionSec / 60;
+            features['v_breakout_volume_recent_break_cost_line_min'] = belowBars * barMinForGap;
           }
         }
       }
     }
+
+    // 创建者推特改名次数：gmgn.dev.twitter_name_change_history 是数组，改名越频繁越可疑（换皮/规避追踪）。
+    // 数组本身不进数值特征体系（flattenObject 把它收进 arrays），这里取长度作为标量字段。
+    // 数组不存在时不写入（该 token 没有 gmgn.dev 数据），不强行给 0。
+    const twChangeHist = arrays['gmgn.dev.twitter_name_change_history'];
+    if (Array.isArray(twChangeHist)) features['gmgn.dev.twitter_name_change_count'] = twChangeHist.length;
 
     // 最近一个 V 转信号（last_alert）的最低点是否比上一个 V 转信号的最低点更低（用户需求新增字段）：
     // 1 = 更低（连续创新低，形态可能更弱），0 = 未创新低。last_alert.low_price/pre_low_price
@@ -348,12 +663,25 @@ async function buildRows(calls, snapshots, onProgress) {
       features['last_alert_low_lower_than_pre_low'] = lastAlertLow < lastAlertPreLow ? 1 : 0;
     }
 
-    // 是否在成本线之上 / 与成本线的距离（用户需求新增字段）：current_avg_price 是"当前整体持仓
-    // 用户的平均价"，与 mcap 同为市值(USD)口径可直接比较（strategy 侧 强势盘策略/v1/code.js 里
-    // 已验证过这个用法：curCostMcap = kline_and_indicators.current_avg_price）。
-    if (fin(mcap) && fin(currentAvgPrice) && currentAvgPrice !== 0) {
-      features['above_cost_line'] = mcap > currentAvgPrice ? 1 : 0;
-      features['cost_line_distance_pct'] = (mcap - currentAvgPrice) / currentAvgPrice * 100;
+    // 是否在成本线之上 / 与成本线的距离：直接取平台算好的 avg_price_deviation_pct，不再自己拿
+    // logearn.mcap 去比 kline 的 current_avg_price。
+    //
+    // 为什么改：这两个值【不同源】——current_avg_price 来自 kline_and_indicators（最新一根K线的
+    // 累计加权成本），logearn.mcap 是快照抓取时刻的市值，两者时间基准不一致。在秒级K线的高波动
+    // 币上差距极大，实测两条真实样本：
+    //   LMAO!: 自己算 (12539−9892)/9892 = 26.8%，平台 avg_price_deviation_pct = 150.6%（差 5 倍多）
+    //   nice : 自己算 (12309−8097)/8097 = 52.0%，平台 avg_price_deviation_pct = 93.3%
+    // 平台那个值是 kline 内部同源计算的（current_price 与 current_avg_price 都取自同一根K线），
+    // 才是策略侧「偏离%」判定真正用的口径。
+    //
+    // 改用平台值后，cost_line_distance_pct 与 kline_and_indicators.avg_price_deviation_pct 完全
+    // 相同，属于冗余字段——按 mcap/fdv/current_mcap 的既有处理方式合并掉一个，避免同一个信息在
+    // 相关性表里占两行、还让多重比较校正的 m 无谓多算一次。
+    const deviationPct = features['kline_and_indicators.avg_price_deviation_pct'];
+    if (fin(deviationPct)) {
+      features['cost_line_distance_pct'] = deviationPct;
+      features['above_cost_line'] = deviationPct > 0 ? 1 : 0;
+      delete features['kline_and_indicators.avg_price_deviation_pct'];
     }
 
     // V 转信号最低点与"当时"成本线之间的距离（用户需求新增字段）：成本线随时间变化，不能直接用
@@ -361,8 +689,15 @@ async function buildRows(calls, snapshots, onProgress) {
     // 回溯找最近的一根（同 强势盘策略/v1/code.js 的 costMcapAt 逻辑）；找不到历史数据时退回当前成本线。
     // low_price_mcap 与 current_avg_price 同为市值(USD)口径（用 low_price/low_price_mcp 会是价格/另一种
     // 口径，与成本线单位不一致，不能直接相减）。
-    const lowMcap = features['last_alert.low_price_mcap'];
-    const lowTimeRaw = features['last_alert.low_price_time'];
+    // 数据源必须是 recentV（最近生效的那条V转信号），不能用 last_alert——last_alert 是"最近一次
+    // 【任意类型】信号"，可能是精选/苏醒/关注钱包，那些信号根本没有 low_price_mcap 字段。用它的
+    // 后果是：这个字段的样本集与同组其他 v_breakout_volume_recent_* 字段对不上（只有恰好
+    // last_alert 是V转信号的行才有值），交叉分析时两个字段的 n 不同源、结论没法互相印证。
+    // 同时 _mcap 优先、_mcp 兜底（真实样本里两者同时存在且数值不同，见 low_price_mcap / _mcp 的取值口径）。
+    const lowMcap = recentV ? (fin(recentV.low_price_mcap) ? recentV.low_price_mcap
+                             : (fin(recentV.low_price_mcp) ? recentV.low_price_mcp : undefined))
+                            : undefined;
+    const lowTimeRaw = recentV ? recentV.low_price_time : undefined;
     if (fin(lowMcap) && fin(lowTimeRaw)) {
       const avgBars = arrays['kline_and_indicators.avg_price_bars'] || [];
       const lowTimeSec = lowTimeRaw >= 1e12 ? Math.floor(lowTimeRaw / 1000) : lowTimeRaw;
@@ -376,7 +711,515 @@ async function buildRows(calls, snapshots, onProgress) {
         }
       }
       if (fin(costAtLow) && costAtLow !== 0) {
-        features['v_turn_low_cost_line_distance_pct'] = (lowMcap - costAtLow) / costAtLow * 100;
+        features['v_breakout_volume_recent_low_cost_line_distance_pct'] = (lowMcap - costAtLow) / costAtLow * 100;
+      }
+    }
+
+    // ---- 早期精选信号 continue_breakout_volume 明细（用户需求新增字段）----
+    // 对应平台 content 文案：「精选，通知市值$31.15K，交易量$4.18K，当前最大振幅94.15%(2026.07.20 03:52:30)」
+    //
+    // 与 V 转信号的关键差别：精选信号【没有】n_pattern_confirmed / fibon_break4 那套"确认 + 是否收尾"
+    // 机制，它就是一个时间点事件，不存在"这轮还没走完"的状态。所以"命中生效的那条"只能按时间取——
+    // 取 signalTime 最新的一条，即策略命中当时最近发生的那次精选。
+    const picks = (s.signal && s.signal.continue_breakout_volume_list)
+                || (s.ctx && s.ctx.logearn && s.ctx.logearn.continue_breakout_volume_list)
+                || (s.ctx && s.ctx.continue_breakout_volume_list);
+    // 次数：数组存在就写长度（哪怕是 0）。真实样本 SVM 里 v_breakout_volume_list 与
+    // continue_breakout_volume_list 都是空数组 []——这是"确实一次都没有"的明确信息，不是未知，
+    // 记成 0 才对；只有整个字段不存在（老版本数据）时才算缺失。三类信号统一这个口径。
+    // 而且"没有信号"对分析很重要：若只在有信号时才写，相关性分析会整段丢掉这部分样本。
+    if (Array.isArray(picks)) features['continue_breakout_volume_signal_count'] = picks.length;
+    if (Array.isArray(picks) && picks.length) {
+      let recentPick = null;
+      for (const ev of picks) {
+        if (!ev) continue;
+        if (!recentPick || (ev.signalTime || 0) > (recentPick.signalTime || 0)) recentPick = ev;
+      }
+      if (recentPick) {
+        const noticeMcap = Number(recentPick.notice_mcap);
+        if (Number.isFinite(noticeMcap)) features['continue_breakout_volume_recent_notice_mcap'] = noticeMcap;
+
+        // 「当前最大振幅」：信号发生时，之前所有K线里最大的那根振幅，单位 %。
+        // 注意平台文案对这个值有两种显示方式——小于 100% 时显示成「94.15%」，超过 100% 时显示成
+        // 「3x」（demo 里 max_amplitude=300.66 显示为 3x）。字段本身恒为百分比数值，不用换算。
+        const amp = Number(recentPick.max_amplitude);
+        if (Number.isFinite(amp)) features['continue_breakout_volume_recent_max_amplitude'] = amp;
+
+        // 最大振幅发生在信号前多久（分钟）：振幅高点紧挨着信号 vs 很久之前，含义完全不同——
+        // 前者是"刚刚剧烈波动完就被选中"，后者是"早就波动过、现在才被选中"
+        const ampSec = Number(recentPick.max_amplitude_time);
+        const pickSec = Number(recentPick.signalTime);
+        if (Number.isFinite(ampSec) && Number.isFinite(pickSec) && pickSec >= ampSec) {
+          features['continue_breakout_volume_recent_amplitude_before_signal_min'] = (pickSec - ampSec) / 60;
+        }
+
+        // all_bullish：加强版精选（信号出现时 K 线连续上涨）。布尔转 0/1，缺失不写入。
+        if (typeof recentPick.all_bullish === 'boolean') {
+          features['continue_breakout_volume_recent_all_bullish'] = recentPick.all_bullish ? 1 : 0;
+        }
+
+        // ---- 三根K线的形态明细（结构文档里完全没有，从真实样本 nice 反推）----
+        // 精选信号的本质是"连续3根K线"的形态：kline1/2/3 各自的时间、是否阳线、成交量、买卖笔数。
+        // all_bullish 只是"三根是否都是阳线"的汇总，下面这些字段能刻画得细得多。
+        const v1 = Number(recentPick.volume1);
+        const v2 = Number(recentPick.volume2);
+        const v3 = Number(recentPick.volume3);
+
+        // 交易量：content 文案里的「交易量$1.64K」= volume3 × 原生币价格。
+        // 两个坑（都是拿真实样本 nice 核对出来的，结构文档里没写）：
+        //   1) 是 volume3（信号那根K线，kline3_time === signal_time），不是 volume1、也不是三根之和；
+        //      实测 21.6248 × 76 = 1643.5 ≈ $1.64K，而 volume1×76=2903.6、三根之和×76=6559 都对不上。
+        //   2) volume1/2/3 的单位是【原生币 SOL/BNB】不是 USD，必须乘 native_coin_price 才是文案里的金额。
+        // native_coin_price 挂在 ctx 顶层，flattenCtx 会把它展开成同名 feature；但并非所有快照都带
+        // （实测有的快照 ctx 里根本没有这几个 native_coin_* 字段），取不到时这两个 USD 口径的字段
+        // 直接缺失，绝不退化成写入 SOL 数值——同一个字段混着两种单位比缺失危险得多。
+        const coinPrice = Number(features['native_coin_price']);
+        if (Number.isFinite(coinPrice) && coinPrice > 0) {
+          if (Number.isFinite(v3)) features['continue_breakout_volume_recent_signal_volume'] = v3 * coinPrice;
+          if (Number.isFinite(v1) && Number.isFinite(v2) && Number.isFinite(v3)) {
+            features['continue_breakout_volume_recent_volume_total'] = (v1 + v2 + v3) * coinPrice;
+          }
+        }
+        // 三根K线的放缩量趋势 = volume3 / volume1。比值无量纲，不依赖 native_coin_price，恒可计算。
+        // <1 = 缩量上涨（真实样本 nice 是 38→27→21，比值 0.57），>1 = 持续放量，两者含义完全不同，
+        // all_bullish 那个布尔值完全体现不出这个差别。
+        if (Number.isFinite(v1) && v1 > 0 && Number.isFinite(v3)) {
+          features['continue_breakout_volume_recent_volume_trend_ratio'] = v3 / v1;
+        }
+
+        // 三根里有几根是阳线（0~3）。all_bullish 等价于该值 === 3，但 2 根阳线和 0 根阳线
+        // 显然不是一回事，离散计数比布尔值信息量大。
+        let bullishCount = 0, bullishKnown = false;
+        for (const k of ['kline1_bullish', 'kline2_bullish', 'kline3_bullish']) {
+          if (typeof recentPick[k] === 'boolean') { bullishKnown = true; if (recentPick[k]) bullishCount++; }
+        }
+        if (bullishKnown) features['continue_breakout_volume_recent_bullish_kline_count'] = bullishCount;
+
+        // 注：早期精选的 kline1/2/3_buy_tx_count / sell_tx_count 在真实样本里恒为 0（平台没填），
+        // 对应的买/卖笔数合计字段已移除，不再产生恒 0 的无效特征。
+
+        // 时间位置：与 V 转那组同口径，单位分钟
+        const pickMs = toMilliseconds(pickSec);
+        if (Number.isFinite(pickMs) && Number.isFinite(swapBeginMs)) {
+          features['continue_breakout_volume_recent_signal_from_open_min'] = (pickMs - swapBeginMs) / 60000;
+        }
+        if (Number.isFinite(buyMs) && Number.isFinite(pickMs)) {
+          features['continue_breakout_volume_recent_signal_to_buy_min'] = (buyMs - pickMs) / 60000;
+        }
+      }
+    }
+
+    // ---- 休眠苏醒信号 breakout_volume_10x 明细（用户需求新增字段）----
+    // 信号结构 = 休眠阶段 + 苏醒阶段：一段低量横盘（history_start_time ~ history_end_time，
+    // 平均量 avg_history_volume、波动率 cv、斜率 standardized_slope）之后突然放量
+    // （current_volume 是平均休眠量的 volume_ratio 倍）。
+    //
+    // 与前两类信号一样，没有"确认/收尾"状态机，命中生效的那条按 signalTime 最新取。
+    const wakes = (s.signal && s.signal.breakout_volume_10x_list)
+               || (s.ctx && s.ctx.logearn && s.ctx.logearn.breakout_volume_10x_list)
+               || (s.ctx && s.ctx.breakout_volume_10x_list);
+    if (Array.isArray(wakes)) features['breakout_volume_10x_signal_count'] = wakes.length;
+    if (Array.isArray(wakes) && wakes.length) {
+      let recentWake = null;
+      for (const ev of wakes) {
+        if (!ev) continue;
+        if (!recentWake || (ev.signalTime || 0) > (recentWake.signalTime || 0)) recentWake = ev;
+      }
+      if (recentWake) {
+        const noticeMcap = Number(recentWake.notice_mcap);
+        if (Number.isFinite(noticeMcap)) features['breakout_volume_10x_recent_notice_mcap'] = noticeMcap;
+
+        // 放量倍数：文档明确「直接当倍数用，12.31 表示 12.31x，不用再乘 100」。
+        // 注意平台 content 文案把它写成「突然放量12.31%」——带了个 % 号但实际是倍数，别被文案误导。
+        const volRatio = Number(recentWake.volume_ratio);
+        if (Number.isFinite(volRatio)) features['breakout_volume_10x_recent_volume_ratio'] = volRatio;
+
+        // 休眠期的形态：持续多久、涉及多少根K线、波动率、斜率。
+        // 横盘越久越平静（cv/slope 越小）之后的放量，与"本来就在震荡"的放量含义不同。
+        const hStart = Number(recentWake.history_start_time);
+        const hEnd = Number(recentWake.history_end_time);
+        if (Number.isFinite(hStart) && Number.isFinite(hEnd) && hEnd >= hStart) {
+          features['breakout_volume_10x_recent_dormant_duration_min'] = (hEnd - hStart) / 60;
+        }
+        const klineCount = Number(recentWake.history_kline_count);
+        if (Number.isFinite(klineCount)) features['breakout_volume_10x_recent_dormant_kline_count'] = klineCount;
+        const cv = Number(recentWake.cv);
+        if (Number.isFinite(cv)) features['breakout_volume_10x_recent_dormant_cv'] = cv;
+        const slope = Number(recentWake.standardized_slope);
+        if (Number.isFinite(slope)) features['breakout_volume_10x_recent_dormant_slope'] = slope;
+
+        // 休眠结束到信号发出隔了多久：紧接着放量 vs 沉寂一段后才放量，是两种节奏
+        const wakeSec = Number(recentWake.signalTime);
+        if (Number.isFinite(hEnd) && Number.isFinite(wakeSec) && wakeSec >= hEnd) {
+          features['breakout_volume_10x_recent_dormant_end_to_signal_min'] = (wakeSec - hEnd) / 60;
+        }
+
+        // 交易量：current_volume / avg_history_volume 的单位都是【原生币 SOL/BNB】，
+        // 与早期精选的 volume1/2/3 同理，必须乘 native_coin_price 才是 USD 口径。
+        // 取不到币价时这两个字段缺失，绝不退化成写入原生币数值。
+
+        // ---- 以下字段结构文档均未列出，从真实样本 SVM 反推 ----
+        // 苏醒那根K线本身的形态：是否阳线 + 涨幅。放量但收阴线（砸盘放量）与放量拉阳线
+        // 完全是两回事，只看 volume_ratio 区分不出来。
+        if (typeof recentWake.current_bullish === 'boolean') {
+          features['breakout_volume_10x_recent_kline_bullish'] = recentWake.current_bullish ? 1 : 0;
+        }
+        const openP = Number(recentWake.current_open_price);
+        const closeP = Number(recentWake.current_close_price);
+        if (Number.isFinite(openP) && openP > 0 && Number.isFinite(closeP)) {
+          // 价格是原生币本位，但涨幅是比值、不受计价单位影响，无需换算
+          features['breakout_volume_10x_recent_kline_change_pct'] = (closeP - openP) / openP * 100;
+        }
+
+        // 信号市值相对历史最高市值的回调深度（%）。平台 content 里的「从最高点回调17.85%」就是它：
+        // 实测第一条信号 (138367.48 − 113664.75) / 138367.48 = 17.85% ✓
+        // 注意平台把负值截断成 0% 显示（第二条 notice_mcap 169499 > max_up_mcap 139250，文案写"回调0%"），
+        // 这里【不截断】——负值表示信号时市值已经超过历史最高点，是比"回调0%"更强的形态，
+        // 截断掉会把"刚好持平"和"大幅创新高"压成同一个值。
+        const maxUpMcap = Number(recentWake.max_up_mcap);
+        if (Number.isFinite(maxUpMcap) && maxUpMcap > 0 && Number.isFinite(noticeMcap)) {
+          features['breakout_volume_10x_recent_drawdown_from_high_pct'] = (maxUpMcap - noticeMcap) / maxUpMcap * 100;
+        }
+
+        const wakeMs = toMilliseconds(wakeSec);
+        if (Number.isFinite(wakeMs) && Number.isFinite(swapBeginMs)) {
+          features['breakout_volume_10x_recent_signal_from_open_min'] = (wakeMs - swapBeginMs) / 60000;
+        }
+        if (Number.isFinite(buyMs) && Number.isFinite(wakeMs)) {
+          features['breakout_volume_10x_recent_signal_to_buy_min'] = (buyMs - wakeMs) / 60000;
+        }
+      }
+    }
+
+    // ---- 蓝筹顶级赢家共振信号 whale ----
+    // 一组头部蓝筹钱包在短时间内集体买入=共振。whaleWalletCount 越多、pastMinute 越短，说明共振
+    // 越密集越强。volume 字段是带 M/K 后缀的字符串（"43.72M"，代币量非 USD），不可靠、不可比，跳过。
+    // 与前几类一样，多条时取 signalTime 最新的一条。
+    const whales = (s.signal && s.signal.whale_list)
+                || (s.ctx && s.ctx.logearn && s.ctx.logearn.whale_list)
+                || (s.ctx && s.ctx.whale_list);
+    if (Array.isArray(whales)) features['whale_signal_count'] = whales.length;
+    if (Array.isArray(whales) && whales.length) {
+      let recentWhale = null;
+      for (const ev of whales) {
+        if (!ev) continue;
+        if (!recentWhale || (ev.signalTime || 0) > (recentWhale.signalTime || 0)) recentWhale = ev;
+      }
+      if (recentWhale) {
+        const wc = Number(recentWhale.whaleWalletCount);
+        if (fin(wc)) features['whale_recent_wallet_count'] = wc;
+        const tc = Number(recentWhale.whaleTxCount);
+        if (fin(tc)) features['whale_recent_tx_count'] = tc;
+        // 人均买入次数：同样几个蓝筹地址，反复买 vs 各买一次，是不同的共振强度
+        if (fin(wc) && wc > 0 && fin(tc)) features['whale_recent_tx_per_wallet'] = tc / wc;
+        // pastMinute 是字符串"1"，转数值：共振时间窗口（分钟），越小越密集
+        const pm = Number(recentWhale.pastMinute);
+        if (fin(pm)) features['whale_recent_past_minute'] = pm;
+        const nm = Number(recentWhale.notice_mcap);
+        if (fin(nm)) features['whale_recent_notice_mcap'] = nm;
+        const wSec = Number(recentWhale.signalTime);
+        const wMs = toMilliseconds(wSec);
+        if (fin(wMs) && fin(swapBeginMs)) features['whale_recent_signal_from_open_min'] = (wMs - swapBeginMs) / 60000;
+        if (fin(buyMs) && fin(wMs)) features['whale_recent_signal_to_buy_min'] = (buyMs - wMs) / 60000;
+      }
+    }
+
+    // ---- K线量能形态（从 kline_bars 序列计算）----
+    // 这是目前唯一"干净"的成交量来源：volume 字段是 USD 成交额（已用两条真实样本交叉验证：
+    // token_volume × 该K线均价 ≈ volume），不依赖 native_coin_price（有的快照没有）、
+    // 不依赖 gmgn（约四成缺失）、也不涉及 pool_liquidity 那三套互相矛盾的口径。
+    //
+    // 另外 logearn 的 buy/sell_wcoin_amount 的 _m5/_h1/_d1 三个窗口在真实样本里取值完全相同
+    // （含一个已上线 178 天的币），窗口口径存疑，所以绝对量类指标一律不从那边取。
+    const klineBarsForVol = arrays['kline_and_indicators.kline_bars'] || [];
+    // 序列统计量在样本太少时毫无意义（真实样本里有的币只给了 2 根K线，有的给了 150 根），
+    // 少于该根数整组不写入，而不是算出一个看似有值、实则由 1~2 根决定的数字。
+    const MIN_KLINE_BARS_FOR_VOLUME = 10;
+    // kline_is_usd 为 false 时 volume 的计价单位不是 USD，跨样本不可比，直接跳过（token_volume
+    // 是代币数量、不受该标记影响，所以换手率仍然可算）
+    const klineIsUsd = features['kline_and_indicators.kline_is_usd'];
+    if (klineBarsForVol.length >= MIN_KLINE_BARS_FOR_VOLUME) {
+      // volsRaw 保留原数组的位置（含非法值），供按索引换算时间/取最新一根用；vols 只用于求和/均值等
+      // 与位置无关的统计——直接在 filter 后的数组上 indexOf/取 [0]，一旦有 bar 的 volume 非法被滤掉，
+      // 索引就与真实 K 线位置错位了
+      const volsRaw = klineBarsForVol.map(b => Number(b && b.volume));
+      const vols = volsRaw.filter(Number.isFinite);
+      if (vols.length >= MIN_KLINE_BARS_FOR_VOLUME && klineIsUsd !== 0) {
+        const total = vols.reduce((a, b) => a + b, 0);
+        const mean = total / vols.length;
+        if (total > 0 && mean > 0) {
+          // 量能集中度：最大一根占总量的比例（%）。持续放量 → 值低；单根异常巨量 → 值高，
+          // 后者常是一笔拉盘/砸盘造成的，与真实换手是两回事，只看总量完全区分不出来。
+          const maxVol = Math.max(...vols);
+          features['kline_volume_concentration_pct'] = maxVol / total * 100;
+          // 距最大量那根过了多少分钟：直接用"根数"没有意义——各样本K线粒度差异极大（1秒~1天），
+          // 同样"距今3根"在秒级K线上是几秒钟、在天级K线上是3天，跨样本没法比较；换算成分钟才是
+          // 统一单位，与 v_breakout_volume_recent_break_cost_line_min 等其它时长类字段口径一致。
+          // resolution 缺失时无法换算，不写入，不用"根数"退回去凑一个语义不同的数字。
+          const mvBarMin = measureBarMinutes(klineBarsForVol);
+          const resSec = Number(features['kline_and_indicators.resolution']);
+          const barMinMv = Number.isFinite(mvBarMin) && mvBarMin > 0
+            ? mvBarMin
+            : (Number.isFinite(resSec) && resSec > 0 ? resSec / 60 : NaN);
+          if (Number.isFinite(barMinMv) && barMinMv > 0) {
+            features['kline_minutes_since_max_volume'] = volsRaw.indexOf(maxVol) * barMinMv;
+          }
+          // 变异系数：量能稳不稳定，和均值无关的相对离散度
+          const variance = vols.reduce((acc, v) => acc + (v - mean) ** 2, 0) / vols.length;
+          features['kline_volume_cv'] = Math.sqrt(variance) / mean;
+          // 通用版"放量倍数"：最新一根相对之前所有根的均量。苏醒信号自带的 volume_ratio 只有
+          // 苏醒信号才有，这个对所有样本都能算。
+          // 最新一根必须取 volsRaw[0]（真实的最新 bar）；它非法时跳过，而不是错拿 vols[0]（可能是次新一根）
+          const newestVol = volsRaw[0];
+          if (Number.isFinite(newestVol)) {
+            const restMean = (total - newestVol) / (vols.length - 1);
+            if (restMean > 0) features['kline_volume_recent_ratio'] = newestVol / restMean;
+          }
+          // 放量/缩量趋势：较近的一半 vs 较早的一半（newest first，所以前半段是较近的）
+          const half = Math.floor(vols.length / 2);
+          const recentHalf = vols.slice(0, half).reduce((a, b) => a + b, 0) / half;
+          const olderHalf = vols.slice(half).reduce((a, b) => a + b, 0) / (vols.length - half);
+          if (olderHalf > 0) features['kline_volume_trend_ratio'] = recentHalf / olderHalf;
+        }
+      }
+      // ---- 急拉程度：从 kline_bars 多尺度扫描最陡的一段拉升 ----
+      // 动机：垂直拉升（几根K线从 7.6K 冲到 40K）和温和爬升是完全不同的形态，但只看总涨幅
+      // （max_up_ratio）区分不出来——后者可能是几小时慢慢涨的。这里找"最陡的那一段"。
+      //
+      // 为什么必须多尺度：如果只用单一固定窗口（比如恒定 5 分钟），speed = rise / 5 就成了
+      // rise 的线性变换，两个字段相关系数恒为 1，等于只有一个字段。扫多个时间尺度后，
+      // speed 偏向短窗口（1分钟暴涨60%），rise 偏向长窗口（15分钟累计涨400%），两者才解耦。
+      //
+      // 稳健性：K线粒度从【相邻bar的实际时间差中位数】推断，不解析 resolution 字符串——真实
+      // 数据粒度从 1S 到 1D 都有，且 bar 之间可能有缺口（无成交时段被跳过），中位数最抗缺口。
+      const chrono = klineBarsForVol.slice().reverse(); // 原数组 newest-first，反转成时间正序
+      const gaps = [];
+      for (let i = 1; i < chrono.length; i++) {
+        const d = (toMilliseconds(chrono[i].time) - toMilliseconds(chrono[i - 1].time)) / 60000;
+        if (Number.isFinite(d) && d > 0) gaps.push(d);
+      }
+      if (gaps.length >= 3) {
+        const sortedGaps = gaps.slice().sort((a, b) => a - b);
+        const barMin = sortedGaps[sortedGaps.length >> 1]; // 中位间隔（分钟）
+        if (barMin > 0) {
+          features['kline_bar_minutes'] = barMin;
+          const highs = chrono.map(b => Number(b.high));
+          const opens = chrono.map(b => Number(b.open));
+          // 目标时间尺度（分钟）→ 折算成根数后去重，粒度粗时会塌缩成同一个 W，无所谓
+          const widths = [];
+          for (const targetMin of [1, 3, 5, 15]) {
+            const w = Math.max(1, Math.min(chrono.length, Math.round(targetMin / barMin)));
+            if (!widths.includes(w)) widths.push(w);
+          }
+          let bestSpeed = NaN, bestSpeedWinMin = NaN, bestRise = NaN;
+          for (const W of widths) {
+            const winMin = W * barMin;
+            for (let i = 0; i + W <= chrono.length; i++) {
+              const base = opens[i];
+              if (!Number.isFinite(base) || base <= 0) continue;
+              let peak = -Infinity;
+              for (let k = i; k < i + W; k++) {
+                if (Number.isFinite(highs[k]) && highs[k] > peak) peak = highs[k];
+              }
+              if (!Number.isFinite(peak) || peak <= base) continue;
+              const rise = (peak - base) / base * 100;
+              const speed = rise / winMin;
+              if (!Number.isFinite(bestSpeed) || speed > bestSpeed) { bestSpeed = speed; bestSpeedWinMin = winMin; }
+              if (!Number.isFinite(bestRise) || rise > bestRise) bestRise = rise;
+            }
+          }
+          if (Number.isFinite(bestSpeed)) {
+            features['kline_max_rise_speed_pct_per_min'] = bestSpeed;
+            features['kline_max_rise_window_min'] = bestSpeedWinMin; // 最陡那一段发生在多长的尺度上
+          }
+          if (Number.isFinite(bestRise)) features['kline_max_rise_pct'] = bestRise;
+        }
+      }
+
+      // 真正的换手率：token_volume 是【已按精度换算】的代币数量（真实样本验证过），
+      // 除以总供应量就是期间换手比例。这是代币口径，不依赖币价、也不涉及"流动性该用哪个口径"
+      // 的争议——之前提的 成交额/池子 严格来说不叫换手率。
+      // 注意窗口长度 = kline_bars 覆盖的时间，各样本的粒度和根数不同，横向比较时要留意这一点。
+      const tokenVols = klineBarsForVol.map(b => Number(b && b.token_volume)).filter(Number.isFinite);
+      const supply = features['total_supply'];
+      if (tokenVols.length >= MIN_KLINE_BARS_FOR_VOLUME && fin(supply) && supply > 0) {
+        features['kline_turnover_pct'] = tokenVols.reduce((a, b) => a + b, 0) / supply * 100;
+      }
+    }
+
+    // ---- Top100 持有人快照聚合（holders 数组）----
+    // ctx.holders 是 GMGN 返回的头部持有人列表（通常约 100 条），每条是一个钱包。数组本身进不了
+    // 数值体系，这里聚合成一批行级占比特征。全部用【占比】而非绝对量/计数：绝对 USD 随市值变化、
+    // 跨 token 不可比；计数受列表长度影响。缺失（无 gmgn 数据）时整组不写入，不强行给 0。
+    //
+    // 关键口径：先剔除 addr_type===2（交易所/流动性池地址，不是真实持有人），A~E 各比例都在
+    // "真实持有人"子集上算；holder_exchange_ratio 例外，它要在全体上算才能反映池子地址占了多少。
+    const holdersAll = arrays['holders'];
+    if (Array.isArray(holdersAll) && holdersAll.length) {
+      const nAll = holdersAll.length;
+      const nExch = holdersAll.filter(h => Number(h && h.addr_type) === 2).length;
+      features['holder_exchange_ratio'] = nExch / nAll * 100;
+
+      const H = holdersAll.filter(h => h && Number(h.addr_type) !== 2);
+      const n = H.length;
+      if (n > 0) {
+        const ratioOf = pred => H.filter(pred).length / n * 100;
+        // 标签匹配辅助：tags/maker_token_tags 是字符串数组，做精确成员判断
+        const hasTag = (h, key, set) => Array.isArray(h[key]) && h[key].some(t => set.has(String(t)));
+        // 标签关键词默认集合——用户可按需增删。bot 类=机器人/三明治/捆绑；smart 类=聪明钱背书。
+        const BOT_TAGS = new Set(['sandwich_bot', 'bundler', 'smart_degen']);
+        const SMART_TAGS = new Set(['kol', 'smart_degen', 'bluechip_owner']);
+
+        // A. 真实买入 vs 转账接盘
+        features['holder_transfer_in_ratio'] = ratioOf(h => h.transfer_in === true);
+        features['holder_never_bought_ratio'] = ratioOf(h => Number(h.buy_volume_cur) === 0);
+        const sumBal = H.reduce((a, h) => a + (Number(h.balance) || 0), 0);
+        const sumTin = H.reduce((a, h) => a + (Number(h.current_transfer_in_amount) || 0), 0);
+        if (sumBal > 0) features['holder_transfer_amount_ratio'] = sumTin / sumBal * 100;
+
+        // B. 钱包画像
+        features['holder_bot_ratio'] = ratioOf(h => hasTag(h, 'tags', BOT_TAGS));
+        features['holder_bundler_ratio'] = ratioOf(h => hasTag(h, 'maker_token_tags', new Set(['bundler'])));
+        features['holder_paper_hands_ratio'] = ratioOf(h => hasTag(h, 'maker_token_tags', new Set(['paper_hands'])));
+        features['holder_smart_ratio'] = ratioOf(h => hasTag(h, 'tags', SMART_TAGS));
+        features['holder_suspicious_ratio'] = ratioOf(h => h.is_suspicious === true);
+        features['holder_new_ratio'] = ratioOf(h => h.is_new === true);
+
+        // C. 集中度（amount_percentage 是 0-1 的占比）。gini 内联，因为 giniCoefficient 定义在
+        // custom-fields.js、加载顺序在 data.js 之后，这里取不到。
+        const shares = H.map(h => Number(h.amount_percentage)).filter(Number.isFinite).sort((a, b) => a - b);
+        if (shares.length >= 2) {
+          const sSum = shares.reduce((a, b) => a + b, 0);
+          if (sSum > 0) {
+            let cw = 0;
+            for (let i = 0; i < shares.length; i++) cw += (2 * (i + 1) - shares.length - 1) * shares[i];
+            features['holder_gini'] = cw / (shares.length * sSum);
+            // HHI：份额平方和，先把 amount_percentage 归一化成占列表内总量的比例再平方求和
+            features['holder_hhi'] = shares.reduce((a, s) => a + (s / sSum) ** 2, 0);
+          }
+        }
+
+        // D. 盈亏/抛压
+        features['holder_in_profit_ratio'] = ratioOf(h => Number(h.profit) > 0);
+        features['holder_sold_ratio'] = ratioOf(h => Number(h.sell_amount_percentage) > 0);
+
+        // E. 入场时间协同：start_holding_at 落在最密集 5 分钟窗口内的占比。用滑动区间找最大命中——
+        // 头部大量钱包在同一 5 分钟涌入 = 协同建仓（狙击/捆绑），是很强的内部控盘信号。
+        const times = H.map(h => Number(h.start_holding_at)).filter(t => Number.isFinite(t) && t > 0).sort((a, b) => a - b);
+        if (times.length >= 3) {
+          let best = 1;
+          for (let i = 0, j = 0; i < times.length; i++) {
+            while (times[i] - times[j] > 300) j++;
+            if (i - j + 1 > best) best = i - j + 1;
+          }
+          features['holder_entry_concentration'] = best / times.length * 100;
+        }
+      }
+    }
+
+    // ---- gmgn 顶层字段组装（gmgn_ 前缀）----
+    // gmgn.price.* 的多窗口是【真实拆分】的（buys_1m/5m/1h/6h/24h 各不相同），是唯一可靠的短期
+    // 动量来源——logearn 的 _m5/_h1/_d1 经核实三窗口恒等（坏的），不能用。绝对 USD 一律只做分子分母，
+    // 不单独进特征。gmgn 数据约四成缺失，缺失时对应字段自动不写入（fin 判断挡住）。
+    const gp = k => features['gmgn.price.' + k];
+    // A. 短期动量：净买入额占比 + 买卖笔数比 + 成交加速度。只做 5m/1h 两窗口（1m 太抖、24h 太钝）。
+    const netBuyVolRatio = win => {
+      const b = gp('buy_volume_' + win), sv = gp('sell_volume_' + win);
+      return (fin(b) && fin(sv) && b + sv > 0) ? b / (b + sv) * 100 : undefined;
+    };
+    let v = netBuyVolRatio('5m'); if (v !== undefined) features['gmgn_net_buy_vol_ratio_5m'] = v;
+    v = netBuyVolRatio('1h'); if (v !== undefined) features['gmgn_net_buy_vol_ratio_1h'] = v;
+    const buys1h = gp('buys_1h'), sells1h = gp('sells_1h');
+    if (fin(buys1h) && fin(sells1h) && sells1h > 0) features['gmgn_buy_sell_count_ratio_1h'] = buys1h / sells1h;
+    // 成交加速度：最近 5 分钟的每分钟均速 ÷ 最近 1 小时的每分钟均速，>1 = 正在放量
+    const vol5m = gp('volume_5m'), vol1h = gp('volume_1h');
+    if (fin(vol5m) && fin(vol1h) && vol1h > 0) features['gmgn_vol_accel_5m_1h'] = (vol5m / 5) / (vol1h / 60);
+
+    // B. 流动性/储备
+    const poolLiq = features['gmgn.pool.liquidity'], initLiq = features['gmgn.pool.initial_liquidity'];
+    if (fin(poolLiq) && fin(initLiq) && initLiq > 0) features['gmgn_liquidity_change_ratio'] = poolLiq / initLiq;
+    const circ = features['gmgn.circulating_supply'], tot = features['gmgn.total_supply'];
+    if (fin(circ) && fin(tot) && tot > 0) features['gmgn_supply_circulating_ratio'] = circ / tot;
+
+    // C. 价格位置：当前价相对历史最高（离顶多远，越接近 1 越贵）
+    const priceNow = features['gmgn.price.price'], ath = features['gmgn.ath_price'];
+    if (fin(priceNow) && fin(ath) && ath > 0) features['gmgn_price_to_ath_ratio'] = priceNow / ath;
+
+    // D. 换手强度：累计手续费 / 流动性
+    const totFee = features['gmgn.total_fee'], gmgnLiq = features['gmgn.liquidity'];
+    if (fin(totFee) && fin(gmgnLiq) && gmgnLiq > 0) features['gmgn_fee_to_liq_ratio'] = totFee / gmgnLiq;
+
+    // ---- logearn 最大涨幅(max_up)组装 ----
+    // max_up_* 都是"开盘到快照时刻为止"的历史最高，不含快照之后的未来数据，可安全用。
+    const maxUpMcap = features['max_up_mcap'], maxUpRatio = features['max_up_ratio'], maxUpDur = features['max_up_duration'];
+    // 当前市值相对历史最高市值：<1=已从高点回落，回撤程度。买在回落多深的位置。
+    if (fin(mcap) && fin(maxUpMcap) && maxUpMcap > 0) features['mcap_to_max_up_ratio'] = mcap / maxUpMcap;
+    // 冲到历史高点的速度（%/分钟）= 最大涨幅 ÷ 用时。速度快=急拉，慢=温和。max_up_duration 为 0
+    // （历史高点就在开盘那一刻）时除数为 0，不写入。
+    if (fin(maxUpRatio) && fin(maxUpDur) && maxUpDur > 0) features['max_up_speed_pct_per_min'] = maxUpRatio / (maxUpDur / 60);
+
+    // ---- 信号时序：一个 token 常常先后触发多类信号（比如先"早期精选"再"回撤反弹"）----
+    // 前面那三组字段都只取各自类型里最新的一条，完全丢掉了【跨类型的先后关系】。
+    // 而"先精选后V转"和"先V转后精选"很可能是两种完全不同的行情结构，多类信号叠加（共振）
+    // 与只有单一信号也是两回事——这些信息只能靠把所有 list 合并、按 signalTime 排序才能得到。
+    //
+    // 这里【包含全部六类信号】（含 whale/followed/smart_money 这三类没做明细字段的），
+    // 因为时序分析只要漏掉一类，算出来的顺序就是错的；但只读 type + signalTime 两个字段，
+    // 不展开它们的明细，与"其他信号不做"的口径不冲突。
+    const SIGNAL_LISTS = {
+      v: 'v_breakout_volume_list',
+      continue: 'continue_breakout_volume_list',
+      '10x': 'breakout_volume_10x_list',
+      whale: 'whale_list',
+      followed: 'followed_list',
+      smart: 'smart_money_list',
+    };
+    const signalEvents = [];
+    let anySignalListPresent = false;
+    for (const [shortName, listKey] of Object.entries(SIGNAL_LISTS)) {
+      const list = (s.signal && s.signal[listKey])
+                || (s.ctx && s.ctx.logearn && s.ctx.logearn[listKey])
+                || (s.ctx && s.ctx[listKey]);
+      if (!Array.isArray(list)) continue;
+      anySignalListPresent = true; // 数组存在（哪怕为空）才说明这份数据确实带了信号列表
+      for (const ev of list) {
+        const t = Number(ev && ev.signalTime);
+        if (!Number.isFinite(t)) continue;
+        // 统一归一成毫秒再入列表：六类 list 的 signalTime 若单位不一致（秒/毫秒混用），
+        // 裸值排序会把顺序算错，span 也会差 1000 倍
+        const tMs = toMilliseconds(t);
+        // 防御性过滤：快照是买入时刻抓的，正常不会出现晚于买入的信号；万一有（时钟偏差/数据
+        // 异常），那就是未来函数，必须排除——否则算出来的"信号顺序"包含了当时根本看不到的信息。
+        if (Number.isFinite(buyMs) && tMs > buyMs) continue;
+        signalEvents.push({ type: shortName, t: tMs });
+      }
+    }
+    if (anySignalListPresent) {
+      signalEvents.sort((a, b) => a.t - b.t);
+      features['signal_total_count'] = signalEvents.length;
+      const distinctTypes = [...new Set(signalEvents.map(e => e.type))];
+      // 出现过几种不同类型的信号：1 = 单一信号，>=2 = 多类共振，是"信号强度"的一个直接度量
+      features['signal_type_count'] = distinctTypes.length;
+
+      if (signalEvents.length) {
+        // signalEvents 里的 t 已是毫秒，两个字段统一按毫秒换算分钟——之前 span 按裸秒 /60、
+        // first_to_buy 却走 toMilliseconds，同一组字段两套单位处理，正是上面 V 转那组注释警告过的坑
+        const firstT = signalEvents[0].t, lastT = signalEvents[signalEvents.length - 1].t;
+        features['signal_span_min'] = (lastT - firstT) / 60000;
+        if (Number.isFinite(buyMs)) features['signal_first_to_buy_min'] = (buyMs - firstT) / 60000;
+
+        // 分类字段（进 categorical，不进数值特征体系）：供"分类字段分析""分组对比"按信号形态分组，
+        // 直接回答"哪种信号组合/顺序的收益更好"。用 > 而不是箭头符号，避免 CSV 导出时的编码问题。
+        //
+        // 两个粒度并存，回答的问题不同：
+        //   signal_sequence — 完整时序（含同类重复），如 continue>continue>v，最细但取值发散、每组样本少
+        //   signal_combo    — 只看出现过哪几类（去重后按字母序），如 continue+v，基数小、每组样本多、统计更稳
+        // 分析时通常先用 combo 看大方向，样本够了再用 sequence 看细节。
+        categorical['signal_sequence'] = signalEvents.map(e => e.type).join('>');
+        categorical['signal_combo'] = distinctTypes.slice().sort().join('+');
+        categorical['signal_first_type'] = signalEvents[0].type;
+        // 最后一个信号 = 触发这次买入的那个，与 signal.type 应当一致
+        categorical['signal_last_type'] = signalEvents[signalEvents.length - 1].type;
       }
     }
 
@@ -413,6 +1256,9 @@ async function buildRows(calls, snapshots, onProgress) {
       // 原始数组字段（如 holders/kline_bars/v_breakout_volume_list），供自定义字段公式里的
       // countWhere/avgField/sumField/giniCoefficient 等聚合函数读取；不参与 getFeature 数值体系
       arrays,
+      // 快照所属策略名（snapshot.strategy_name）：同一个工作集可能通过"追加数据"混入多个策略的
+      // 样本，逐行记下来源才能在界面上如实展示"当前数据来自哪个/哪些策略"。
+      strategyName: s.strategy_name || '',
       // 快照原始 ctx 的【引用】（不是拷贝，不额外占内存）：策略回放（"8. CA 定位"里的策略诊断）需要
       // 把策略源码原样跑一遍，而策略读的是 ctx.logearn / ctx.gmgn / ctx.kline_and_indicators 这套
       // 原始嵌套结构，扁平化后的 features 无法还原。只有这一个功能会用到，其它分析一律走 getFeature。
@@ -425,7 +1271,81 @@ async function buildRows(calls, snapshots, onProgress) {
 
 function isAssembledField(key) {
   // composite_score 是进阶分析“组合评分”写入工作集的衍生字段，归入组装字段口径
-  return DERIVED_KEYS.includes(key) || key === 'composite_score' || customFields.some(c => c.name === key);
+  return DERIVED_KEYS.includes(key) || SIGNAL_KEYS.includes(key) || key === 'composite_score' || customFields.some(c => c.name === key);
+}
+
+// K线量能字段单独判定：字段浏览器分组时优先于 isAssembledField 判断，把这组从"组装字段"里摘出来
+function isKlineVolumeField(key) {
+  return KLINE_VOLUME_KEYS.includes(key);
+}
+
+// 信号字段单独判定：字段浏览器要把它们从"组装字段"里分出来单独成组
+function isSignalField(key) {
+  return SIGNAL_KEYS.includes(key);
+}
+
+// dev 组：创建者/开发者维度。用【显式清单】而不是 gmgn.dev.* 前缀——前缀会把用户没圈定的字段
+// （dexscr_ad / cto_flag / offchain / 各种资金来源 _ts 等噪声）也一并抓进来。只保留用户指定的这些。
+const DEV_FIELDS = new Set([
+  'gmgn.dev.creator_open_count',        // 创建者历史发币数（发币越多越像惯犯）
+  'gmgn.dev.top_10_holder_rate',        // 前10大持有人占比
+  'gmgn.dev.creator_token_balance',     // 创建者当前持仓数量
+  'gmgn.dev.twitter_create_token_count',// 推特宣传过的发币数
+  'gmgn.dev.twitter_del_post_token_count', // 删除过的发币帖子数
+  'gmgn.dev.twitter_name_change_count', // 推特改名次数（本工具从数组算出的派生字段）
+  'gmgn.dev.dexscr_boost_fee',          // 是否买 DexScreener Boost
+  'gmgn.dev.dexscr_trending_bar',       // 是否上过 DexScreener 趋势榜（0/1 标志保留；对应的 _ts 时间戳无分析意义，已剔除）
+]);
+function isDevField(key) { return DEV_FIELDS.has(key); }
+
+// stat 组：链上持仓结构/交易者画像维度。同样用显式清单，只保留用户指定字段。
+const STAT_FIELDS = new Set([
+  'gmgn.stat.top_rat_trader_percentage',        // 插队/内鬼交易者成交占比
+  'gmgn.stat.top_bundler_trader_percentage',    // 机器人捆绑买入成交占比
+  'gmgn.stat.top_entrapment_trader_percentage', // 诱多/陷阱交易者成交占比
+  'gmgn.stat.top_bot_degen_percentage',         // 机器人 degen 钱包成交占比
+  'gmgn.stat.creator_created_count',            // 创建者历史发币数
+  'gmgn.stat.bot_degen_count',                  // 机器人 degen 钱包数量
+  'gmgn.stat.bot_degen_rate',                   // 机器人 degen 钱包占比
+  'gmgn.stat.fresh_wallet_rate',                // 新钱包持仓占比
+  'gmgn.stat.top_10_holder_rate',               // 前10大持有人占比（>0.5 高风险）
+  'gmgn.stat.dev_team_hold_rate',               // 开发团队持仓占比
+  'gmgn.stat.creator_hold_rate',                // 创建者持仓占比
+  'gmgn.stat.creator_token_balance',            // 创建者当前持仓数量
+  'gmgn.stat.top70_sniper_hold_rate',           // 前70名狙击手钱包持仓占比
+]);
+function isStatField(key) { return STAT_FIELDS.has(key); }
+
+// 筹码组判定：chip_analysis.* 是筹码峰分析维度——套牢/获利占比、内盘卖出、筹码峰位置、头部来源等，
+// 既有平台直接给的标量，也有从 price_bars/top5_holders 数组组装出来的。用"前缀 + 排除清单"：
+// 前缀能自动纳入以后新增的派生字段，排除清单挡掉冗余/无意义的。
+// current_mcap 只是 ctx.logearn.mcap 的副本（平台在 chip_analysis 里顺带塞的当前市值），与 mcap
+// 完全重复，不该单独占一个筹码字段——否则相关性表里同一个信息出现两次、多重比较校正的 m 也虚增。
+const CHIP_FIELD_EXCLUDE = new Set([
+  'chip_analysis.current_mcap',
+]);
+// 持仓指标：logearn 的 *_volume 系列——各类钱包人群的实时持仓占比（%）。这是最核心的一组
+// 筛选字段（垃圾钱包>5 / 新钱包>60 / 高频>50 都是危险信号），单独成组放最前。
+const HOLDING_INDICATOR_FIELDS = new Set([
+  'smart_volume',     // 聪明钱持仓占比
+  'whale_volume',     // 蓝筹头部赢家持仓占比
+  'frequent_volume',  // 高频交易者持仓占比
+  'new_volume',       // 新钱包持仓占比
+  'old_volume',       // 老钱包持仓占比
+  'shit_volume',      // 垃圾钱包持仓占比
+  // 已移除 scam_volume / amm_volume / exchange_volume：实测这三个在真实数据里恒为 0
+  // （零方差 → AUC 恰好 0.5、置信区间宽度为 0），不含任何信息量，留在候选池里只会
+  // 占位并被误读成"测过了不显著"。若将来数据源开始提供非零值，再加回来即可。
+]);
+function isHoldingField(key) { return HOLDING_INDICATOR_FIELDS.has(key); }
+
+// holders 组：Top100 持有人快照聚合出的行级占比字段，全部 holder_ 前缀单独成组。
+function isHolderField(key) {
+  return typeof key === 'string' && key.indexOf('holder_') === 0;
+}
+
+function isChipField(key) {
+  return typeof key === 'string' && key.indexOf('chip_analysis.') === 0 && !CHIP_FIELD_EXCLUDE.has(key);
 }
 
 // 相关性候选池治理：三类字段在进入相关性检验前直接剔除——

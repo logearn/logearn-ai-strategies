@@ -223,6 +223,7 @@ function refreshAfterCustomFieldChange() {
   allNumericKeys = [...new Set([
     ...matchedRows.flatMap(r => Object.keys(r.features)),
     ...DERIVED_KEYS,
+    ...SIGNAL_KEYS,
     ...customFields.map(c => c.name),
   ])].sort();
   updateScatterSelects();

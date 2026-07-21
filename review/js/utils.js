@@ -414,6 +414,68 @@ function computeROC(values, labels, direction) {
   return { points: rocPoints, auc, best, positives, negatives };
 }
 
+// AUC 的 bootstrap 95% 置信区间。
+// 为什么必须有：AUC 的点估计极容易被误读——n 小的时候 0.53 和 0.5 在统计上根本分不开，但光看
+// "AUC=0.528"很像"比随机好一点点"。区间跨过 0.5 就说明这个字段和随机猜测没有可分辨的差别。
+//
+// 重抽样口径：按【样本对】(value, label) 整体有放回抽，不固定正负样本各自的数量——这样重抽样
+// 的随机性同时包含了"类别比例本身也是抽样得来的"这部分不确定性，区间不会偏窄。
+// 抽出来正负样本只剩一类的那few次直接丢弃（AUC 无定义），不计入分位数。
+//
+// 注意 direction 固定用外面已定好的方向，不在每次重抽样里重新自动检测：否则每次都取
+// max(auc, 1-auc)，AUC 会被系统性地推高到 0.5 以上，区间下界永远够不到 0.5，
+// "是否显著优于随机"这个问题就自动变成"是"了——这正是要避免的偏差。
+function bootstrapAucCI(values, labels, direction, B) {
+  const n = values.length;
+  if (n < 2) return { lo: NaN, hi: NaN };
+  const aucs = [];
+  const sv = new Array(n), sl = new Array(n);
+  for (let b = 0; b < B; b++) {
+    let pos = 0;
+    for (let i = 0; i < n; i++) {
+      const idx = Math.floor(Math.random() * n);
+      sv[i] = values[idx]; sl[i] = labels[idx];
+      pos += labels[idx];
+    }
+    if (pos === 0 || pos === n) continue;
+    const a = rankAuc(sv, sl, direction);
+    if (Number.isFinite(a)) aucs.push(a);
+  }
+  if (aucs.length < 20) return { lo: NaN, hi: NaN };
+  aucs.sort((a, b) => a - b);
+  return { lo: percentile(aucs, 0.025), hi: percentile(aucs, 0.975) };
+}
+
+// 秩和（Mann-Whitney U）公式算 AUC：AUC = (正样本秩和 - n1(n1+1)/2) / (n1·n2)。
+// 与 computeROC 里的梯形积分在数学上等价，但复杂度是 O(n log n) 而不是 O(阈值数 × n)，
+// bootstrap 要重复上千次，必须用这个版本，否则批量对比几十个字段会直接把页面卡死。
+// 并列值用平均秩（midrank）处理——大量重复值（比如布尔字段、被截断的比例字段）时，
+// 不做 midrank 会让 AUC 系统性偏离。
+function rankAuc(values, labels, direction) {
+  const n = values.length;
+  const idx = new Array(n);
+  for (let i = 0; i < n; i++) idx[i] = i;
+  // direction='lower'（越小越可能盈利）等价于把值取反后按 'higher' 算
+  const sign = direction === 'lower' ? -1 : 1;
+  idx.sort((a, b) => sign * (values[a] - values[b]));
+  const rank = new Array(n);
+  let i = 0;
+  while (i < n) {
+    let j = i;
+    while (j + 1 < n && values[idx[j + 1]] === values[idx[i]]) j++;
+    const avgRank = (i + j) / 2 + 1; // 秩从 1 开始，并列取平均
+    for (let k = i; k <= j; k++) rank[idx[k]] = avgRank;
+    i = j + 1;
+  }
+  let rankSumPos = 0, n1 = 0;
+  for (let k = 0; k < n; k++) {
+    if (labels[k] === 1) { rankSumPos += rank[k]; n1++; }
+  }
+  const n2 = n - n1;
+  if (n1 === 0 || n2 === 0) return NaN;
+  return (rankSumPos - n1 * (n1 + 1) / 2) / (n1 * n2);
+}
+
 // Welch's t 检验：不假设两组方差相等，比标准 t 检验更稳健，适合分类字段两组均值对比场景。
 // p 值用正态近似（大样本近似，简化处理，n 较小时结果仅供参考）；自由度用 Welch–Satterthwaite 近似，仅用于展示参考。
 function welchTTest(a, b) {
@@ -464,6 +526,47 @@ function anovaFTest(groups) {
   const chi2Approx = df1 * F;
   const p = Number.isFinite(chi2Approx) ? 1 - chiSquareCdfApprox(chi2Approx, df1) : 0;
   return { F, p, df1, df2 };
+}
+
+// 二项检验（正态近似）：某个子集里的胜率 pSub（k/n）与基准胜率 p0 是否有显著差异。
+// 用途：区间挖掘里判断"这一档的胜率比全样本高"是真信号还是抽样波动。
+// 返回双尾 p 值；n 太小或 p0 退化（0/1）时返回 NaN——此时正态近似本身就不成立，
+// 与其给个不可信的 p 值，不如明确标为无法判断。
+function binomTestP(k, n, p0) {
+  if (!Number.isFinite(k) || !Number.isFinite(n) || !Number.isFinite(p0)) return NaN;
+  if (n < 5 || p0 <= 0 || p0 >= 1) return NaN;
+  const se = Math.sqrt(p0 * (1 - p0) / n);
+  if (se <= 0) return NaN;
+  const z = (k / n - p0) / se;
+  return 2 * (1 - normalCdf(Math.abs(z)));
+}
+
+// Wilson score 区间：比例的置信区间。比"p ± 1.96·sqrt(p(1-p)/n)"这个正态近似稳健得多——
+// 后者在 p 接近 0 或 1 时会给出越界（负数或 >1）的区间，样本小的时候尤其离谱（比如 0/7 会
+// 得到 [0,0]，看起来像"确定不会赢"，实际只是样本太少）。Wilson 在这些边界情况下仍然合理。
+// 用途：滑动窗口胜率曲线的置信带——带子宽不宽，直接决定那个"波峰"值不值得信。
+function wilsonInterval(k, n, z = 1.96) {
+  if (!Number.isFinite(k) || !Number.isFinite(n) || n <= 0) return { lo: NaN, hi: NaN };
+  const p = k / n;
+  const z2 = z * z;
+  const denom = 1 + z2 / n;
+  const center = (p + z2 / (2 * n)) / denom;
+  const half = (z / denom) * Math.sqrt(p * (1 - p) / n + z2 / (4 * n * n));
+  return { lo: Math.max(0, center - half), hi: Math.min(1, center + half) };
+}
+
+// 两比例 z 检验（正态近似）：两个独立子集的胜率 k1/n1 与 k2/n2 是否有显著差异。
+// 与 binomTestP 的区别：那个是"子集 vs 已知基准"，这个是"两个子集互相比"——断点挖掘要问的是
+// "在这里切一刀，左右两边的胜率差异是不是真的"，两边都是估计值，必须用合并比例算标准误。
+function twoProportionTestP(k1, n1, k2, n2) {
+  if (![k1, n1, k2, n2].every(Number.isFinite)) return NaN;
+  if (n1 < 5 || n2 < 5) return NaN; // 样本太小时正态近似不成立，宁可不给 p 值
+  const pPool = (k1 + k2) / (n1 + n2);
+  if (pPool <= 0 || pPool >= 1) return NaN; // 全赢或全输，没有可比较的差异
+  const se = Math.sqrt(pPool * (1 - pPool) * (1 / n1 + 1 / n2));
+  if (se <= 0) return NaN;
+  const z = (k1 / n1 - k2 / n2) / se;
+  return 2 * (1 - normalCdf(Math.abs(z)));
 }
 
 // 多重比较校正：同时检验 m 个假设时，单个 p<0.05 的"显著性"含义会被稀释——

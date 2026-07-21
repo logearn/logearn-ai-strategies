@@ -509,6 +509,68 @@ function renderFieldQuality() {
   });
 }
 
+// ---------- 字段说明浮层 ----------
+// 给任何带 data-field-tip="字段名" 的元素加悬停提示：字段分类 + 中文含义 + 计算公式。
+// 用事件委托挂在 document 上，这样动态生成的元素（图表标题每次 rerender 都会重建）不用逐个绑定。
+let fieldTipEl = null;
+
+function fieldKindLabel(field) {
+  if (customFields.some(c => c.name === field)) return '自定义字段';
+  if (typeof isDevField === 'function' && isDevField(field)) return 'dev 字段';
+  if (typeof isStatField === 'function' && isStatField(field)) return 'stat 字段';
+  if (typeof isChipField === 'function' && isChipField(field)) return '筹码字段';
+  if (typeof isHolderField === 'function' && isHolderField(field)) return '持有人字段';
+  if (typeof isSignalField === 'function' && isSignalField(field)) return '信号字段';
+  if (isAssembledField(field)) return '组装字段';
+  if (typeof isHoldingField === 'function' && isHoldingField(field)) return '持仓指标';
+  if (typeof ORIGINAL_FIELD_WHITELIST !== 'undefined' && ORIGINAL_FIELD_WHITELIST.has(field)) return '原字段';
+  return '原字段';
+}
+
+function buildFieldTipHtml(field) {
+  const desc = getFieldDesc(field);
+  // 自定义字段的"计算公式"就是用户自己写的那段代码，内置的组装/信号字段则把公式写在中文说明里，
+  // 所以这里只有自定义字段需要额外贴一段代码块
+  const custom = customFields.find(c => c.name === field);
+  return `<div><span class="field-tip-name">${escapeHtml(field)}</span><span class="field-tip-kind">${escapeHtml(fieldKindLabel(field))}</span></div>`
+    + `<div class="field-tip-desc">${desc ? escapeHtml(desc) : '暂无字段说明'}</div>`
+    + (custom ? `<div class="field-tip-code">${escapeHtml(custom.code)}</div>` : '');
+}
+
+function showFieldTip(target, field) {
+  if (!fieldTipEl) {
+    fieldTipEl = document.createElement('div');
+    fieldTipEl.className = 'field-tip';
+    document.body.appendChild(fieldTipEl);
+  }
+  fieldTipEl.innerHTML = buildFieldTipHtml(field);
+  fieldTipEl.classList.add('show');
+  // 先显示再量尺寸，否则 display:none 时量出来是 0，没法做边界收拢
+  const r = target.getBoundingClientRect();
+  const tip = fieldTipEl.getBoundingClientRect();
+  let left = r.left;
+  let top = r.bottom + 8;
+  if (left + tip.width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - tip.width - 8);
+  // 下方放不下就翻到元素上方，避免浮层被视口截断
+  if (top + tip.height > window.innerHeight - 8) top = Math.max(8, r.top - tip.height - 8);
+  fieldTipEl.style.left = left + 'px';
+  fieldTipEl.style.top = top + 'px';
+}
+
+function hideFieldTip() {
+  if (fieldTipEl) fieldTipEl.classList.remove('show');
+}
+
+document.addEventListener('mouseover', e => {
+  const t = e.target.closest && e.target.closest('[data-field-tip]');
+  if (t) showFieldTip(t, t.getAttribute('data-field-tip'));
+});
+document.addEventListener('mouseout', e => {
+  if (e.target.closest && e.target.closest('[data-field-tip]')) hideFieldTip();
+});
+// 滚动时元素会移位，浮层是 fixed 定位不会跟着走，直接隐藏比错位显示好
+window.addEventListener('scroll', hideFieldTip, true);
+
 // 从字段质量表跳转到相关性表定位该字段：数值字段直接在相关性表里高亮对应行；
 // 分类字段本身不参与相关性计算（pearson 只对数值有意义），提示改去 Pro 分析的分组/分类视图看
 function jumpToCorrField(field) {
@@ -811,10 +873,12 @@ function applyFilter() {
     <tr>
       <td>${escapeHtml(r.symbol || '')}</td>
       <td>${escapeHtml(r.tokenAddress || '')}</td>
+      <td>${escapeHtml(r.signalType || '')}</td>
       <td class="num">${r.returnMax.toFixed(4)}x</td>
       <td class="num">${conditions.map(c => { const v = getFeature(r, c.field); return `${escapeHtml(c.field)}: ${escapeHtml(typeof v === 'number' ? formatNumberSmart(v) : v)}`; }).join('<br>')}</td>
+      <td>${r.tokenAddress ? `<a href="${escapeHtml(logearnUrl(r.tokenAddress))}" target="_blank" rel="noopener">打开</a>` : ''}</td>
     </tr>
-  `).join('') : `<tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:20px 12px;">没有满足条件的样本，试试放宽阈值</td></tr>`;
+  `).join('') : `<tr><td colspan="6" style="text-align:center; color:var(--text-muted); padding:20px 12px;">没有满足条件的样本，试试放宽阈值</td></tr>`;
 }
 
 function copyFilterCAs() {
@@ -1022,14 +1086,6 @@ function initBatchXImport() {
 // 和"组装字段"（DERIVED_KEYS 里的比率/差值等衍生字段 + 用户自定义字段），点击直接加入 X，
 // 不用像自动补全那样一个字一个字打拼音/英文去联想。
 // 保存最近一次分组结果，供"+ 全部加入X"按钮直接读取，不用重新计算一遍
-let fieldBrowserGroups = { original: [], assembled: [] };
-
-function copyFieldNames(fields) {
-  if (!fields.length) { showToast('该分组暂无字段'); return; }
-  navigator.clipboard.writeText(fields.join('\n'))
-    .then(() => showToast(`已复制 ${fields.length} 个字段名到剪贴板（每行一个）`))
-    .catch(err => showToast('复制失败：' + err));
-}
 
 async function addFieldsToX(fields) {
   if (!fields.length) return 0;
@@ -1049,6 +1105,13 @@ async function addFieldsToX(fields) {
   return fields.length > 20 ? withLoading(`正在加入 ${fields.length} 个字段...`, () => run()) : run();
 }
 
+function copyFieldNames(fields) {
+  if (!fields.length) { showToast('该分组暂无字段'); return; }
+  navigator.clipboard.writeText(fields.join('\n'))
+    .then(() => showToast(`已复制 ${fields.length} 个字段名到剪贴板（每行一个）`))
+    .catch(err => showToast('复制失败：' + err));
+}
+
 // "原字段"分组的白名单：只有确实是有意义的原始业务字段才归入"原字段"，
 // 排除 _highlight_*/ai_max_*/all_signals_max_ratio.* 等内部标记或高度重复的衍生统计字段（这些改归入"组装字段"分组）。
 const ORIGINAL_FIELD_WHITELIST = new Set([
@@ -1057,6 +1120,7 @@ const ORIGINAL_FIELD_WHITELIST = new Set([
   'gmgn.dev.dexscr_boost_fee', 
   'gmgn.dev.top_10_holder_rate', 'gmgn.dev.twitter_create_token_count', 'gmgn.dev.twitter_del_post_token_count',
   'gmgn.image_dup_count',
+  'gmgn.launchpad_progress', 'gmgn.locked_ratio', 'gmgn.visiting_count', 'gmgn.launchpad_status', 'gmgn.price.hot_level', 'gmgn.pool.fee_ratio', 'gmgn.og', 'gmgn.migration_market_cap', 'launch_time_duration', 'is_fake', 'is_new_m5_hot_ranking_token', 'is_new_h1_hot_ranking_token',
   'gmgn.liquidity', 'gmgn.locked_ratio',
    'gmgn.pool.liquidity',
   'gmgn.price.buy_volume_1h', 'gmgn.price.buy_volume_1m', 'gmgn.price.buy_volume_24h', 'gmgn.price.buy_volume_5m',
@@ -1101,6 +1165,7 @@ const TRUSTED_FIELDS = new Set([
   'old_volume', 'new_volume', 'frequent_volume',
   'price_change_5m', 'price_change_1h', 'price_change_6h', 'price_change_1d',
   'above_cost_line',
+  'gmgn.launchpad_progress', 'gmgn.locked_ratio', 'gmgn.visiting_count', 'gmgn.launchpad_status', 'gmgn.price.hot_level', 'gmgn.pool.fee_ratio', 'gmgn.og', 'gmgn.migration_market_cap', 'gmgn.image_dup_count', 'launch_time_duration', 'is_fake', 'is_new_m5_hot_ranking_token', 'is_new_h1_hot_ranking_token',
 ]);
 
 // "常用字段"的实际判定口径 = 上面这份手工核实过的原始字段清单 ∪ 全部组装字段（DERIVED_KEYS 里的
@@ -1108,35 +1173,78 @@ const TRUSTED_FIELDS = new Set([
 // 为了分析才专门造出来的（原始字段是数据源给什么就有什么，组装字段是有目的地挑出来的），没有
 // "需要人工筛一遍哪些靠谱"的问题。另外用户自定义字段是运行时动态增删的，写死进 TRUSTED_FIELDS
 // 这个静态 Set 也维护不了，只能靠 isAssembledField 动态判断。
+// 信号字段【不算】常用：它们有 49 个，且只在对应类型的信号存在时才有值——而三类信号基本互斥，
+// 实测覆盖率低到个位数百分比。全塞进常用字段会让"★ 一键加载"灌进一堆大面积缺失的字段、
+// 并把联想框顶部的 ★ 常用区淹没。需要它们时走字段浏览器的"信号字段"分组。
 function isTrustedField(f) {
+  if (typeof isSignalField === 'function' && isSignalField(f)) return false;
   return TRUSTED_FIELDS.has(f) || isAssembledField(f);
 }
 
-function renderFieldBrowser() {
-  const originalBox = document.getElementById('fieldBrowserOriginal');
-  const assembledBox = document.getElementById('fieldBrowserAssembled');
-  if (!originalBox || !assembledBox) return;
-  const original = [], assembled = [];
+// 字段分组计算：从 scatterOptions 实时算，不依赖字段浏览器是否渲染过。
+// 之前 fieldBrowserGroups 只在面板可见时由 renderFieldBrowser 填充，别处（如 AUC 批量导入）
+// 直接读它，用户没展开过面板时就是一堆空数组 → 误报"该分组没有可用字段"。
+// 现在统一走这个函数，渲染和导入用同一份口径。
+function computeFieldGroups() {
+  const holding = [], assembled = [], signal = [], volume = [], dev = [], stat = [], chip = [], holder = [];
   for (const f of scatterOptions) {
-    if (ORIGINAL_FIELD_WHITELIST.has(f)) original.push(f);
+    // 8大持仓指标最先判定，单独成组放最前（用户最常用的核心筛选字段）
+    if (typeof isHoldingField === 'function' && isHoldingField(f)) holding.push(f);
+    else if (typeof isDevField === 'function' && isDevField(f)) dev.push(f);
+    else if (typeof isStatField === 'function' && isStatField(f)) stat.push(f);
+    else if (typeof isChipField === 'function' && isChipField(f)) chip.push(f);
+    else if (typeof isHolderField === 'function' && isHolderField(f)) holder.push(f);
+    // 原字段分组已移除：不属于上述主题组、也不是衍生/信号/量能字段的原始白名单字段，
+    // 不再单独成组（仍可通过上方联想框搜索到）
+    else if (isKlineVolumeField(f)) volume.push(f);
+    else if (isSignalField(f)) signal.push(f);
     else if (isAssembledField(f)) assembled.push(f);
-    // 既不在白名单、也不是衍生/自定义字段（比如 _highlight_*、ai_max_* 等内部标记/噪声字段）：
-    // 两组都不显示，避免"组装字段"分组被无关字段撑大。
   }
-  original.sort();
-  assembled.sort();
-  fieldBrowserGroups = { original, assembled };
-  document.getElementById('fieldBrowserOriginalCount').textContent = `（${original.length}）`;
+  [holding, assembled, signal, volume, dev, stat, chip, holder].forEach(a => a.sort());
+  return { holding, assembled, signal, volume, dev, stat, chip, holder };
+}
+
+// 保存最近一次分组结果，供各分组的"+ 全部加入X"/"复制字段名"按钮直接读取
+let fieldBrowserGroups = computeFieldGroups();
+
+function renderFieldBrowser() {
+  const holdingBox = document.getElementById('fieldBrowserHolding');
+  const assembledBox = document.getElementById('fieldBrowserAssembled');
+  const signalBox = document.getElementById('fieldBrowserSignal');
+  const volumeBox = document.getElementById('fieldBrowserVolume');
+  const devBox = document.getElementById('fieldBrowserDev');
+  const statBox = document.getElementById('fieldBrowserStat');
+  const chipBox = document.getElementById('fieldBrowserChip');
+  const holderBox = document.getElementById('fieldBrowserHolder');
+  if (!holdingBox || !assembledBox || !signalBox || !volumeBox || !devBox || !statBox || !chipBox || !holderBox) return;
+  // 分组口径与 AUC 批量导入等处共用同一个 computeFieldGroups，避免两处逻辑漂移
+  fieldBrowserGroups = computeFieldGroups();
+  const { holding, assembled, signal, volume, dev, stat, chip, holder } = fieldBrowserGroups;
+  document.getElementById('fieldBrowserHoldingCount').textContent = `（${holding.length}）`;
   document.getElementById('fieldBrowserAssembledCount').textContent = `（${assembled.length}）`;
+  document.getElementById('fieldBrowserSignalCount').textContent = `（${signal.length}）`;
+  document.getElementById('fieldBrowserVolumeCount').textContent = `（${volume.length}）`;
+  document.getElementById('fieldBrowserDevCount').textContent = `（${dev.length}）`;
+  document.getElementById('fieldBrowserStatCount').textContent = `（${stat.length}）`;
+  document.getElementById('fieldBrowserChipCount').textContent = `（${chip.length}）`;
+  document.getElementById('fieldBrowserHolderCount').textContent = `（${holder.length}）`;
 
   const renderChips = fields => fields.map(f => {
     const selected = batchXSelected.includes(f);
-    return `<button type="button" class="secondary field-chip-btn${selected ? ' active' : ''}" data-field="${escapeHtml(f)}" title="${escapeHtml(getFieldDesc(f) || '')}">${escapeHtml(f)}${selected ? ' ✓' : ''}</button>`;
+    // 用 data-field-tip 走统一的字段说明浮层（含分类和自定义字段公式），不再用原生 title
+    // ——原生 title 有约 1 秒延迟、纯文本、没法展示代码块
+    return `<button type="button" class="secondary field-chip-btn${selected ? ' active' : ''}" data-field="${escapeHtml(f)}" data-field-tip="${escapeHtml(f)}">${escapeHtml(f)}${selected ? ' ✓' : ''}</button>`;
   }).join('');
-  originalBox.innerHTML = renderChips(original) || '<span class="hint" style="margin:0;">暂无</span>';
+  holdingBox.innerHTML = renderChips(holding) || '<span class="hint" style="margin:0;">暂无</span>';
   assembledBox.innerHTML = renderChips(assembled) || '<span class="hint" style="margin:0;">暂无</span>';
+  signalBox.innerHTML = renderChips(signal) || '<span class="hint" style="margin:0;">暂无</span>';
+  volumeBox.innerHTML = renderChips(volume) || '<span class="hint" style="margin:0;">暂无</span>';
+  devBox.innerHTML = renderChips(dev) || '<span class="hint" style="margin:0;">暂无</span>';
+  statBox.innerHTML = renderChips(stat) || '<span class="hint" style="margin:0;">暂无</span>';
+  chipBox.innerHTML = renderChips(chip) || '<span class="hint" style="margin:0;">暂无</span>';
+  holderBox.innerHTML = renderChips(holder) || '<span class="hint" style="margin:0;">暂无</span>';
 
-  [originalBox, assembledBox].forEach(box => {
+  [holdingBox, assembledBox, signalBox, volumeBox, devBox, statBox, chipBox, holderBox].forEach(box => {
     box.querySelectorAll('.field-chip-btn').forEach(btn => {
       btn.addEventListener('click', () => addFieldsToX([btn.dataset.field]));
     });
@@ -1224,7 +1332,7 @@ function downloadCsv() {
 function finalizeMatchedRows() {
   activeRows = matchedRows;
   applyCustomFields(matchedRows);
-  allNumericKeys = [...new Set([...matchedRows.flatMap(r => Object.keys(r.features)), ...DERIVED_KEYS, ...customFields.map(c => c.name)])].sort();
+  allNumericKeys = [...new Set([...matchedRows.flatMap(r => Object.keys(r.features)), ...DERIVED_KEYS, ...SIGNAL_KEYS, ...customFields.map(c => c.name)])].sort();
 
   const catValueSets = new Map();
   for (const r of matchedRows) {
@@ -1253,6 +1361,8 @@ function finalizeMatchedRows() {
   updateScatterSelects();
   renderCustomFieldList();
   refreshAnalysisViews();
+  // 所有重建工作集的入口（分析/追加/快照恢复/数据集切换）都会走到这里，统一刷新策略名展示
+  renderStrategyBadge();
 }
 
 async function analyze() {
@@ -1284,6 +1394,23 @@ async function analyze() {
   } finally {
     btn.disabled = false; btn.textContent = '分析';
   }
+}
+
+// 数据源策略名展示：从当前 matchedRows 汇总 strategy_name（追加数据后可能有多个），
+// 显示在"数据源"标题旁。对比两个策略版本时，一眼确认加载的是哪份数据。
+function renderStrategyBadge() {
+  const el = document.getElementById('dataSourceStrategy');
+  if (!el) return;
+  if (!matchedRows.length) { el.innerHTML = ''; return; }
+  const counts = new Map();
+  for (const r of matchedRows) {
+    const n = r.strategyName || '(未标注策略)';
+    counts.set(n, (counts.get(n) || 0) + 1);
+  }
+  const items = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  el.innerHTML = items.map(([n, c]) =>
+    `<span class="strategy-badge" title="该策略贡献 ${c} 条样本">${escapeHtml(n)} <b>${c}</b></span>`
+  ).join('');
 }
 
 // 追加数据（design doc §14.1）：把新选择的 calls/snapshots 合并进当前 matchedRows，而不是整体替换。
@@ -1354,10 +1481,81 @@ document.getElementById('resetAllChartOptsBtn').addEventListener('click', () => 
   if (!batchXSelected.length) { showToast('当前没有已展示的图表'); return; }
   resetAllChartOptions();
 });
+
+// 低覆盖率过滤开关：改动后立即重绘（只影响渲染，不动已选字段列表）
+['minCoverageEnabled', 'minCoveragePct', 'minCoverageUnit'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { plotPage = 0; if (matchedRows.length) plot(); });
+});
 document.querySelectorAll('.export-png-btn').forEach(btn => {
   btn.addEventListener('click', () => exportChartPng(document.getElementById(btn.dataset.target), btn.dataset.filename));
 });
 document.getElementById('genBinBarBtn').addEventListener('click', renderBinBarChart);
+// 导出分箱分析给 AI 诊断：复制到剪贴板（最常用，直接粘进对话框）+ 下载文件两条路
+function withBinBarAiReport(fn) {
+  const md = buildBinBarAiReport();
+  if (!md) { showToast('请先点"生成分箱柱状图"，有结果之后才能导出'); return; }
+  fn(md);
+}
+document.getElementById('copyBinBarAiBtn').addEventListener('click', () => withBinBarAiReport(md => {
+  navigator.clipboard.writeText(md)
+    .then(() => showToast(`已复制 ${md.length} 字符，直接粘贴给 AI 即可`))
+    .catch(err => showToast('复制失败：' + err, true));
+}));
+document.getElementById('downloadBinBarAiBtn').addEventListener('click', () => withBinBarAiReport(md => {
+  const blob = new Blob([md], { type: 'text/markdown;charset=utf-8;' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `分箱分析_${document.getElementById('binField').value.trim() || 'field'}.md`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}));
+
+document.getElementById('genWinCurveBtn').addEventListener('click', () => renderWinRateCurve());
+document.getElementById('genFieldScanBtn').addEventListener('click', () => {
+  withLoading('正在逐字段跑置换检验...', () => renderFieldScan());
+});
+// 点某行"设为分箱字段"：填进分箱字段框并直接画出该字段的曲线，方便顺着看细节
+document.getElementById('fieldScanBody').addEventListener('click', e => {
+  const btn = e.target.closest('.scan-pick-field-btn');
+  if (!btn) return;
+  document.getElementById('binField').value = btn.dataset.field;
+  renderWinRateCurve();
+  document.getElementById('winCurveChart').scrollIntoView({ behavior: 'smooth', block: 'center' });
+});
+document.getElementById('addScanPassedToXBtn').addEventListener('click', async () => {
+  if (!lastFieldScanPassed.length) { showToast('还没有通过检测的字段，请先运行集体检测'); return; }
+  const added = await addFieldsToX(lastFieldScanPassed);
+  showToast(`已加入 ${lastFieldScanPassed.length} 个通过检测的字段（新增 ${added}）`);
+});
+['curveWindow', 'curveLogX', 'peakWinThreshold'].forEach(id => {
+  const el = document.getElementById(id);
+  // 已经画过曲线才跟着重绘，避免刚进页面改参数就弹"请填写字段"
+  if (el) el.addEventListener('change', () => {
+    if (activeRows.length && document.getElementById('winCurveChart').querySelector('.main-svg')) renderWinRateCurve();
+  });
+});
+
+document.getElementById('genBreakpointMineBtn').addEventListener('click', () => {
+  withLoading('正在搜索最优切分点...', () => renderBreakpointMine());
+});
+// "填入断点"：把挖到的切点写进分箱断点框并立即重绘分箱图，省去手动复制粘贴
+document.getElementById('breakpointMineBody').addEventListener('click', e => {
+  const btn = e.target.closest('.apply-breakpoint-btn');
+  if (!btn) return;
+  document.getElementById('binBreakpoints').value = btn.dataset.cut;
+  renderBinBarChart();
+  document.getElementById('binBarChart').scrollIntoView({ behavior: 'smooth', block: 'center' });
+  showToast('已填入断点并重绘分箱图');
+});
+
+// 主指标切换后立即重绘（已经生成过图才重绘，避免首次进页面就报"请填写字段"）
+['binPrimaryStat'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => {
+    if (activeRows.length && document.getElementById('binField').value.trim()) renderBinBarChart();
+  });
+});
 document.getElementById('binRecommendBtn').addEventListener('click', () => {
   if (!activeRows.length) { showToast('请先点击"分析"加载数据'); return; }
   const field = document.getElementById('binField').value.trim();
@@ -1377,10 +1575,22 @@ document.getElementById('fieldBrowserToggle').addEventListener('click', () => {
   panel.classList.toggle('hidden');
   if (!panel.classList.contains('hidden')) renderFieldBrowser();
 });
-document.getElementById('fieldBrowserAddAllOriginal').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.original));
+document.getElementById('fieldBrowserAddAllHolding').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.holding));
 document.getElementById('fieldBrowserAddAllAssembled').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.assembled));
-document.getElementById('fieldBrowserCopyOriginal').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.original));
+document.getElementById('fieldBrowserCopyHolding').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.holding));
 document.getElementById('fieldBrowserCopyAssembled').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.assembled));
+document.getElementById('fieldBrowserAddAllSignal').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.signal));
+document.getElementById('fieldBrowserCopySignal').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.signal));
+document.getElementById('fieldBrowserAddAllVolume').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.volume));
+document.getElementById('fieldBrowserCopyVolume').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.volume));
+document.getElementById('fieldBrowserAddAllDev').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.dev));
+document.getElementById('fieldBrowserCopyDev').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.dev));
+document.getElementById('fieldBrowserAddAllStat').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.stat));
+document.getElementById('fieldBrowserCopyStat').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.stat));
+document.getElementById('fieldBrowserAddAllChip').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.chip));
+document.getElementById('fieldBrowserCopyChip').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.chip));
+document.getElementById('fieldBrowserAddAllHolder').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.holder));
+document.getElementById('fieldBrowserCopyHolder').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.holder));
 document.getElementById('loadTrustedFieldsBtn').addEventListener('click', async () => {
   // 直接从 scatterOptions（当前数据集实际存在、可作为 X 轴的字段）里筛，而不是遍历 TRUSTED_FIELDS
   // 再过滤：一来避免加进去一堆当前数据里根本没有的死字段，二来组装字段（含用户自定义字段）本来就

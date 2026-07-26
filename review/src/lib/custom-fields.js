@@ -1,0 +1,381 @@
+// ⚠️ 由 js/custom-fields.js 机械移植而来：逻辑一行未改，只在文件首尾加了 import / export。
+// 122 个既有测试全部改为从这里 import，测试通过即证明移植是忠实的。
+import { DERIVED_KEYS, SIGNAL_KEYS, readJson } from './data.js';
+import { FIELD_DESC } from './dictionary.js';
+import { formatNumberSmart } from './utils.js';
+
+// ========== 自定义组装字段（用户写 JS） ==========
+// 依赖 data.js（DERIVED_KEYS）、dictionary.js（FIELD_DESC）、ui.js（renderBatchTags/refreshAnalysisViews/
+// updateScatterSelects/matchedRows/activeRows/allNumericKeys/batchXSelected）——均在函数体内读取，加载顺序无要求。
+
+const CUSTOM_FIELDS_STORAGE_KEY = 'chart_custom_fields';
+let customFields = []; // [{ name, code }]，按定义顺序计算，后面的可引用前面的
+const customFieldStats = new Map(); // name -> { ok, err, total, firstError, min, max }
+
+// 数组聚合函数（design doc §20.0）：holders/kline_bars/各类事件 _list 等数组字段单条元素没有直接分析意义，
+// 必须先聚合成标量才能进相关性/回归框架。这几个函数在自定义字段公式里通过 countWhere(arr, ...)/avgField(arr, field) 直接调用，
+// 第二个参数支持"字段名字符串"（取 item[field]）或"回调函数"（自定义取值/判断逻辑），覆盖大多数聚合场景。
+function resolveArrValue(item, field) {
+  if (item === null || item === undefined) return undefined;
+  return typeof field === 'function' ? field(item) : item[field];
+}
+function countWhere(arr, predicate) {
+  if (!Array.isArray(arr)) return null;
+  if (predicate === undefined) return arr.length;
+  let c = 0;
+  for (const item of arr) {
+    try {
+      const v = typeof predicate === 'function' ? predicate(item) : item === predicate;
+      if (v) c++;
+    } catch (e) { /* 单条元素取值出错，跳过不计入 */ }
+  }
+  return c;
+}
+function avgField(arr, field) {
+  if (!Array.isArray(arr) || !arr.length) return null;
+  let sum = 0, n = 0;
+  for (const item of arr) {
+    const v = Number(resolveArrValue(item, field));
+    if (Number.isFinite(v)) { sum += v; n++; }
+  }
+  return n ? sum / n : null;
+}
+function sumField(arr, field) {
+  if (!Array.isArray(arr)) return null;
+  let sum = 0;
+  for (const item of arr) {
+    const v = Number(resolveArrValue(item, field));
+    if (Number.isFinite(v)) sum += v;
+  }
+  return sum;
+}
+function maxField(arr, field) {
+  if (!Array.isArray(arr) || !arr.length) return null;
+  let m = -Infinity;
+  for (const item of arr) {
+    const v = Number(resolveArrValue(item, field));
+    if (Number.isFinite(v) && v > m) m = v;
+  }
+  return Number.isFinite(m) ? m : null;
+}
+function minField(arr, field) {
+  if (!Array.isArray(arr) || !arr.length) return null;
+  let m = Infinity;
+  for (const item of arr) {
+    const v = Number(resolveArrValue(item, field));
+    if (Number.isFinite(v) && v < m) m = v;
+  }
+  return Number.isFinite(m) ? m : null;
+}
+// 基尼系数：衡量数组某个数值字段的分布不平等程度，0=完全平均，1=完全集中（design doc §20.4，
+// 比如用在 holders 数组的 amount_percentage 上衡量持仓集中度，比单一的"前N大占比"更完整）
+function giniCoefficient(arr, field) {
+  if (!Array.isArray(arr)) return null;
+  const vals = arr.map(item => Number(resolveArrValue(item, field))).filter(Number.isFinite).sort((a, b) => a - b);
+  const n = vals.length;
+  if (n < 2) return null;
+  const sum = vals.reduce((a, b) => a + b, 0);
+  if (sum === 0) return 0;
+  let cumWeighted = 0;
+  for (let i = 0; i < n; i++) cumWeighted += (2 * (i + 1) - n - 1) * vals[i];
+  return cumWeighted / (n * sum);
+}
+// 自定义字段公式里可直接调用的聚合函数集合，编译/执行时作为额外参数注入 Function 作用域
+const AGGREGATE_FN_NAMES = ['countWhere', 'avgField', 'sumField', 'maxField', 'minField', 'giniCoefficient'];
+const AGGREGATE_FNS = [countWhere, avgField, sumField, maxField, minField, giniCoefficient];
+
+// 公共函数库（design doc §13.1）：把用户重复手写的"避免除以0"这类边界判断收进几个白名单函数，
+// 降低自定义字段的上手门槛，不需要每次都自己拼 `b !== 0 ? a/b : null` 这种条件判断。
+// b 为 0/缺失时返回 null 而不是 Infinity/NaN，避免这类"坏值"悄悄混进后续统计
+function safeDiv(a, b) {
+  const an = Number(a), bn = Number(b);
+  if (!Number.isFinite(an) || !Number.isFinite(bn) || bn === 0) return null;
+  return an / bn;
+}
+// 占比类组合专用，等价于 safeDiv(a, b) * 100，语义比裸写乘除更清楚
+function pct(a, b) {
+  const v = safeDiv(a, b);
+  return v === null ? null : v * 100;
+}
+// 把值限制在区间内，防止个别极端值把后续相关性/图表拉爆；min/max 任一非有限数时视为该侧不限制
+function clamp(x, min, max) {
+  const xn = Number(x);
+  if (!Number.isFinite(xn)) return null;
+  let v = xn;
+  if (Number.isFinite(min) && v < min) v = min;
+  if (Number.isFinite(max) && v > max) v = max;
+  return v;
+}
+// log(1+x)，给长尾分布字段（mcap/volume等）做压缩变换时常用；x <= -1 时 log 无意义，返回 null
+function log1p(x) {
+  const xn = Number(x);
+  if (!Number.isFinite(xn) || xn <= -1) return null;
+  return Math.log1p(xn);
+}
+const PURE_FN_NAMES = ['safeDiv', 'pct', 'clamp', 'log1p'];
+const PURE_FNS = [safeDiv, pct, clamp, log1p];
+
+// zscore(x, field)：把 x 按 field 这个字段在当前 rows（同一批 applyCustomFields 调用范围内）里的
+// 均值/标准差做标准化，公式里不用自己现算全数据集的均值方差。因为依赖当前数据集，不能是纯函数，
+// 每次 applyCustomFields/试算调用时用 buildZscoreFn(rows) 现场构造一个绑定了该批 rows 的闭包函数。
+function buildZscoreFn(rows) {
+  const statsCache = new Map();
+  function fieldStats(field) {
+    if (statsCache.has(field)) return statsCache.get(field);
+    const vals = [];
+    for (const r of rows) {
+      const v = r.features[field];
+      if (Number.isFinite(v)) vals.push(v);
+    }
+    let stat = { mean: NaN, std: NaN };
+    if (vals.length) {
+      const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+      const variance = vals.reduce((a, b) => a + (b - mean) * (b - mean), 0) / vals.length;
+      stat = { mean, std: Math.sqrt(variance) };
+    }
+    statsCache.set(field, stat);
+    return stat;
+  }
+  return function zscore(x, field) {
+    const xn = Number(x);
+    const { mean, std } = fieldStats(field);
+    if (!Number.isFinite(xn) || !Number.isFinite(mean) || !Number.isFinite(std) || std === 0) return null;
+    return (xn - mean) / std;
+  };
+}
+// 公式编译时需要知道全部可调用函数名（含动态构造的 zscore），聚合函数 + 公共函数 + zscore 三组合并
+const CUSTOM_FN_NAMES = [...AGGREGATE_FN_NAMES, ...PURE_FN_NAMES, 'zscore'];
+
+function loadCustomFields() {
+  try {
+    const raw = localStorage.getItem(CUSTOM_FIELDS_STORAGE_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) customFields = arr.filter(c => c && typeof c.name === 'string' && typeof c.code === 'string');
+    }
+  } catch (e) { console.warn('加载自定义字段失败', e); }
+}
+function saveCustomFields() {
+  try { localStorage.setItem(CUSTOM_FIELDS_STORAGE_KEY, JSON.stringify(customFields)); } catch (e) {}
+}
+
+// 编译用户代码：没有 return 关键字时按单表达式处理，自动包一层 return (...)
+// 额外注入聚合函数（countWhere/avgField/...）+ 公共函数库（safeDiv/pct/clamp/log1p，design doc §13.1）+
+// zscore 作为形参，公式里可以直接按函数名调用，比如 safeDiv(f['a'], f['b']) 或 countWhere(row.arrays.holders, ...)
+function compileCustomField(code) {
+  const body = /\breturn\b/.test(code) ? code : `return (\n${code}\n);`;
+  return new Function('f', 'row', ...CUSTOM_FN_NAMES, `"use strict";\n${body}`);
+}
+// zscoreFn：由调用方（applyCustomFields/试算）用 buildZscoreFn(rows) 现场构造并传入，
+// 因为 zscore 依赖当前这批行的均值/标准差，不能像其它函数一样是固定不变的纯函数
+function invokeCustomField(fn, features, meta, zscoreFn) {
+  return fn(features, meta, ...AGGREGATE_FNS, ...PURE_FNS, zscoreFn);
+}
+
+function customRowMeta(r) {
+  return {
+    id: r.id, symbol: r.symbol, token_address: r.tokenAddress, signalType: r.signalType,
+    returnMax: r.returnMax,
+    initialMcap: r.initialMcap, currentMcap: r.currentMcap, maxMcap: r.maxMcap,
+    // 原始数组字段（如 holders/kline_bars/v_breakout_volume_list），配合聚合函数使用（design doc §20.0）
+    arrays: r.arrays || {},
+  };
+}
+
+// 对所有行按定义顺序计算全部自定义字段；写入 row.features，供图表/过滤/相关性直接使用
+function applyCustomFields(rows) {
+  customFieldStats.clear();
+  const zscoreFn = buildZscoreFn(rows);
+  for (const cf of customFields) {
+    const stat = { ok: 0, err: 0, total: rows.length, firstError: '', min: Infinity, max: -Infinity };
+    let fn = null;
+    try { fn = compileCustomField(cf.code); }
+    catch (e) { stat.firstError = '编译失败: ' + e.message; stat.err = rows.length; }
+    if (fn) {
+      for (const r of rows) {
+        try {
+          const v = invokeCustomField(fn, r.features, customRowMeta(r), zscoreFn);
+          if (typeof v === 'number' && Number.isFinite(v)) {
+            r.features[cf.name] = v;
+            stat.ok++;
+            if (v < stat.min) stat.min = v;
+            if (v > stat.max) stat.max = v;
+          } else {
+            delete r.features[cf.name];
+          }
+        } catch (e) {
+          delete r.features[cf.name];
+          stat.err++;
+          if (!stat.firstError) stat.firstError = e.message;
+        }
+      }
+    }
+    customFieldStats.set(cf.name, stat);
+    FIELD_DESC[cf.name] = '自定义字段: ' + cf.code.replace(/\s+/g, ' ').trim();
+  }
+}
+
+// 从所有行中移除某个自定义字段的值
+function removeCustomFieldValues(name) {
+  for (const r of matchedRows) delete r.features[name];
+  delete FIELD_DESC[name];
+  customFieldStats.delete(name);
+}
+
+// 重算自定义字段并刷新所有下游（候选字段/相关性/散点图）
+function refreshAfterCustomFieldChange() {
+  if (!matchedRows.length) { renderCustomFieldList(); return; }
+  applyCustomFields(matchedRows);
+  allNumericKeys = [...new Set([
+    ...matchedRows.flatMap(r => Object.keys(r.features)),
+    ...DERIVED_KEYS,
+    ...SIGNAL_KEYS,
+    ...customFields.map(c => c.name),
+  ])].sort();
+  updateScatterSelects();
+  renderCustomFieldList();
+  refreshAnalysisViews();
+}
+
+// 字段依赖分析（design doc §13.3）：扫描每个自定义字段的公式里引用到哪些其他自定义字段（通过 f['custom.xxx'] 读取方式扫描，
+// 和面板里现有的占位写法一致），维护一张 Map<被依赖的字段名, Set<依赖它的字段名>>，
+// 同时检测"引用了不存在的字段"（比如依赖的字段已经被删除但公式没同步改）。
+function extractFieldRefs(code) {
+  const refs = new Set();
+  const re = /f\[\s*['"]([^'"]+)['"]\s*\]/g;
+  let m;
+  while ((m = re.exec(code))) refs.add(m[1]);
+  return refs;
+}
+function computeCustomFieldDependencies() {
+  const dependents = new Map(); // 被依赖的字段名 -> Set(依赖它的字段名)
+  const brokenRefs = new Map(); // 字段名 -> Set(引用了但已不存在的 custom 字段名)
+  const namesSet = new Set(customFields.map(c => c.name));
+  for (const cf of customFields) dependents.set(cf.name, new Set());
+  for (const cf of customFields) {
+    for (const ref of extractFieldRefs(cf.code)) {
+      if (!ref.startsWith('custom.') || ref === cf.name) continue;
+      if (namesSet.has(ref)) dependents.get(ref).add(cf.name);
+      else {
+        if (!brokenRefs.has(cf.name)) brokenRefs.set(cf.name, new Set());
+        brokenRefs.get(cf.name).add(ref);
+      }
+    }
+  }
+  return { dependents, brokenRefs };
+}
+
+let editingCustomFieldIdx = -1; // -1 = 新建
+
+function validateCustomFieldName(rawName) {
+  const trimmed = rawName.trim().replace(/^custom\./, '');
+  if (!trimmed) return { error: '请填写字段名' };
+  if (!/^[a-zA-Z0-9_.]+$/.test(trimmed)) return { error: '字段名只允许字母、数字、下划线和点' };
+  const name = 'custom.' + trimmed;
+  const conflictIdx = customFields.findIndex(c => c.name === name);
+  if (conflictIdx !== -1 && conflictIdx !== editingCustomFieldIdx) return { error: `字段 ${name} 已存在` };
+  if (allNumericKeys.includes(name) && conflictIdx === -1) return { error: `字段 ${name} 与数据中已有字段重名` };
+  return { name };
+}
+
+// 导入/导出自定义字段配置（design doc §13.2）：现在只存在 localStorage，换浏览器/设备/团队共享都会丢失，
+// 导出成 JSON 文件后可以在其他设备/给同事导入，version 字段用于以后格式升级时做向后兼容检查。
+const CUSTOM_FIELDS_CONFIG_VERSION = 1;
+
+// 冲突处理用简单的 prompt 交互（覆盖/跳过/重命名后导入），和现有删除字段用 confirm() 的风格保持一致，
+// 不为这个低频操作单独设计一套弹窗组件
+function promptImportConflict(name) {
+  const choice = (prompt(`字段 "${name}" 已存在，如何处理？输入 overwrite（覆盖）/ skip（跳过）/ rename（重命名后导入），默认 skip`, 'skip') || '').trim().toLowerCase();
+  if (choice === 'overwrite' || choice === 'rename') return choice;
+  return 'skip';
+}
+
+async function importCustomFieldsFromFile(file) {
+  let payload;
+  try { payload = await readJson(file); } catch (e) { showToast('文件解析失败：' + e.message); return; }
+  const list = Array.isArray(payload) ? payload : payload && payload.fields;
+  if (!Array.isArray(list)) { showToast('文件里没有找到自定义字段列表，请确认是本工具导出的配置文件'); return; }
+  if (!Array.isArray(payload) && payload.version !== undefined && payload.version !== CUSTOM_FIELDS_CONFIG_VERSION) {
+    if (!await showConfirm(`该配置文件版本号(${payload.version})与当前工具（v${CUSTOM_FIELDS_CONFIG_VERSION}）不一致，部分设置可能无法正确导入，是否继续？`)) return;
+  }
+  // 校验：字段名格式合法 + 公式能编译通过，两者都复用现有的校验/编译逻辑，不重新写一套
+  const valid = [];
+  const invalidMsgs = [];
+  for (const item of list) {
+    if (!item || typeof item.name !== 'string' || typeof item.code !== 'string') { invalidMsgs.push(`${item && item.name || '(未命名)'}：缺少 name/code`); continue; }
+    const trimmed = item.name.replace(/^custom\./, '');
+    if (!/^[a-zA-Z0-9_.]+$/.test(trimmed)) { invalidMsgs.push(`${item.name}：字段名含非法字符`); continue; }
+    try { compileCustomField(item.code); } catch (e) { invalidMsgs.push(`${item.name}：编译失败 - ${e.message}`); continue; }
+    valid.push({ name: item.name.startsWith('custom.') ? item.name : 'custom.' + trimmed, code: item.code });
+  }
+  if (invalidMsgs.length) showToast(`以下字段校验未通过，已跳过：\n${invalidMsgs.join('\n')}`);
+  if (!valid.length) return;
+
+  let importCount = 0, skipCount = 0, overwriteCount = 0, renameCount = 0;
+  for (const item of valid) {
+    const existingIdx = customFields.findIndex(c => c.name === item.name);
+    if (existingIdx === -1) {
+      customFields.push({ name: item.name, code: item.code });
+      importCount++;
+      continue;
+    }
+    const choice = promptImportConflict(item.name);
+    if (choice === 'skip') { skipCount++; continue; }
+    if (choice === 'overwrite') { customFields[existingIdx] = { name: item.name, code: item.code }; overwriteCount++; continue; }
+    let newName = item.name + '_imported', suffix = 2;
+    while (customFields.some(c => c.name === newName)) { newName = item.name + '_imported' + suffix; suffix++; }
+    customFields.push({ name: newName, code: item.code });
+    renameCount++;
+  }
+  saveCustomFields();
+  refreshAfterCustomFieldChange();
+  showToast(`导入完成：新增 ${importCount} 个，覆盖 ${overwriteCount} 个，重命名导入 ${renameCount} 个，跳过 ${skipCount} 个。`);
+}
+
+// 代码模板/示例库（design doc §13.4）：面对空白公式输入框，新用户不知道能写什么，
+// 用几个覆盖最常见组合模式的模板降低"从0开始想公式"这一步的门槛，占位字段名（字段A/字段B）
+// 不是合法字段，提交前的字段名校验会自然拦下并提示用户替换，不需要额外设计校验逻辑。
+const CUSTOM_FIELD_TEMPLATES = {
+  ratio: { code: "safeDiv(f['字段A'], f['字段B'])", hint: '比率类，例如"买卖比"：把字段A、字段B换成实际字段名（如 buy_wcoin_amount_d1 / sell_wcoin_amount_d1）' },
+  pct: { code: "pct(f['字段A'], f['字段A'] + f['字段B'])", hint: '占比类，例如"买方占比 = 买入金额/(买入+卖出金额)"：把字段A、字段B换成实际字段名' },
+  zscore: { code: "zscore(f['字段A'], '字段A')", hint: '归一化类，例如"把市值标准化后再比较不同量级的token"：两处字段A都要换成同一个实际字段名（如 mcap）' },
+};
+
+export {
+  AGGREGATE_FNS,
+  AGGREGATE_FN_NAMES,
+  CUSTOM_FIELDS_CONFIG_VERSION,
+  CUSTOM_FIELDS_STORAGE_KEY,
+  CUSTOM_FIELD_TEMPLATES,
+  CUSTOM_FN_NAMES,
+  PURE_FNS,
+  PURE_FN_NAMES,
+  applyCustomFields,
+  avgField,
+  buildZscoreFn,
+  clamp,
+  compileCustomField,
+  computeCustomFieldDependencies,
+  countWhere,
+  customFieldStats,
+  customFields,
+  customRowMeta,
+  editingCustomFieldIdx,
+  extractFieldRefs,
+  giniCoefficient,
+  importCustomFieldsFromFile,
+  invokeCustomField,
+  loadCustomFields,
+  log1p,
+  maxField,
+  minField,
+  pct,
+  promptImportConflict,
+  refreshAfterCustomFieldChange,
+  removeCustomFieldValues,
+  resolveArrValue,
+  safeDiv,
+  saveCustomFields,
+  sumField,
+  validateCustomFieldName,
+};

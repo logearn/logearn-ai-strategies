@@ -42,7 +42,7 @@ let defaultSwapped = true;
 const chartSettings = new Map();
 function getChartSettings(xField) {
   if (!chartSettings.has(xField)) {
-    chartSettings.set(xField, { logX: false, logY: false, clipOutliers: false, showConfBand: true, showBinned: false, swapped: defaultSwapped, showVLine: false, vLineValue: 2 });
+    chartSettings.set(xField, { logX: false, logY: false, clipOutliers: false, showConfBand: true, showBinned: false, showMarginal: true, swapped: defaultSwapped, showVLine: false, vLineValue: 2 });
   }
   return chartSettings.get(xField);
 }
@@ -61,7 +61,7 @@ function resetAllChartOptions() {
   // 返回的对象引用；这里必须在原对象上原地重置字段（而不是像以前那样整个替换掉 Map 里的
   // 对象），否则已经渲染出来的卡片会一直用着替换前的旧对象，重置操作对它们不生效。
   for (const xField of batchXSelected) {
-    Object.assign(getChartSettings(xField), { logX: false, logY: false, clipOutliers: false, showConfBand: true, showBinned: false, swapped: defaultSwapped, showVLine: false, vLineValue: 2 });
+    Object.assign(getChartSettings(xField), { logX: false, logY: false, clipOutliers: false, showConfBand: true, showBinned: false, showMarginal: true, swapped: defaultSwapped, showVLine: false, vLineValue: 2 });
   }
   if (matchedRows.length) plot();
 }
@@ -294,9 +294,10 @@ function createChartCard(xField) {
     <button type="button" class="chart-tool-btn${opt.swapped ? ' active' : ''}" data-action="swap" title="交换该图的横纵坐标">⇄ 交换 X/Y</button>
     <label class="chart-opt"><input type="checkbox" data-opt="logX" ${opt.logX ? 'checked' : ''}> 对数 X</label>
     <label class="chart-opt"><input type="checkbox" data-opt="logY" ${opt.logY ? 'checked' : ''}> 对数 Y</label>
-    <label class="chart-opt" title="勾选后基于 IQR(Tukey k=1.5) 自动识别主体数据范围并收紧坐标轴，离群点仍参与计算但不显示在图上"><input type="checkbox" data-opt="clipOutliers" ${opt.clipOutliers ? 'checked' : ''}> 剔除离群点</label>
+    <label class="chart-opt" title="勾选后基于 IQR(Tukey k=1.5) 自动识别主体数据范围并收紧坐标轴，离群点不显示在图上、也不参与 r/p/趋势线的计算"><input type="checkbox" data-opt="clipOutliers" ${opt.clipOutliers ? 'checked' : ''}> 剔除离群点</label>
     <label class="chart-opt" title="在趋势线周围显示 95% 置信区间"><input type="checkbox" data-opt="showConfBand" ${opt.showConfBand ? 'checked' : ''}> 趋势线置信区间</label>
     <label class="chart-opt" title="按 X 字段分档，展示每档 Y 的均值±标准差"><input type="checkbox" data-opt="showBinned" ${opt.showBinned ? 'checked' : ''}> 分档统计</label>
+    <label class="chart-opt" title="在左侧显示 Y 字段的分布直方图，用来判断收益集中在哪个区间、有没有长尾（散点在密集区会重叠成一团，看不出密度）"><input type="checkbox" data-opt="showMarginal" ${opt.showMarginal !== false ? 'checked' : ''}> 边际分布</label>
     <label class="chart-opt" title="在 X 轴指定数值处画一条竖直分割线，便于按阈值直观区分两组"><input type="checkbox" data-opt="showVLine" ${opt.showVLine ? 'checked' : ''}> 分割竖线</label>
     <input type="number" class="chart-vline-value" step="any" value="${opt.vLineValue}" title="竖线所在的 X 轴数值" style="width: 64px;">
     <button type="button" class="chart-tool-btn danger" data-action="remove" title="删除该图表，并移除对应的 X 指标">✕ 删除该图</button>
@@ -384,7 +385,7 @@ function createChartCard(xField) {
   // 图越多、无关操作的性能提升越明显。
   const currentSnapshot = () => ({
     logX: opt.logX, logY: opt.logY, clipOutliers: opt.clipOutliers,
-    showConfBand: opt.showConfBand, showBinned: opt.showBinned, swapped: opt.swapped,
+    showConfBand: opt.showConfBand, showBinned: opt.showBinned, showMarginal: opt.showMarginal, swapped: opt.swapped,
     showVLine: opt.showVLine, vLineValue: opt.vLineValue,
     yField: getValidFieldInput('yField'), colorField: getValidColorField(),
     activeRows, highlightCAs, light: isLightTheme()
@@ -395,7 +396,8 @@ function createChartCard(xField) {
     const prev = renderedSnapshot;
     const same = prev && prev.logX === snap.logX && prev.logY === snap.logY &&
       prev.clipOutliers === snap.clipOutliers && prev.showConfBand === snap.showConfBand &&
-      prev.showBinned === snap.showBinned && prev.swapped === snap.swapped &&
+      prev.showBinned === snap.showBinned && prev.showMarginal === snap.showMarginal &&
+      prev.swapped === snap.swapped &&
       prev.showVLine === snap.showVLine && prev.vLineValue === snap.vLineValue &&
       prev.yField === snap.yField && prev.colorField === snap.colorField &&
       prev.activeRows === snap.activeRows && prev.highlightCAs === snap.highlightCAs &&
@@ -427,7 +429,7 @@ function createChartCard(xField) {
 }
 
 function renderScatterChart(xField, yField, settings, chartDiv, captionEl) {
-  const { colorField, logX, logY, clipOutliers, showConfBand, showBinned, showVLine, vLineValue } = settings;
+  const { colorField, logX, logY, clipOutliers, showConfBand, showBinned, showMarginal, showVLine, vLineValue } = settings;
 
   const pairs = [];
   const points = []; // { x, y, text, symbol, tokenAddress }
@@ -511,48 +513,82 @@ function renderScatterChart(xField, yField, settings, chartDiv, captionEl) {
     }
   }
 
-  const r = pearson(pairs);
   const n = pairs.length;
-  const pVal = pearsonPValue(r, n);
 
-  if (n >= 2) {
-    const { slope, intercept } = linearRegression(pairs);
-    const minX = Math.min(...xArr), maxX = Math.max(...xArr);
+  // 离群点探测提前到这里算一次：既用来（下面）收紧坐标轴显示，也用来在勾选"剔除离群点"时
+  // 把这些点从相关系数/趋势线的计算里排除——不然"剔除"就只是把点挪出画面的视觉效果，
+  // 极端值照样在拉着 r 值/趋势线跑，跟"剔除"这两个字的字面意思对不上。
+  let cx = null, cy = null;
+  const outlierIdx = new Set();
+  if (clipOutliers && n >= 8) {
+    cx = computeClipRange(xArr.slice().sort((a, b) => a - b));
+    cy = computeClipRange(yArr.slice().sort((a, b) => a - b));
+    points.forEach((p, i) => {
+      const outX = !cx.degenerate && (p.x < cx.fenceLo || p.x > cx.fenceHi);
+      const outY = !cy.degenerate && (p.y < cy.fenceLo || p.y > cy.fenceHi);
+      if (outX || outY) outlierIdx.add(i);
+    });
+  }
+  const outlierRows = points.filter((_, i) => outlierIdx.has(i));
+
+  // 相关系数/趋势线用"统计口径"数据：剔除了离群点（勾选时），并按对数开关做过变换——
+  // 对数轴下趋势线该是"对数空间里的一条直线"，不是"线性空间的直线硬套在对数轴上"
+  // （那样在对数轴上会显示成一条跟直觉对不上的弯曲曲线，r 值也仍是线性相关，不是对数相关）。
+  // 前面收集 points 时 logX/logY 开启已经把 <=0 的点滤掉了，这里可以放心直接取 log10。
+  const statX = v => (logX ? Math.log10(v) : v);
+  const statY = v => (logY ? Math.log10(v) : v);
+  const unstatY = v => (logY ? Math.pow(10, v) : v);
+  const statPairs = points
+    .map((p, i) => ({ p, i }))
+    .filter(({ i }) => !outlierIdx.has(i))
+    .map(({ p }) => [statX(p.x), statY(p.y)]);
+  const nStat = statPairs.length;
+
+  const r = pearson(statPairs);
+  const pVal = pearsonPValue(r, nStat);
+
+  if (nStat >= 2) {
+    const { slope, intercept } = linearRegression(statPairs);
+    const xStatArr = statPairs.map(p => p[0]);
+    const minXStat = Math.min(...xStatArr), maxXStat = Math.max(...xStatArr);
     const steps = 40;
-    const xs = Array.from({ length: steps + 1 }, (_, i) => minX + (maxX - minX) * i / steps);
+    // 对数场景下趋势线在原始坐标里是曲线，不是直线——多采样几个点连成折线才能画对；
+    // 线性场景下这些多余的采样点无害，仍然会连成一条直线。
+    const xsStat = Array.from({ length: steps + 1 }, (_, i) => minXStat + (maxXStat - minXStat) * i / steps);
+    const xsRaw = xsStat.map(v => (logX ? Math.pow(10, v) : v));
+    const ysRaw = xsStat.map(v => unstatY(slope * v + intercept));
 
     traces.push({
-      x: [minX, maxX],
-      y: [slope * minX + intercept, slope * maxX + intercept],
+      x: xsRaw, y: ysRaw,
       mode: 'lines', type: 'scatter', name: '趋势线',
       line: { color: '#ff9f0a' },
-      // hoverinfo:'skip'：趋势线只有 2 个数据点，但 Plotly 对 mode:'lines' 的最近点判定是按
-      // "鼠标到线段本身的距离"算的，会覆盖几乎整条横轴。之前只给置信区间加了这个属性，
-      // 趋势线没加，导致点击稍微偏离样本点（哪怕只偏几个像素）时，Plotly 判定"最近的点"是趋势线
-      // 而不是下面的样本点——趋势线没有 customdata，点击处理器按设计静默返回，看起来就是
-      // "点了没反应，console 也没日志"。加上这个属性后趋势线彻底退出 hover/点击的候选判定。
+      // hoverinfo:'skip'：Plotly 对 mode:'lines' 的最近点判定是按"鼠标到线段本身的距离"算的，
+      // 会覆盖几乎整条横轴。之前只给置信区间加了这个属性，趋势线没加，导致点击稍微偏离样本点
+      // （哪怕只偏几个像素）时，Plotly 判定"最近的点"是趋势线而不是下面的样本点——趋势线没有
+      // customdata，点击处理器按设计静默返回，看起来就是"点了没反应，console 也没日志"。
+      // 加上这个属性后趋势线彻底退出 hover/点击的候选判定。
       hoverinfo: 'skip'
     });
 
-    if (showConfBand && n >= 4) {
-      const meanX = xArr.reduce((a, b) => a + b, 0) / n;
-      const Sxx = xArr.reduce((a, x) => a + (x - meanX) ** 2, 0);
-      const sse = pairs.reduce((a, [x, y]) => a + (y - (slope * x + intercept)) ** 2, 0);
-      const s = Math.sqrt(sse / Math.max(1, n - 2));
+    if (showConfBand && nStat >= 4) {
+      const meanXStat = xStatArr.reduce((a, b) => a + b, 0) / nStat;
+      const Sxx = xStatArr.reduce((a, x) => a + (x - meanXStat) ** 2, 0);
+      const sse = statPairs.reduce((a, [x, y]) => a + (y - (slope * x + intercept)) ** 2, 0);
+      const s = Math.sqrt(sse / Math.max(1, nStat - 2));
       const tcrit = 1.96; // 大样本近似 95% 置信
       const upper = [], lower = [];
-      for (const x0 of xs) {
-        const se = Sxx > 0 ? s * Math.sqrt(1 / n + (x0 - meanX) ** 2 / Sxx) : s / Math.sqrt(n);
+      for (const x0 of xsStat) {
+        const se = Sxx > 0 ? s * Math.sqrt(1 / nStat + (x0 - meanXStat) ** 2 / Sxx) : s / Math.sqrt(nStat);
         const yhat = slope * x0 + intercept;
-        upper.push(yhat + tcrit * se);
-        lower.push(yhat - tcrit * se);
+        upper.push(unstatY(yhat + tcrit * se));
+        lower.push(unstatY(yhat - tcrit * se));
       }
       traces.push({
-        x: xs, y: upper, mode: 'lines', type: 'scatter', name: '95% 置信区间(近似)',
+        x: xsRaw, y: upper, mode: 'lines', type: 'scatter', name: '95% 置信区间(近似)',
         line: { width: 0 }, showlegend: false, hoverinfo: 'skip'
       });
       traces.push({
-        x: xs, y: lower, mode: 'lines', type: 'scatter', name: '95% 置信区间(近似)',
+        x: xsRaw, y: lower, mode: 'lines', type: 'scatter', name: '95% 置信区间(近似)',
         line: { width: 0 }, fill: 'tonexty', fillcolor: 'rgba(255,159,10,0.15)',
         showlegend: true, hoverinfo: 'skip'
       });
@@ -567,10 +603,10 @@ function renderScatterChart(xField, yField, settings, chartDiv, captionEl) {
     for (let i = 0; i < sorted.length; i += binSize) {
       const chunk = sorted.slice(i, i + binSize);
       if (!chunk.length) continue;
-      const cx = chunk.reduce((a, p) => a + p.x, 0) / chunk.length;
+      const binCx = chunk.reduce((a, p) => a + p.x, 0) / chunk.length;
       const cyMean = chunk.reduce((a, p) => a + p.y, 0) / chunk.length;
       const cyStd = Math.sqrt(chunk.reduce((a, p) => a + (p.y - cyMean) ** 2, 0) / chunk.length);
-      binX.push(cx); binY.push(cyMean); binErr.push(cyStd);
+      binX.push(binCx); binY.push(cyMean); binErr.push(cyStd);
     }
     traces.push({
       x: binX, y: binY, mode: 'markers+lines', type: 'scatter', name: `分箱均值±标准差 (n=${binCount})`,
@@ -582,23 +618,42 @@ function renderScatterChart(xField, yField, settings, chartDiv, captionEl) {
 
   const xaxis = { title: xField, type: logX ? 'log' : 'linear' };
   const yaxis = { title: yField, type: logY ? 'log' : 'linear' };
-  const outlierRows = [];
 
-  if (clipOutliers && n >= 8) {
-    const sortedX = xArr.slice().sort((a, b) => a - b);
-    const sortedY = yArr.slice().sort((a, b) => a - b);
-    const cx = computeClipRange(sortedX);
-    const cy = computeClipRange(sortedY);
+  // 边际分布：只在【左侧】画 Y 的分布直方图。
+  // 为什么不画 X 的：X 通常是筛选字段（占比、计数），分布本身在散点图的横向铺开里已经看得见；
+  // 而且真实数据里 X 常是重尾的（比如 returnMax），顶部直方图会退化成"第一根柱子顶天、其余贴地"，
+  // 占了 16% 的画布高度却读不出任何信息。Y 是收益，它的分布形状（集中在哪、有没有长尾）才是要看的。
+  const marginalAxes = {};
+  if (showMarginal && n >= 2) {
+    // 直方图与主图的 domain 直接相接、不留间隙：留了缝之后视觉上会变成"两张图并排"，
+    // 而它们共用同一条 Y 轴、本来就该读成一张图。
+    const HIST_W = 0.15;  // 左侧直方图宽度
+    xaxis.domain = [HIST_W, 1];
+    // 直方图复用主 yaxis，所以纵向缩放/剔除离群点/对数 Y 全都自动跟随，不需要单独同步。
+    // 柱子从左侧基线向右生长（不加 autorange:'reversed'）：这样零点靠着 Y 轴刻度、柱顶朝向
+    // 散点图，和主图的阅读方向一致；反过来向左长会让长柱子的"头"甩到最左边，和刻度轴打架。
+    marginalAxes.xaxis2 = {
+      domain: [0, HIST_W],
+      showgrid: false, zeroline: false, showticklabels: false, anchor: 'y',
+    };
+    // Y 轴刻度和标题改画在最左边（直方图外侧）：默认它们画在主图左缘，会正好压在直方图上。
+    yaxis.anchor = 'x2';
+    // hoverinfo 关掉：点击处理器靠 customdata 打开 logearn，直方图没有 customdata，
+    // 一旦被判成"最近的点"就会静默返回，表现为"点了没反应"——趋势线踩过同样的坑。
+    traces.push({
+      type: 'histogram', y: yArr, xaxis: 'x2',
+      nbinsy: Math.min(60, Math.max(10, Math.round(Math.sqrt(n) * 2))),
+      marker: { color: 'rgba(255,159,10,0.55)' }, showlegend: false, hoverinfo: 'skip',
+    });
+  }
+
+  // cx/cy/outlierRows 已经在上面算过一次（供相关系数/趋势线排除离群点用），这里直接复用，
+  // 只用来把坐标轴范围收紧到围栏以内——不重复算一遍。
+  if (clipOutliers && cx && cy) {
     if (!logX && cx.hi > cx.lo) xaxis.range = [cx.lo, cx.hi];
     if (logX && cx.hi > cx.lo && cx.lo > 0) xaxis.range = [Math.log10(cx.lo), Math.log10(cx.hi)];
     if (!logY && cy.hi > cy.lo) yaxis.range = [cy.lo, cy.hi];
     if (logY && cy.hi > cy.lo && cy.lo > 0) yaxis.range = [Math.log10(cy.lo), Math.log10(cy.hi)];
-
-    points.forEach(p => {
-      const outX = !cx.degenerate && (p.x < cx.fenceLo || p.x > cx.fenceHi);
-      const outY = !cy.degenerate && (p.y < cy.fenceLo || p.y > cy.fenceHi);
-      if (outX || outY) outlierRows.push(p);
-    });
   }
 
   // 分割竖线：只是在 X 轴指定数值处画一条参考线，帮助直观区分"竖线左/右两组"，不参与任何
@@ -623,7 +678,7 @@ function renderScatterChart(xField, yField, settings, chartDiv, captionEl) {
   if (outlierRows.length) {
     const top = outlierRows.slice(0, 5);
     captionParts.push(
-      `<b>坐标轴已按 IQR 围栏自动收紧，共 ${outlierRows.length} 个离群点未显示（仍参与计算）：</b> ` +
+      `<b>坐标轴已按 IQR 围栏自动收紧，共 ${outlierRows.length} 个离群点未显示、也不参与 r/p/趋势线计算（图上样本点仍照常画出，只是不进统计）：</b> ` +
       escapeHtml(top.map(p => `${p.symbol || '(无symbol)'} ${xField}=${p.x.toPrecision ? p.x.toPrecision(4) : p.x}, ${yField}=${p.y.toPrecision ? p.y.toPrecision(4) : p.y}`).join('； ')));
   }
   const droppedHlTotal = droppedHl.missing + droppedHl.nonPositive;
@@ -635,13 +690,15 @@ function renderScatterChart(xField, yField, settings, chartDiv, captionEl) {
   }
   captionEl.innerHTML = captionParts.join('<br>');
 
-  const statsText = `n=${n}  r=${r.toFixed(4)}  p=${Number.isFinite(pVal) ? pVal.toExponential(2) : 'N/A'}`;
+  const statsText = `n=${nStat}  r=${r.toFixed(4)}  p=${Number.isFinite(pVal) ? pVal.toExponential(2) : 'N/A'}`;
   Plotly.newPlot(chartDiv, traces, darkLayout({
     title: { text: `<span style="font-size:12px;color:${themeMutedColor()}">${statsText}（点击数据点打开 logearn）</span>` },
-    xaxis, yaxis,
+    xaxis, yaxis, ...marginalAxes,
     hovermode: 'closest',
-    legend: { orientation: 'h' },
-    margin: { t: 40 },
+    bargap: 0.05,
+    // 图例下移并加大下边距：默认横向图例贴在绘图区正下方，会和 X 轴标题叠在一起
+    legend: { orientation: 'h', y: -0.16, yanchor: 'top' },
+    margin: { t: 40, b: 90 },
     shapes, annotations
   }), { responsive: true }).catch(err => {
     // Plotly.newPlot 对某些数据分布（比如某个 X 字段全部同值、方差为 0、log 轴遇到 <=0 等边界
@@ -1420,8 +1477,13 @@ function renderBinBarChart() {
   }
 
   for (const row of activeRows) {
-    const bv = Number(getFeature(row, binField));
-    const vv = Number(getFeature(row, valueField));
+    // 先看原始值再转数字：getFeature 对"字段存在但值为 null / 空串"返回 null / ''，
+    // 而 Number(null)===0、Number('')===0 都能通过 isFinite —— 缺值样本会被当成 0
+    // 塞进最低那一箱，并以 0 参与均值/中位数/胜率，静默污染分箱统计。
+    const bvRaw = getFeature(row, binField), vvRaw = getFeature(row, valueField);
+    if (bvRaw === undefined || bvRaw === null || bvRaw === '') continue;
+    if (vvRaw === undefined || vvRaw === null || vvRaw === '') continue;
+    const bv = Number(bvRaw), vv = Number(vvRaw);
     if (!Number.isFinite(bv) || !Number.isFinite(vv)) continue;
     for (const b of bins) {
       if (bv >= b.lo && bv < b.hi) { b.values.push(vv); break; }

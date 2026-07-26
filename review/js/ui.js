@@ -164,14 +164,17 @@ function renderCorrTable() {
   // 悬浮可以看具体剔除了哪些字段
   const ex = allCorrelations._excluded;
   if (ex) {
-    const exTotal = ex.timestamp.length + ex.internal.length + ex.constant.length;
+    // 按桶遍历而不是逐个写死桶名：新增一类剔除原因时只要在下面的标签表里补一行，
+    // 漏了也只是显示成原始 key，不会像之前那样把整条分析链路带崩。
+    const exLabels = { timestamp: '时间戳', internal: '内部标记', metadata: '元数据/常量', constant: '取值恒定' };
+    const exEntries = Object.entries(ex).filter(([, v]) => Array.isArray(v) && v.length);
+    const exTotal = exEntries.reduce((n, [, v]) => n + v.length, 0);
     if (exTotal > 0) {
-      summaryEl.textContent += ` 另有 ${exTotal} 个无效字段已自动剔除、不占检验名额（时间戳 ${ex.timestamp.length}、内部标记 ${ex.internal.length}、取值恒定 ${ex.constant.length}）。`;
-      summaryEl.title = [
-        ex.timestamp.length ? `时间戳字段：${ex.timestamp.join('、')}` : '',
-        ex.internal.length ? `内部标记字段：${ex.internal.join('、')}` : '',
-        ex.constant.length ? `取值恒定字段：${ex.constant.join('、')}` : '',
-      ].filter(Boolean).join('\n');
+      const brief = exEntries.map(([k, v]) => `${exLabels[k] || k} ${v.length}`).join('、');
+      summaryEl.textContent += ` 另有 ${exTotal} 个无效字段已自动剔除、不占检验名额（${brief}）。`;
+      summaryEl.title = exEntries
+        .map(([k, v]) => `${exLabels[k] || k}字段：${v.join('、')}`)
+        .join('\n');
     } else {
       summaryEl.title = '';
     }
@@ -708,7 +711,12 @@ function getValidColorField() {
 let scatterSelectsInitialized = false;
 
 function updateScatterSelects() {
-  scatterOptions = ['returnMax', 'logReturnMax', ...allNumericKeys].filter(isNumericColumn);
+  // 内部标记（_highlight_*/ai_max_*）和元数据/常量字段（decimals/chain/bnb_price/恒零量等）
+  // 从候选池里彻底剔除。判定统一走 data.js 的 isNonAnalyticField，不在这里另写一份条件——
+  // 之前就是"相关性池挡了、候选池没挡"，同一件事两处实现必然漂移。
+  scatterOptions = ['returnMax', 'logReturnMax', ...allNumericKeys]
+    .filter(isNumericColumn)
+    .filter(k => !(typeof isNonAnalyticField === 'function' && isNonAnalyticField(k)));
   const defaultX = scatterOptions.includes('buyer_count_d1') ? 'buyer_count_d1' :
     scatterOptions.find(c => c !== 'returnMax') || scatterOptions[0] || '';
   const defaultY = scatterOptions.includes('returnMax') ? 'returnMax' : scatterOptions[0] || '';
@@ -1207,6 +1215,142 @@ function computeFieldGroups() {
 // 保存最近一次分组结果，供各分组的"+ 全部加入X"/"复制字段名"按钮直接读取
 let fieldBrowserGroups = computeFieldGroups();
 
+
+// ========== 导出字段说明（字段名 + 含义 + 组装字段的公式） ==========
+// 公式的来源：file:// 下 fetch 读不了本地 js（CORS 直接拒绝），所以从运行时函数体反查——
+// data.js 是普通 script，顶层 function 都是 window 上的全局，toString() 能拿到源码。
+// 这样导出的公式永远和当前实际执行的代码一致，不会出现"文档写完就过期"。
+function collectRuntimeSources() {
+  const out = [];
+  for (const key of Object.getOwnPropertyNames(window)) {
+    let v;
+    try { v = window[key]; } catch (e) { continue; } // 个别浏览器属性读取会抛
+    if (typeof v !== 'function') continue;
+    let src;
+    try { src = Function.prototype.toString.call(v); } catch (e) { continue; }
+    if (src && src.indexOf('[native code]') < 0) out.push(src);
+  }
+  return out;
+}
+
+// 只取赋值号右边的表达式作为"公式"，不带上下文代码
+function findFieldFormula(field, sources) {
+  const esc = String(field).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pat = new RegExp('features\\[[\'"]' + esc + '[\'"]\\]\\s*=\\s*([^\n]*)');
+  for (const src of sources) {
+    const m = src.match(pat);
+    if (!m) continue;
+    const rhs = m[1].replace(/;\s*$/, '').replace(/\s*\/\/.*$/, '').trim();
+    return resolveIdentifier(rhs, src);
+  }
+  return '';
+}
+
+// 右边只是个中间变量名（features['x'] = drawdownMin）时，公式等于没写。
+// 往回查一层它的 const 声明，把真正的表达式替换进来。
+// 只认 const：let 声明意味着变量会被反复改写（典型是循环里累积的 bestSpeed），
+// 拿它的初始值（往往是 NaN）当公式反而更误导，这种情况保留变量名更诚实。
+function resolveIdentifier(rhs, src) {
+  if (!/^[A-Za-z_$][\w$]*$/.test(rhs)) return rhs;
+  const declPat = new RegExp('\\bconst\\s+' + rhs + '\\s*=\\s*([^\n]*)');
+  const d = src.match(declPat);
+  if (!d) return rhs;
+  const expr = d[1].replace(/;\s*$/, '').replace(/\s*\/\/.*$/, '').trim();
+  // 声明本身还是个裸变量名就不再递归了，避免链式跳转绕回来
+  return expr && expr !== rhs ? expr : rhs;
+}
+
+function exportFieldDocs() {
+  const groups = computeFieldGroups();
+  const labels = {
+    holding: '持仓指标',
+    assembled: '比率/差值衍生 + 自定义字段', // 避免与「二、组装字段」大节标题撞名
+    signal: '信号字段',
+    volume: 'K线量能字段',
+    dev: 'dev 字段（gmgn.dev.*）',
+    stat: 'stat 字段（gmgn.stat.*）',
+    chip: '筹码字段（chip_analysis.*）',
+    holder: '持有人字段（holder_*）',
+    ungrouped: '未归入主题分组的字段',
+  };
+  const order = ['holding', 'assembled', 'signal', 'volume', 'dev', 'stat', 'chip', 'holder'];
+  // computeFieldGroups 只收录命中主题谓词的字段，剩下的原始白名单字段不属于任何组。
+  // 这里必须兜底列出，否则导出会静默缺一块，用户无从察觉。
+  const grouped = new Set(order.flatMap(k => groups[k] || []));
+  groups.ungrouped = (typeof scatterOptions !== 'undefined' ? scatterOptions : []).filter(f => !grouped.has(f)).sort();
+  order.push('ungrouped');
+
+  const sources = collectRuntimeSources();
+  const customByName = new Map(
+    (typeof customFields !== 'undefined' && Array.isArray(customFields) ? customFields : [])
+      .map(c => [c.name, c.code])
+  );
+  // 表格单元格里的 | 和换行会撑坏 Markdown 表格，统一转义
+  const cell = t => String(t == null ? '' : t).replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim();
+
+  // 先把每个字段解出公式，再按"有没有公式"切成原生/组装两大块：
+  // 有 features['x'] = ... 赋值的是本工具算出来的，没有的就是平台快照 JSON 原样给的。
+  // 用这个判定而不是另维护一份清单，是因为它跟着代码自动走，不会漏也不会过期。
+  const rawGroups = {}, madeGroups = {};
+  let rawCount = 0, madeCount = 0;
+  for (const key of order) {
+    for (const fld of (groups[key] || [])) {
+      const formula = customByName.has(fld) ? customByName.get(fld) : findFieldFormula(fld, sources);
+      const bucket = formula ? madeGroups : rawGroups;
+      (bucket[key] = bucket[key] || []).push({ field: fld, formula });
+      if (formula) madeCount++; else rawCount++;
+    }
+  }
+
+  const total = rawCount + madeCount;
+  const L = ['# 字段说明', ''];
+  L.push(`生成时间：${new Date().toLocaleString('zh-CN')}　字段总数：${total}（原生 ${rawCount} / 组装 ${madeCount}）`);
+  L.push('');
+
+  L.push(`## 一、原生字段（${rawCount}）`, '');
+  L.push('直接来自平台快照 JSON，没有二次计算。', '');
+  if (!rawCount) L.push('_（无）_', '');
+  for (const key of order) {
+    const items = rawGroups[key];
+    if (!items || !items.length) continue;
+    L.push(`### ${labels[key]}（${items.length}）`, '');
+    L.push('| 字段 | 含义 |', '| --- | --- |');
+    for (const it of items) {
+      const desc = typeof getFieldDesc === 'function' ? getFieldDesc(it.field) : '';
+      L.push(`| \`${cell(it.field)}\` | ${cell(desc)} |`);
+    }
+    L.push('');
+  }
+
+  L.push(`## 二、组装字段（${madeCount}）`, '');
+  L.push('本工具从原生字段计算得到，公式如下。', '');
+  if (!madeCount) L.push('_（无）_', '');
+  for (const key of order) {
+    const items = madeGroups[key];
+    if (!items || !items.length) continue;
+    L.push(`### ${labels[key]}（${items.length}）`, '');
+    L.push('| 字段 | 含义 | 公式 |', '| --- | --- | --- |');
+    for (const it of items) {
+      const desc = typeof getFieldDesc === 'function' ? getFieldDesc(it.field) : '';
+      L.push(`| \`${cell(it.field)}\` | ${cell(desc)} | \`${cell(it.formula)}\` |`);
+    }
+    L.push('');
+  }
+  L.push(`_共 ${total} 个字段：原生 ${rawCount} 个，组装 ${madeCount} 个。_`);
+
+  const blob = new Blob([L.join('\n')], { type: 'text/markdown;charset=utf-8;' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `字段说明_${total}字段_${new Date().toISOString().slice(0, 10)}.md`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(a.href);
+  const tip = document.getElementById('fieldBrowserExportResult');
+  if (tip) tip.textContent = `已导出 ${total} 个字段（原生 ${rawCount} / 组装 ${madeCount}）`;
+}
+
+
 function renderFieldBrowser() {
   const holdingBox = document.getElementById('fieldBrowserHolding');
   const assembledBox = document.getElementById('fieldBrowserAssembled');
@@ -1575,6 +1719,7 @@ document.getElementById('fieldBrowserToggle').addEventListener('click', () => {
   panel.classList.toggle('hidden');
   if (!panel.classList.contains('hidden')) renderFieldBrowser();
 });
+document.getElementById('fieldBrowserExportDocs').addEventListener('click', exportFieldDocs);
 document.getElementById('fieldBrowserAddAllHolding').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.holding));
 document.getElementById('fieldBrowserAddAllAssembled').addEventListener('click', () => addFieldsToX(fieldBrowserGroups.assembled));
 document.getElementById('fieldBrowserCopyHolding').addEventListener('click', () => copyFieldNames(fieldBrowserGroups.holding));

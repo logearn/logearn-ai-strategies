@@ -1038,6 +1038,10 @@
           </div>
           <div id="fieldBrowserPanel" class="hidden" style="margin-top: 8px;">
             <p class="hint" style="margin: 0 0 6px;">点击字段名直接加入 X（和上面输入联想选中效果一样），按"持仓指标"/"组装字段"/"信号字段"/"K线量能"/"dev/stat/筹码/持有人"等分组浏览，不用一个个打字联想。</p>
+            <div class="row" style="margin: 0 0 8px; gap: 8px; align-items: center;">
+              <button type="button" id="fieldBrowserExportDocs" class="secondary" style="padding:4px 12px; font-size:12px;">📄 导出字段说明（Markdown）</button>
+              <span id="fieldBrowserExportResult" class="hint" style="margin:0;">导出全部分组的字段名 + 中文含义，组装字段附带实际计算代码</span>
+            </div>
             <div class="row" style="align-items: flex-start;">
               <div class="control" style="min-width: 260px;">
                 <label style="display:flex; align-items:center; justify-content:space-between; gap:8px;">

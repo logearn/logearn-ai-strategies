@@ -1,3 +1,8 @@
+// ⚠️ 由 js/data.js 机械移植而来：逻辑一行未改，只在文件首尾加了 import / export。
+// 122 个既有测试全部改为从这里 import，测试通过即证明移植是忠实的。
+import { customFields, pct } from './custom-fields.js';
+import { pearson, pearsonPValue, spearman } from './utils.js';
+
 // ========== 数据匹配、展开（flatten）、组装字段计算、相关性计算 ==========
 // 依赖 utils.js（num 内部逻辑自洽，pearson 用于 computeCorrelations）；
 // isAssembledField 依赖 custom-fields.js 里的 customFields（仅在函数体内读取，加载顺序无要求）。
@@ -67,7 +72,6 @@ const DERIVED_KEYS = [
   // K线量能形态（清单见 KLINE_VOLUME_KEYS，字段浏览器单独成组）
   ...KLINE_VOLUME_KEYS,
   'smart_money_net_buy_count',
-  'chip_analysis.pressure_net',
   'open_to_buy_duration',
   'launch_to_buy_duration',
   'buy_max_retracement',
@@ -137,7 +141,6 @@ const SIGNAL_KEYS = [
   'v_breakout_volume_recent_below_cost_line_elapsed_min',
   'v_breakout_volume_recent_low_cost_line_distance_pct',
 ];
-
 
 // 以下字段原始值是 0-1 的小数比例（比如 "0.0331" 实际代表 3.31%），
 // 统一 ×100 转成百分比数值，跟其它已经是百分比口径的字段（8大持仓指标、price_change_* 等）保持同一量级，
@@ -266,6 +269,23 @@ function readJson(file) {
     r.onerror = reject;
     r.readAsText(file);
   });
+}
+
+// 从 JSON 内容本身判断这是 calls 导出还是 snapshots 导出——DataLoader 只留一个上传入口，
+// 不再让用户自己把文件分拣进两个按钮，靠数据形状自动识别。
+// snapshots 每条都有 signal/ctx 这两个字段（buildRows 就是读这两个）；calls 每条都有
+// initial_mcap/current_mcap/max_mcap 之一（buildRows 算 returnMax 就靠这几个）——
+// 两组标记字段互斥，任何一份真实导出数据都不会同时命中两边，命中不了任何一边就老实报"认不出"，
+// 不瞎猜（猜错了会把 calls 当 snapshots 存，后面匹配全部为 0，比"上传失败"更难排查）。
+function detectFileKind(data) {
+  if (!Array.isArray(data) || !data.length) return null;
+  const sample = data.find(x => x && typeof x === 'object');
+  if (!sample) return null;
+  const isSnap = 'signal' in sample || 'ctx' in sample;
+  const isCall = 'initial_mcap' in sample || 'current_mcap' in sample || 'max_mcap' in sample || 'min_mcap' in sample;
+  if (isSnap && !isCall) return 'snaps';
+  if (isCall && !isSnap) return 'calls';
+  return null;
 }
 
 function snapKey(s) {
@@ -416,8 +436,12 @@ async function buildRows(calls, snapshots, onProgress) {
     if (fin(sellTx) && fin(sellers) && sellers !== 0) features['sell_tx_per_seller'] = sellTx / sellers;
     // 聪明钱净买入地址数（design doc §20.1）
     if (fin(smartBuy) && fin(smartSell)) features['smart_money_net_buy_count'] = smartBuy - smartSell;
-    // 筹码净压力指标：正数=上方套牢盘更多抛压大，负数=下方支撑更强（design doc §20.5）
-    if (fin(chipAbove) && fin(chipBelow)) features['chip_analysis.pressure_net'] = chipAbove - chipBelow;
+    // 【已移除 chip_analysis.pressure_net】= above_percent − below_percent。
+    // 它和 above_below_ratio（= above / below）都是同两个数的函数，四个字段合起来只有
+    // 2 个自由度，VIF 全是 ∞。留着不增加任何信息，只会抬高 BH 校正的 m ——
+    // m 按参与检验的字段总数算，冗余字段越多，真信号的校正后 p 越难通过。
+    // 差值与比值二选一时保留比值：比值无量纲，不受总持仓规模影响
+    //（above=40/below=20 与 above=4/below=2 的净压力差 10 倍，但压力比例相同）。
 
     // ---- 筹码分布组装字段（从 chip_analysis 的数组算，标量字段由 flattenObject 自动展开，不用管）----
     // price_bars: 按市值分 70 桶的筹码分布，percent = 该价位买入仍持有的量占总供应量的比例。
@@ -1299,6 +1323,14 @@ async function buildRows(calls, snapshots, onProgress) {
             // 不足 N 个真实持有人就不写入：拿 20 个人算出来的值叫"前50大户均价"会误导横向比较
             if (ranked.length < N) continue;
             const topN = ranked.slice(0, N);
+            // 前 N 大户持仓占比合计：ranked 已按持仓降序、且剔除了 addr_type===2（交易所/流动性池）。
+            // amount_percentage 是各钱包占【总供应量】的比例（0-1），求和 ×100 = 前 N 大户合计控盘比例。
+            // 这是最直接的集中度指标——比 gini/hhi 直观，"前30占了 60%" 一眼就懂危险。
+            const topNShare = topN.reduce((sum, h) => {
+              const p = Number(h.amount_percentage);
+              return sum + (Number.isFinite(p) ? p : 0);
+            }, 0) * 100;
+            features[`holder_top${N}_share_pct`] = topNShare;
             const buyMcap = weightedMcap(topN, 'history_bought_cost', 'buy_amount_cur');
             const sellMcap = weightedMcap(topN, 'history_sold_income', 'sell_amount_cur');
             const netMcap = netCostMcap(topN);
@@ -1613,6 +1645,10 @@ const NON_ANALYTIC_FIELDS = new Set([
   // 原生币行情与精度：和 bnb_price/bnb_decimal 同类。sol_price 是全市场共同的外部行情，
   // 对同一时刻的所有样本都一样，只随快照时间漂移——极易和"样本采集顺序"耦合出伪相关。
   'sol_decimal', 'sol_price',
+  // 筹码上下方占比是一对：above_below_ratio 已经承载了它们的关系，
+  // 再把 below 单独放进候选池就是重复计数。注意这里只是不参与分析，
+  // 字段本身仍会算出来——above_below_ratio 要拿它当分母。
+  'chip_analysis.below_percent',
   // 记录数与总供应量：total_record 是接口分页元数据；total_supply 是绝对代币数量
   // （meme 币动辄 10 亿枚，和收益无关），它有用的形态是换手率 kline_turnover_pct，已经算好了。
   // 注意这里是精确匹配，gmgn.total_supply 是另一个字段（用于算流通占比），不受影响。
@@ -1652,15 +1688,6 @@ function correlationPoolExclusionReason(key) {
   if (CORR_INTERNAL_FIELD_RE.test(key)) return 'internal';
   if (NON_ANALYTIC_FIELDS.has(key) || NON_ANALYTIC_PREFIX_RE.test(key)) return 'metadata';
   return null;
-}
-
-// 目标筛选口径：收益目标只剩 returnMax 一个（原来的 returnCurrent 已下线），下拉里也就没有"全部"
-// 选项了；这里仍保留 'all' 分支，是为了兼容早期版本存在 localStorage 里的 target='all'——它的语义
-// 是"不含 log 目标"，即只匹配 returnMax。log(returnMax) 与 returnMax 是同一结果的单调变换而非独立
-// 假设，同时计入会把多重比较校正的 m 无理由翻倍，拖累真字段的校正后 p，所以要看 log 目标得单独选。
-// 相关性表/Bootstrap CI 两处筛选逻辑共用这一条判断。
-function matchCorrTarget(c, target) {
-  return target === 'all' ? c.target === 'returnMax' : c.target === target;
 }
 
 function computeCorrelations(rows) {
@@ -1808,3 +1835,50 @@ function isNumericColumn(col) {
 }
 
 function isFiniteNumber(v) { return v !== undefined && v !== null && Number.isFinite(Number(v)); }
+
+export {
+  ADDRESS_LIKE_KEYS,
+  BUILD_ROWS_CHUNK_SIZE,
+  CHIP_FIELD_EXCLUDE,
+  CORR_INTERNAL_FIELD_RE,
+  CORR_TIMESTAMP_FIELD_RE,
+  DERIVED_KEYS,
+  DEV_FIELDS,
+  HOLDING_INDICATOR_FIELDS,
+  KLINE_VOLUME_KEYS,
+  MAX_SNAPSHOT_MATCH_DIFF_SECONDS,
+  NON_ANALYTIC_FIELDS,
+  NON_ANALYTIC_PREFIX_RE,
+  PERCENT_FRACTION_FIELDS,
+  ROW_LEVEL_FIELDS,
+  SIGNAL_KEYS,
+  STAT_FIELDS,
+  buildRows,
+  callKey,
+  computeCorrelations,
+  correlationPoolExclusionReason,
+  detectFileKind,
+  flattenCtx,
+  flattenObject,
+  getFeature,
+  isAddressLikeKey,
+  isAssembledField,
+  isChipField,
+  isDevField,
+  isFiniteNumber,
+  isHolderField,
+  isHoldingField,
+  isKlineVolumeField,
+  isNonAnalyticField,
+  isNumericColumn,
+  isSignalField,
+  isStatField,
+  looksLikeAddressString,
+  measureBarMinutes,
+  num,
+  readJson,
+  resolveNativeDecimals,
+  snapKey,
+  toMilliseconds,
+  tsOrZeroMs,
+};

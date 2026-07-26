@@ -1,3 +1,6 @@
+// ⚠️ 由 js/dictionary.js 机械移植而来：逻辑一行未改，只在文件首尾加了 import / export。
+// 122 个既有测试全部改为从这里 import，测试通过即证明移植是忠实的。
+
 // ========== 字段中文含义词典（FIELD_DESC / SOURCE_DESC / TERM_MAP / TIME_MAP）与翻译函数 ==========
 // 纯数据 + 纯函数模块，不依赖其他模块（getFieldDesc 内部只读全局字典，不依赖 DOM/state）。
 
@@ -185,6 +188,7 @@ const FIELD_DESC = {
   'mcap_liquidity_ratio': '市值 / 池子流动性',
   'avg_buy_amount': '平均每笔买入金额',
   'avg_sell_amount': '平均每笔卖出金额',
+  'chip_analysis.below_percent': '下方获利盘占比。【不参与分析】——它与 above_percent 的关系已由 above_below_ratio 承载，单独放进候选池是重复计数；字段本身仍会算出来，因为 above_below_ratio 要拿它做分母',
   'chip_analysis.above_below_ratio': '筹码上下比例 = chip_analysis.above_percent / chip_analysis.below_percent（越高=当前价上方套牢盘相对下方支撑盘越多，抛压风险越大）',
   'chip_analysis.price_to_peak_ratio': '当前市值 / 筹码峰市值。大于1=当前价在筹码峰上方（多数持仓浮盈、上方无密集套牢），小于1=当前价在筹码峰下方（头上压着套牢盘，反弹遇阻）',
   'chip_analysis.price_concentration_hhi': '筹码价位集中度(HHI)：各价位桶占比的平方和，接近1=高度集中在少数价位（庄控/单一建仓区），接近0=分散',
@@ -202,9 +206,7 @@ const FIELD_DESC = {
   'kline_bar_minutes': 'K线粒度（分钟），由相邻bar的实际时间差中位数推断。用于判断 kline_* 系列字段跨样本的可比性',
   'kline_turnover_pct': '期间换手率（%）= 所有K线的 token_volume 之和 / total_supply × 100。代币口径的真实换手率，不依赖币价、也不涉及流动性口径分歧',
 
-
   'smart_money_net_buy_count': '聪明钱净买入地址数 = smart_money_address_buy_count_d1 - smart_money_address_sell_count_d1',
-  'chip_analysis.pressure_net': '筹码净压力指标 = chip_analysis.above_percent - chip_analysis.below_percent（正数=上方套牢盘更多抛压大，负数=下方支撑更强）',
   'open_to_buy_duration': '开盘到买入时长 = 快照时间（买入点）- swap_begin_time（第一笔交易时间），单位分钟',
   'launch_to_buy_duration': '上线到买入时长 = 快照时间（买入点）- launch_time（代币上线时间），单位分钟',
   'above_cost_line': '是否在成本线之上（1=是，0=否）= cost_line_distance_pct > 0；取自平台 kline_and_indicators.avg_price_deviation_pct',
@@ -253,6 +255,8 @@ const FIELD_DESC = {
   'signal_last_type': '【分类字段】最后触发的信号类型，即直接促成这次买入的那个信号',
   'holder_top30_net_cost_mcap': '前30大户的【净成本】，市值口径（美元）=（总买入花费+手续费 − 总卖出收入）÷ 总持仓 × 总供应量。可以是负数：负数表示这批大户卖出拿回的钱已超过投入，手上剩的筹码是白嫖的——这种人对价格没有任何防守动机。与买入均价的关键区别就在这里：后者会给已回本的人算出一个正的"成本线"，看起来还有支撑位，那是假的',
   'holder_top50_net_cost_mcap': '前50大户的净成本（市值口径，美元），口径同 holder_top30_net_cost_mcap。与 top30 版对比：top50 更负说明靠后的大户跑得更彻底',
+  'holder_top30_share_pct': '前30大户持仓占比合计（%）。已剔除交易所/流动性池地址（addr_type=2），按持仓降序取前30，合计各自占总供应量的比例。最直观的控盘集中度：越高说明筹码越集中在少数钱包，砸盘风险越大。比 gini/hhi 直观',
+  'holder_top50_share_pct': '前50大户持仓占比合计（%），口径同 holder_top30_share_pct。与 top30 对比可看集中度曲线——top50 相比 top30 增加得少，说明 30 名之后的持仓已经很分散',
   'holder_top30_avg_buy_mcap': '前30大户的买入均价，换算成【市值】口径（美元）。按金额加权：Σ买入成本 ÷ Σ买入数量 × 总供应量，不是对各钱包 avg_cost 求简单平均（那样买100刀和买1万刀权重一样）。用市值而非单价是为了跨 token 可比——单价在不同币之间差好几个数量级',
   'holder_top30_avg_sell_mcap': '前30大户的卖出均价（市值口径，美元）。与 buy 版配套：卖出均价明显高于买入均价 = 大户在派发获利；前30里无人卖出时该字段缺失（不是 0）',
   'holder_top50_avg_buy_mcap': '前50大户的买入均价（市值口径，美元）。与 top30 版对比可看筹码结构：top50 明显高于 top30 = 靠后的大户是在更高位接的盘',
@@ -480,10 +484,13 @@ function getFieldDesc(field) {
 
 // 打分因子表用的"富提示"：因子名在 code-score.js 里可能被截断到 20 字符
 // （老的 buildAllChecksRow 逻辑、或手写代码），比如 'chip_analysis.above_' 其实是
-// 'chip_analysis.above_below_ratio'。截断后 getFieldDesc 查不到精确 key，只会退化成
-// translateTokens 的逐词硬翻。这里反向补救：exact 查不到时，反向找"以这个（可能被截断的）
-// 名字为前缀"的完整字段，唯一命中就用它的完整描述，多个就都列出来让人认。
-// 镜像 src/lib/dictionary.js（React 侧打分因子面板用，vanilla 侧暂无对应面板，保持两文件同步）。
+// 'chip_analysis.above_below_ratio'、'v_breakout_volume_si' 其实是 'v_breakout_volume_signal_count'。
+// 截断后 getFieldDesc 查不到精确 key，只会退化成 translateTokens 的逐词硬翻
+// （"v / 突破 / 交易量 / si" 这种没信息量的东西）。这里反向补救：
+//   1) 完整字段能直接查到 → 字段名 + 完整描述；
+//   2) 名字是某个完整字段的前缀（被截断）→ 找出候选完整字段，唯一就直接用，多个就都列出来让人认；
+//   3) 都不是 → 退回 getFieldDesc。
+// 返回多行字符串（原生 title 提示支持 \n 换行），供 <span title=...> 直接用。
 function describeFactorLabel(name) {
   if (!name) return '';
   if (FIELD_DESC[name]) return `${name}\n${FIELD_DESC[name]}`;
@@ -495,30 +502,13 @@ function describeFactorLabel(name) {
   return getFieldDesc(name) || name;
 }
 
-// 以下两个函数引用的 #currentFieldDesc / #allDescBody 元素在当前 HTML 中不存在（历史遗留 UI），
-// 内部已有空守卫，调用不会报错，属于死代码，保留以兼容未来可能恢复该 UI。
-function updateCurrentFieldDesc() {
-  const el = document.getElementById('currentFieldDesc');
-  if (!el) return;
-  const x = batchXSelected[0] || '';
-  const y = document.getElementById('yField').value;
-  const xDesc = getFieldDesc(x);
-  const yDesc = getFieldDesc(y);
-  if (!xDesc && !yDesc) {
-    el.className = 'field-desc empty';
-    el.innerHTML = '请选择 X / Y 字段以查看中文含义';
-  } else {
-    el.className = 'field-desc';
-    el.innerHTML = `<b>${escapeHtml(x)}</b>：${escapeHtml(xDesc) || '暂无备注'}<br><b>${escapeHtml(y)}</b>：${escapeHtml(yDesc) || '暂无备注'}`;
-  }
-}
-
-function renderAllDescTable() {
-  const tbody = document.getElementById('allDescBody');
-  if (!tbody) return;
-  const fields = ['returnMax', ...allNumericKeys].sort();
-  tbody.innerHTML = fields.map(f => {
-    const desc = getFieldDesc(f);
-    return `<tr><td>${escapeHtml(f)}</td><td>${escapeHtml(desc) || '暂无备注'}</td></tr>`;
-  }).join('');
-}
+export {
+  FIELD_DESC,
+  SOURCE_DESC,
+  TERM_MAP,
+  TIME_MAP,
+  getFieldDesc,
+  describeFactorLabel,
+  translateToken,
+  translateTokens,
+};

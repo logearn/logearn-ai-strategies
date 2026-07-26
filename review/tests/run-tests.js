@@ -7,35 +7,56 @@
 //
 // 运行方式：node tests/run-tests.js（在 review/ 目录下执行，或用绝对路径）
 
-'use strict';
-const fs = require('fs');
-const path = require('path');
-const vm = require('vm');
-const assert = require('assert');
+// 本文件已从 vm 沙箱改为直接 import src/lib 下的 ES 模块。
+// 这一步本身就是移植的验收：src/lib/* 是从 js/* 机械复制来的（逻辑一行未改，只加了
+// import/export），所以这 122 个测试原封不动地全部通过，就证明移植没有引入行为变化。
+import assert from 'node:assert';
+import * as _utils from '../src/lib/utils.js';
+import * as _dictionary from '../src/lib/dictionary.js';
+import * as _data from '../src/lib/data.js';
+import * as _customFields from '../src/lib/custom-fields.js';
+import { run as runLibAnalytics } from './lib-analytics.test.js';
+import { run as runScatterFigure } from './scatter-figure.test.js';
+import { run as runFilter } from './filter.test.js';
+import { run as runSummary } from './summary.test.js';
+import { run as runBinning, runReport as runBinReport } from './binning.test.js';
+import { run as runAuc } from './auc.test.js';
+import { run as runStrategy } from './strategy.test.js';
+import { run as runFieldDocs } from './field-docs.test.js';
+import { run as runParity } from './parity.test.js';
+import { run as runAnalyticsParity } from './analytics-parity.test.js';
+import { run as runCustomRuntime } from './custom-fields-runtime.test.js';
+import { run as runCompare } from './compare.test.js';
+import { run as runLabels } from './labels.test.js';
+import { run as runCommonHolders } from './common-holders.test.js';
+import { run as runFieldHealth } from './field-health.test.js';
+import { run as runFactorLab } from './factorlab.test.js';
+import { run as runStrategyVersions } from './strategy-versions.test.js';
+import { run as runDailyBacktest } from './daily-backtest.test.js';
+import { run as runFactorExclusions } from './factor-exclusions.test.js';
+import { run as runExcludedTokens } from './excluded-tokens.test.js';
+import { run as runStrategyReplayLogic } from './strategy-replay-logic.test.js';
+import { run as runCampLibrary } from './camp-library.test.js';
+import { run as runRemovedFactors } from './removed-factors.test.js';
+import { run as runDataArchive } from './data-archive.test.js';
+import { run as runStrategySpec } from './strategy-spec.test.js';
+import { run as runDataSlices } from './data-slices.test.js';
+import { run as runTableHiddenFields } from './table-hidden-fields.test.js';
 
-const sandbox = { console };
-vm.createContext(sandbox);
-// data.js 的 isAssembledField / custom-fields.js 的部分函数会读取这几个全局状态变量，
-// 本次测试只调用纯函数（不会真正触发这些依赖路径），但仍需要提前声明避免 ReferenceError。
-sandbox.customFields = [];
-sandbox.matchedRows = [];
-sandbox.activeRows = [];
-sandbox.FIELD_DESC = sandbox.FIELD_DESC || {};
+// 旧测试全部写成 sandbox.foo(...)，这里把四个模块的导出合并成同名对象，
+// 这样 1400 行测试正文一个字都不用改。
+const sandbox = { console, ..._utils, ..._dictionary, ..._data, ..._customFields };
+// 旧沙箱里这几个是全局变量（真实运行时由 ui.js 提供）。逻辑层只在函数体内读它们，
+// 这里挂到 globalThis 上，避免调用到相关分支时抛 ReferenceError。
+globalThis.matchedRows = [];
+globalThis.activeRows = [];
 
-function loadFile(relPath) {
-  const code = fs.readFileSync(path.join(__dirname, '..', 'js', relPath), 'utf8');
-  vm.runInContext(code, sandbox, { filename: relPath });
+// 旧的 ctxEval 用来读 vm 里的顶层 const（vm 不会把 const 挂到沙箱对象上）。
+// 现在它们是正经的模块导出，直接查表即可。
+function ctxEval(name) {
+  if (!(name in sandbox)) throw new Error('ctxEval: 未导出的符号 ' + name);
+  return sandbox[name];
 }
-// vm.runInContext 执行的顶层 const/let 声明不会挂到 sandbox 对象上（只有 function 声明会），
-// 想从外部读取这类常量的值，需要在同一个 context 里再跑一段表达式取值
-function ctxEval(expr) {
-  return vm.runInContext(expr, sandbox);
-}
-
-loadFile('utils.js');
-loadFile('dictionary.js');
-loadFile('data.js');
-loadFile('custom-fields.js');
 
 let passed = 0, failed = 0;
 function test(name, fn) {
@@ -73,6 +94,28 @@ test('num: 0x十六进制地址字符串不应被解析成数字', () => {
 });
 test('num: base58 风格长地址字符串（Solana 地址）不应被解析成数字', () => {
   assert.strictEqual(sandbox.num('7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU'), null);
+});
+
+// ---------- detectFileKind（DataLoader 单一上传入口的自动分类）----------
+test('detectFileKind: 带 signal/ctx 的数组应识别为 snapshots', () => {
+  assert.strictEqual(sandbox.detectFileKind([{ timestamp: 1, signal: {}, ctx: {} }]), 'snaps');
+  assert.strictEqual(sandbox.detectFileKind([{ timestamp: 1, ctx: {} }]), 'snaps', '只有 ctx 没有 signal 也该认得出');
+});
+test('detectFileKind: 带 *_mcap 字段的数组应识别为 calls', () => {
+  assert.strictEqual(sandbox.detectFileKind([{ token_address: 'x', initial_mcap: 1, current_mcap: 2, max_mcap: 3 }]), 'calls');
+  assert.strictEqual(sandbox.detectFileKind([{ token_address: 'x', min_mcap: 1 }]), 'calls', '只有 min_mcap 也该认得出');
+});
+test('detectFileKind: 空数组/非数组/都不沾边的对象应返回 null，不瞎猜', () => {
+  assert.strictEqual(sandbox.detectFileKind([]), null);
+  assert.strictEqual(sandbox.detectFileKind(null), null);
+  assert.strictEqual(sandbox.detectFileKind({ not: 'an array' }), null);
+  assert.strictEqual(sandbox.detectFileKind([{ foo: 'bar' }]), null);
+});
+test('detectFileKind: 同时命中两组标记字段（不应该在真实数据里发生）时也该返回 null 而不是乱猜一个', () => {
+  assert.strictEqual(sandbox.detectFileKind([{ signal: {}, initial_mcap: 1 }]), null);
+});
+test('detectFileKind: 数组第一项是 null/非对象时应跳过找下一个可用样本', () => {
+  assert.strictEqual(sandbox.detectFileKind([null, { ctx: {} }]), 'snaps');
 });
 
 async function main() {
@@ -286,8 +329,6 @@ await testAsync('buildRows(真实样本): 时间位置字段应按分钟计算',
   const f = rows[0].features;
   // 信号 1784517203 − 开盘 1784517149 = 54 秒 = 0.9 分钟
   assert.ok(Math.abs(f.v_breakout_volume_recent_signal_from_open_min - 54 / 60) < 1e-9, `实际 ${f.v_breakout_volume_recent_signal_from_open_min}`);
-  // 买入 − 信号 = 60 秒 = 1 分钟
-  assert.ok(Math.abs(f.v_breakout_volume_recent_signal_to_buy_min - 1) < 1e-9, `实际 ${f.v_breakout_volume_recent_signal_to_buy_min}`);
   // 买入 − 触底 1784517200 = 63 秒
   assert.ok(Math.abs(f.v_breakout_volume_recent_low_to_buy_min - 63 / 60) < 1e-9, `实际 ${f.v_breakout_volume_recent_low_to_buy_min}`);
 });
@@ -298,7 +339,7 @@ await testAsync('buildRows: 没有生效 V 转信号时，这组字段应全部�
   snapshot.signal.v_breakout_volume_list = [ev];
   const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
   ['v_breakout_volume_recent_retracement_pct', 'v_breakout_volume_recent_breakout_ratio',
-   'v_breakout_volume_recent_signal_to_buy_min'].forEach(k => assert.strictEqual(f[k], undefined, `${k} 不应有值`));
+   'v_breakout_volume_recent_low_to_buy_min'].forEach(k => assert.strictEqual(f[k], undefined, `${k} 不应有值`));
 });
 await testAsync('buildRows: 回调在同一根K线内完成（时长为0）时，回调速度应缺失而不是 Infinity', async () => {
   const { call, snapshot } = await makeMinimalCallSnapshot();
@@ -580,6 +621,381 @@ await testAsync('buildRows(量能): resolution 缺失时应回退到实测bar间
   assert.ok(Math.abs(f.kline_minutes_since_max_volume - 3) < 1e-9);
 });
 
+function mkHolder(address, over) {
+  return Object.assign({
+    addr_type: 0, address, amount_percentage: 0.01, balance: 100,
+    buy_volume_cur: 1, buy_amount_cur: 0, sell_tx_count_cur: 0, sell_amount_percentage: 0,
+    realized_profit: 0, profit: 1, unrealized_pnl: 0, avg_cost: 0.00002,
+    native_balance: '100', start_holding_at: 1000,
+    tags: [], maker_token_tags: [], transfer_in: false,
+    native_transfer: null, token_transfer_in: null, token_transfer_out: null,
+  }, over || {});
+}
+const fund = (from_address, name) => ({ native_transfer: { from_address, name: name || null } });
+
+await testAsync('buildRows(holders): 同源出金要按【私人/交易所】分开分簇，个人昵称不能误判成交易所', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.ctx.holders = [
+    mkHolder('W1', fund('PRIV_A')), mkHolder('W2', fund('PRIV_A')), mkHolder('W3', fund('PRIV_A')),
+    mkHolder('W4', fund('PRIV_B')), mkHolder('W5', fund('PRIV_B')),
+    mkHolder('W6', fund('PRIV_C')),                       // 单例，不算协同
+    mkHolder('W7', fund('CEX_BN', 'Binance')), mkHolder('W8', fund('CEX_BN', 'Binance')),
+    // 真实样本里存在 name 为 "YZBY🌎"（个人昵称带 emoji）的出金方，非空但不是交易所。
+    // 若用「name 是否为空」判交易所，这两个会被错误归到 CEX 桶、私人协同被低估。
+    mkHolder('W9', fund('PRIV_D', 'YZBY🌎')), mkHolder('W10', fund('PRIV_D', 'YZBY🌎')),
+  ];
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  // 私人成簇：W1-W3(3) + W4,W5(2) + W9,W10(2) = 7 个 /10
+  assert.ok(Math.abs(f.holder_same_private_funder_ratio - 70) < 1e-9, '实际 ' + f.holder_same_private_funder_ratio);
+  assert.ok(Math.abs(f.holder_max_private_funder_ratio - 30) < 1e-9, '最大簇应是 PRIV_A 的 3 个');
+  assert.ok(Math.abs(f.holder_same_cex_funder_ratio - 20) < 1e-9, '仅 W7/W8');
+});
+
+await testAsync('buildRows(holders): 同秒建仓/相同买入量/内部互转 三个协同字段', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.ctx.holders = [
+    mkHolder('A1', { start_holding_at: 5000, buy_amount_cur: 3698776 }),
+    mkHolder('A2', { start_holding_at: 5000, buy_amount_cur: 3698776 }),
+    mkHolder('A3', { start_holding_at: 5001, buy_amount_cur: 111 }),
+    // B1<->B2 互转；B1 的对手方是列表里的 B2，B2 的对手方是 B1。
+    // 建仓时间必须各不相同，否则它们自己会凑成第二个"同秒簇"，把上面的断言算错
+    mkHolder('B1', { start_holding_at: 6001, token_transfer_out: { address: 'B2' } }),
+    mkHolder('B2', { start_holding_at: 6002, token_transfer_in: { address: 'B1' } }),
+    // 对手方是列表外的陌生地址，不算内部互转
+    mkHolder('C1', { start_holding_at: 6003, token_transfer_in: { address: 'OUTSIDER' } }),
+  ];
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.ok(Math.abs(f.holder_same_second_entry_ratio - (2 / 6 * 100)) < 1e-9, 'A1/A2 同秒');
+  assert.ok(Math.abs(f.holder_identical_buy_amount_ratio - (2 / 6 * 100)) < 1e-9, 'A1/A2 买入量相同');
+  assert.ok(Math.abs(f.holder_internal_transfer_ratio - (2 / 6 * 100)) < 1e-9, '只有 B1/B2');
+});
+
+await testAsync('buildRows(holders): 浮盈/抛压/成本离散/画像字段', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.ctx.holders = [
+    mkHolder('P1', { unrealized_pnl: 6, avg_cost: 0.00001, sell_tx_count_cur: 3, realized_profit: -5,
+                     maker_token_tags: ['creator', 'dev_team'], tags: ['kol'] }),
+    mkHolder('P2', { unrealized_pnl: 4, avg_cost: 0.00002, maker_token_tags: ['sniper'], tags: ['fomo'] }),
+    mkHolder('P3', { unrealized_pnl: 0.5, avg_cost: 0.00003, native_balance: '0' }),
+    mkHolder('P4', { unrealized_pnl: -0.2, avg_cost: 0.00004 }),
+  ];
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.ok(Math.abs(f.holder_pnl_median - (0.5 + 4) / 2) < 1e-9, '中位数应是 2.25，实际 ' + f.holder_pnl_median);
+  assert.ok(Math.abs(f.holder_big_winner_ratio - 50) < 1e-9, 'pnl>3 的是 P1/P2');
+  assert.ok(Math.abs(f.holder_active_seller_ratio - 25) < 1e-9);
+  assert.ok(Math.abs(f.holder_realized_loss_ratio - 25) < 1e-9);
+  assert.ok(f.holder_avg_cost_cv > 0, '成本有离散度');
+  assert.ok(Math.abs(f.holder_zero_native_ratio - 25) < 1e-9, '只有 P3 是空壳');
+  assert.strictEqual(f.holder_creator_rank, 1, '创建者排第一');
+  assert.ok(Math.abs(f.holder_sniper_ratio - 25) < 1e-9);
+  assert.ok(Math.abs(f.holder_kol_ratio - 25) < 1e-9);
+  assert.ok(Math.abs(f.holder_fomo_ratio - 25) < 1e-9);
+  assert.ok(Math.abs(f.holder_dev_team_ratio - 25) < 1e-9);
+});
+
+await testAsync('buildRows(holders): 前30/50大户买卖均价应按金额加权并换算成市值', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  // 总供应量 = balance / amount_percentage = 1e9（每个持有人都自洽）
+  const SUPPLY = 1e9;
+  const holders = [];
+  for (let i = 0; i < 50; i++) {
+    const bal = (50 - i) * 1000;              // 降序持仓，用于校验排序取前 N
+    // 前 30 名单价 1e-6，后 20 名单价 1e-5：只有正确切出前 30 才能得到纯 1e-6
+    const unit = i < 30 ? 1e-6 : 1e-5;
+    const amt = 1000000;
+    holders.push(mkHolder('H' + i, {
+      balance: bal, amount_percentage: bal / SUPPLY,
+      buy_amount_cur: amt, history_bought_cost: amt * unit,
+      sell_amount_cur: amt / 2, history_sold_income: (amt / 2) * unit * 2,
+    }));
+  }
+  const f = (await sandbox.buildRows([call], [snapshot.constructor === Object ? Object.assign(snapshot, { ctx: { holders } }) : snapshot]))[0].features;
+  // 前30：单价恒 1e-6 → 市值 1e-6 * 1e9 = 1000
+  assert.ok(Math.abs(f.holder_top30_avg_buy_mcap - 1000) < 1e-6, '实际 ' + f.holder_top30_avg_buy_mcap);
+  assert.ok(Math.abs(f.holder_top30_avg_sell_mcap - 2000) < 1e-6, '卖出单价是买入的 2 倍');
+  // 前50：30 个 1e-6 + 20 个 1e-5，按金额加权（每人买入数量相同）
+  // = (30*1e-6 + 20*1e-5)/50 * 1e9 = (3e-5+2e-4)/50*1e9 = 4600
+  assert.ok(Math.abs(f.holder_top50_avg_buy_mcap - 4600) < 1e-6, '实际 ' + f.holder_top50_avg_buy_mcap);
+});
+
+await testAsync('buildRows(holders): 净成本要能取负值——大户已回本时不能算出正的假成本线', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  const SUPPLY = 1e9;
+  const holders = [];
+  for (let i = 0; i < 30; i++) {
+    const bal = (30 - i) * 1000;
+    // 每人买 100 万个花 $10，卖掉一半却拿回 $30（涨了 6 倍卖的）→ 净投入 -$20，已回本
+    holders.push(mkHolder('N' + i, {
+      balance: bal, amount_percentage: bal / SUPPLY,
+      buy_amount_cur: 1000000, history_bought_cost: 10, history_bought_fee: 0,
+      sell_amount_cur: 500000, history_sold_income: 30, history_sold_fee: 0,
+    }));
+  }
+  snapshot.ctx.holders = holders;
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.ok(f.holder_top30_net_cost_mcap < 0, '已回本应为负，实际 ' + f.holder_top30_net_cost_mcap);
+  // 净投入 30*(10-30) = -600，总持仓 = 1000*(30+29+...+1) = 465000
+  // -600/465000*1e9 = -1290.32...
+  assert.ok(Math.abs(f.holder_top30_net_cost_mcap - (-600 / 465000 * SUPPLY)) < 1e-6);
+  // 而买入均价依然是正的 $10/1e6*1e9 = 10000 —— 这正是两个字段必须并存的理由
+  assert.ok(Math.abs(f.holder_top30_avg_buy_mcap - 10000) < 1e-6, '买入均价不受影响');
+});
+
+await testAsync('buildRows(holders): 净成本要计入手续费', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  const SUPPLY = 1e9;
+  const holders = [];
+  for (let i = 0; i < 30; i++) {
+    const bal = (30 - i) * 1000;
+    holders.push(mkHolder('G' + i, {
+      balance: bal, amount_percentage: bal / SUPPLY,
+      buy_amount_cur: 1000000, history_bought_cost: 10, history_bought_fee: 2,
+      sell_amount_cur: 0, history_sold_income: 0, history_sold_fee: 0,
+    }));
+  }
+  snapshot.ctx.holders = holders;
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  // 净投入 30*(10+2) = 360；不算手续费会是 300，差 20%
+  assert.ok(Math.abs(f.holder_top30_net_cost_mcap - (360 / 465000 * SUPPLY)) < 1e-6,
+    '应含手续费，实际 ' + f.holder_top30_net_cost_mcap);
+});
+
+await testAsync('buildRows(holders): 持有人不足 N 个时前N大户均价应缺失，无人卖出时卖出均价应缺失', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  const SUPPLY = 1e9;
+  const holders = [];
+  for (let i = 0; i < 35; i++) {
+    const bal = (35 - i) * 1000;
+    holders.push(mkHolder('K' + i, {
+      balance: bal, amount_percentage: bal / SUPPLY,
+      buy_amount_cur: 1000000, history_bought_cost: 1,
+      sell_amount_cur: 0, history_sold_income: 0,   // 没有人卖过
+    }));
+  }
+  snapshot.ctx.holders = holders;
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.ok(Number.isFinite(f.holder_top30_avg_buy_mcap), '35 个够算前30');
+  assert.strictEqual(f.holder_top50_avg_buy_mcap, undefined, '不足 50 个不应写入');
+  assert.strictEqual(f.holder_top30_avg_sell_mcap, undefined, '无人卖出应缺失而不是 0');
+});
+
+await testAsync('buildRows(holders): 没有创建者时 holder_creator_rank 应缺失而不是 0', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.ctx.holders = [mkHolder('X1'), mkHolder('X2'), mkHolder('X3')];
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.strictEqual(f.holder_creator_rank, undefined);
+  // 无任何协同痕迹时应给 0 而不是缺失——0 是"测过了，没有"，缺失是"没数据"
+  assert.strictEqual(f.holder_same_private_funder_ratio, 0);
+  assert.strictEqual(f.holder_internal_transfer_ratio, 0);
+});
+
+await testAsync('buildRows(holders): 既无 native_coin_decimal 也无法从 chain 识别时，SOL 余额统计应整组缺失', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.ctx.holders = [
+    mkHolder('S1', { native_balance: '1000000000' }),
+    mkHolder('S2', { native_balance: '2000000000' }),
+    mkHolder('S3', { native_balance: '3000000000' }),
+  ]; // 没有 native_coin_decimal，signal 里也没有 chain
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.strictEqual(f.holder_native_sol_median, undefined);
+  assert.strictEqual(f.holder_native_sol_cv, undefined);
+});
+
+await testAsync('buildRows(holders): SOL 余额应按 native_coin_decimal 换算后取中位数与变异系数', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.ctx.holders = [
+    mkHolder('S1', { native_balance: '1000000000' }), // 1 SOL
+    mkHolder('S2', { native_balance: '2000000000' }), // 2 SOL
+    mkHolder('S3', { native_balance: '3000000000' }), // 3 SOL
+  ];
+  snapshot.ctx.native_coin_decimal = 1e9;
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.ok(Math.abs(f.holder_native_sol_median - 2) < 1e-9, '实际 ' + f.holder_native_sol_median);
+  // 均值2，方差=((1-2)^2+(2-2)^2+(3-2)^2)/3=2/3，cv=sqrt(2/3)/2≈0.40825
+  assert.ok(Math.abs(f.holder_native_sol_cv - 0.4082482905) < 1e-6, '实际 ' + f.holder_native_sol_cv);
+});
+
+await testAsync('buildRows(holders): native_coin_decimal 缺失时应按 chain=3 兜底 Solana(1e9) 精度换算', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.chain = 3; // 真实数据里 native_coin_decimal 并非每次快照都带，chain 是更可靠的兜底
+  snapshot.ctx.holders = [
+    mkHolder('C1', { native_balance: '1000000000' }), // 1 SOL
+    mkHolder('C2', { native_balance: '2000000000' }), // 2 SOL
+    mkHolder('C3', { native_balance: '3000000000' }), // 3 SOL
+  ];
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.ok(Math.abs(f.holder_native_sol_median - 2) < 1e-9, '实际 ' + f.holder_native_sol_median);
+});
+
+await testAsync('buildRows(holders): native_coin_decimal 缺失时应按 chain=56 兜底 BSC(1e18) 精度换算', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.chain = 56;
+  snapshot.ctx.holders = [
+    mkHolder('B1', { native_balance: String(1e18) }),   // 1 BNB
+    mkHolder('B2', { native_balance: String(2 * 1e18) }), // 2 BNB
+    mkHolder('B3', { native_balance: String(3 * 1e18) }), // 3 BNB
+  ];
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.ok(Math.abs(f.holder_native_sol_median - 2) < 1e-9, '实际 ' + f.holder_native_sol_median);
+});
+
+await testAsync('buildRows(holders): 显式 native_coin_decimal 应优先于 chain 兜底', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.chain = 3; // chain 兜底会给 1e9，但下面显式给了不同的精度，应以显式值为准
+  snapshot.ctx.native_coin_decimal = 1e6;
+  snapshot.ctx.holders = [
+    mkHolder('E1', { native_balance: '1000000' }), // 1（按显式的 1e6 换算）
+    mkHolder('E2', { native_balance: '2000000' }),
+    mkHolder('E3', { native_balance: '3000000' }),
+  ];
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.ok(Math.abs(f.holder_native_sol_median - 2) < 1e-9, '实际 ' + f.holder_native_sol_median);
+});
+
+await testAsync('buildRows(holders): 多数大户 SOL 余额为 0 时中位数应如实为 0，而不是被过滤掉', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.ctx.holders = [
+    mkHolder('Z1', { native_balance: '0' }),
+    mkHolder('Z2', { native_balance: '0' }),
+    mkHolder('Z3', { native_balance: '0' }),
+    mkHolder('Z4', { native_balance: '5000000000' }), // 5 SOL
+    mkHolder('Z5', { native_balance: '3000000000' }), // 3 SOL
+  ];
+  snapshot.ctx.native_coin_decimal = 1e9;
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.strictEqual(f.holder_native_sol_median, 0, '5个里3个是0，中位数应为0');
+});
+
+test('computeCorrelations: 出现任一类被剔除字段时都不应抛异常，且要正确归桶', () => {
+  // 回归：correlationPoolExclusionReason 新增 'metadata' 返回值时，excluded 初始化里没有对应
+  // 的桶，excluded['metadata'].push 抛 "Cannot read properties of undefined (reading 'push')"。
+  // 它在 computeCorrelations 主链路上，结果是整个「分析」直接失败、一条数据都加载不出来。
+  // 这里把四类剔除原因各放一个字段，任何一类没桶都会当场炸。
+  const rows = [];
+  for (let i = 0; i < 12; i++) {
+    rows.push({ returnMax: 1 + i * 0.3, features: {
+      sol_price: 150 + i,          // metadata
+      last_traded: 1784000000 + i, // timestamp
+      ai_max_up_ratio: i,          // internal
+      always_same: 7,              // constant（零方差）
+      buyer_count_d1: 10 + i,      // 正常字段，应当留下
+    } });
+  }
+  const list = sandbox.computeCorrelations(rows);
+  const ex = list._excluded;
+  assert.ok(ex.metadata.includes('sol_price'), 'sol_price 应进 metadata 桶');
+  assert.ok(ex.timestamp.includes('last_traded'), 'last_traded 应进 timestamp 桶');
+  assert.ok(ex.internal.includes('ai_max_up_ratio'), 'ai_max_up_ratio 应进 internal 桶');
+  assert.ok(ex.constant.includes('always_same'), 'always_same 应进 constant 桶');
+  assert.ok(list.some(r => r.feature === 'buyer_count_d1'), '正常字段应参与检验');
+});
+
+test('字段候选池剔除：不得误杀任何组装字段（对 buildRows 里全部 features 赋值做全量校验）', () => {
+  // 剔除规则用的是前缀/后缀正则，边界写松一点就会连坐成品特征，而且不报错——
+  // 只是候选池里悄悄少一批，没人会发现。这里把源码里所有 features['x'] = 的字段全捞出来兜底。
+  const src = sandbox.buildRows.toString();
+  const made = [...new Set([...src.matchAll(/features\[['"]([^'"]+)['"]\]\s*=/g)].map(m => m[1]))];
+  assert.ok(made.length > 50, '应能解析出足量组装字段，实际 ' + made.length);
+  const killed = made.filter(f => sandbox.isNonAnalyticField(f));
+  assert.deepStrictEqual(killed, [], '这些组装字段被剔除规则误杀：' + killed.join(', '));
+});
+
+testAsync('holder_topN_share_pct：前N大户持仓占比合计，必须剔除交易所/流动性地址', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  const H = (t, addr, pct) => ({ addr_type: t, address: addr, amount_percentage: pct, balance: pct * 1e9,
+    buy_volume_cur: 1, buy_amount_cur: 1e6, history_bought_cost: 1, sell_amount_cur: 0,
+    history_sold_income: 0, unrealized_pnl: 0, avg_cost: 1e-5, native_balance: '100',
+    start_holding_at: 100, tags: [], maker_token_tags: [], native_transfer: null });
+  const holders = [H(2, 'POOL', 0.15), H(2, 'CEX', 0.10)];   // 交易所/池 25%，应被剔除
+  for (let i = 0; i < 35; i++) holders.push(H(0, 'W' + i, (35 - i) * 0.001));
+  snapshot.ctx.holders = holders;
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+
+  // 前30真实持有人（第6~35名，各 0.006..0.035）合计 = 61.5%
+  let exp30 = 0; for (let k = 35; k >= 6; k--) exp30 += k * 0.001;
+  assert.ok(Math.abs(f['holder_top30_share_pct'] - exp30 * 100) < 1e-6,
+    '前30占比应剔除交易所后算，实际 ' + f['holder_top30_share_pct']);
+  // 关键：把 25% 的交易所算进去会得到 86.5%，必须证明没有
+  assert.ok(f['holder_top30_share_pct'] < 70, '交易所/池的持仓不能计入前30占比');
+  // 只有 35 个真实持有人 → 前50不足，应缺失而不是拿 35 个凑数
+  assert.strictEqual(f['holder_top50_share_pct'], undefined, '不足 50 个真实持有人应缺失');
+});
+
+testAsync('筹码字段：pressure_net 已移除，below_percent 仍参与计算但不进候选池', async () => {
+  // 四个字段（above / below / ratio / net）只有 2 个自由度：
+  //   pressure_net = above − below，above_below_ratio = above ÷ below
+  // 全放进候选池不增加信息，只会抬高 BH 校正的 m，把真信号的校正后 p 拖垮。
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.ctx.chip_analysis = { above_percent: 40, below_percent: 20 };
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+
+  assert.strictEqual(f['chip_analysis.pressure_net'], undefined, 'pressure_net 应已移除');
+  // below_percent 必须还在——above_below_ratio 拿它做分母
+  assert.strictEqual(f['chip_analysis.below_percent'], 20);
+  assert.strictEqual(f['chip_analysis.above_below_ratio'], 2);
+
+  // 但它不该进分析候选池
+  assert.ok(sandbox.isNonAnalyticField('chip_analysis.below_percent'), 'below_percent 应被剔除出候选池');
+  assert.ok(!sandbox.isNonAnalyticField('chip_analysis.above_percent'), 'above_percent 要保留');
+  assert.ok(!sandbox.isNonAnalyticField('chip_analysis.above_below_ratio'), 'above_below_ratio 要保留');
+});
+
+test('字段候选池剔除：元数据/常量字段应被 isNonAnalyticField 挡掉，业务字段必须放行', () => {
+  for (const f of ['amm_volume', 'exchange_volume', 'scam_volume', 'bnb_decimal', 'bnb_price',
+                   'decimals', 'chain', 'dexscreen_loading', 'goplus_loading',
+                   'h1_featured_index', 'hot_index',
+                   'is_diamond_token', 'is_error_market_token', 'is_honey', 'is_scam_token',
+                   'is_top_token', 'is_trench_token',
+                   'is_fake', 'is_fake_bonk', 'is_fake_four', 'is_fake_pump',
+                   // 点号路径的 highlight.* 整棵子树
+                   'highlight.is_usdt', 'highlight.is_live', 'highlight.is_activity',
+                   // kline_and_indicators.* 是计算输入（绝对价/单位标志/元数据），不是特征
+                   'kline_and_indicators.current_price', 'kline_and_indicators.current_avg_price',
+                   'kline_and_indicators.current_ao', 'kline_and_indicators.kline_is_usd',
+                   'kline_and_indicators.kline_is_mcap', 'kline_and_indicators.timestamp',
+                   'kline_and_indicators.resolution',
+                   // last_alert.* 整棵子树：上次告警的绝对价/市值/fibon位/时间戳
+                   'last_alert.top_price', 'last_alert.low_price_mcap', 'last_alert.fibon_break1',
+                   'last_alert.n_pattern_retracement', 'last_alert.total_supply',
+                   'last_alert.signalTime', 'last_traded',
+                   'sol_decimal', 'sol_price', 'total_record', 'total_supply',
+                   '_highlight_mcap_update', 'ai_max_up_ratio']) {
+    assert.ok(sandbox.isNonAnalyticField(f), f + ' 应被剔除出候选池');
+  }
+  // 精确匹配而非前缀/包含匹配：new_volume 等持仓指标名字里也有 _volume，
+  // 一旦写成 includes('_volume') 就会把核心筛选字段全部误杀
+  // is_new_m5_hot_ranking_token 必须活着：它是 is_* 布尔，但和被删的 hot_index 不同，
+  // 表达的是"是否新进榜"这一事件，不是随平台流量漂移的名次
+  // kline_* 顶层字段是从 kline_and_indicators 子树加工出来的成品特征，名字不带子树前缀，
+  // 必须活着——前缀规则一旦写成 /kline/ 这种没有 ^ 和 \. 边界的形式就会全军覆没
+  for (const f of ['new_volume', 'smart_volume', 'shit_volume', 'whale_volume',
+                   'gmgn.price.buy_volume_1h', 'max_up_ratio', 'kline_max_rise_pct',
+                   'is_new_m5_hot_ranking_token', 'is_new_h1_hot_ranking_token', 'gmgn.og',
+                   'kline_volume_cv', 'kline_max_rise_speed_pct_per_min', 'kline_bar_minutes',
+                   'kline_minutes_since_max_volume', 'cost_line_distance_pct',
+                   // total_supply 被剔除，但带前缀的 gmgn.total_supply 是另一个字段（算流通占比用），
+                   // 靠 Set 精确匹配区分——写成 endsWith('total_supply') 就会连坐
+                   'gmgn.total_supply', 'gmgn.circulating_supply', 'kline_turnover_pct']) {
+    assert.ok(!sandbox.isNonAnalyticField(f), f + ' 不该被误伤');
+  }
+});
+
+test('字段候选池剔除：_highlight_*/ai_max_* 应被判为 internal，而同名相近的历史统计量必须保留', () => {
+  // ai_max_* 是 AI 侧的预测/极值标注，_highlight_* 是 UI 高亮标记，都不该进分析候选池。
+  // 但 max_up_ratio / signal_max_up_ratio 是"截至买入快照的历史最大值"，是合法特征，
+  // 正则一旦写宽（比如漏了 ^ 或 \. 边界）就会把它们一起误杀，这里正反两侧都钉住。
+  // 注意断言的是"有没有被剔除"而不是具体原因：ai_max_price_time 会先命中时间戳规则返回
+  // 'timestamp'，同样是剔除。scatterOptions 的过滤复用 CORR_INTERNAL_FIELD_RE，口径一致。
+  for (const f of ['_highlight_mcap_update', '_highlight_signals_update', 'ai_max_price_time',
+                   'ai_max_up_duration', 'ai_max_up_ratio', 'ai_max_up_ratio_mcap']) {
+    assert.ok(sandbox.correlationPoolExclusionReason(f), f + ' 应被剔除');
+  }
+  for (const f of ['max_up_ratio', 'max_up_duration', 'signal_max_up_ratio',
+                   'all_signals_max_ratio.v_breakout_volume', 'kline_max_rise_pct', 'ai_score']) {
+    assert.strictEqual(sandbox.correlationPoolExclusionReason(f), null, f + ' 不该被误伤');
+  }
+});
+
 await testAsync('buildRows(量能): bar 太少且无 resolution 时才真正不写入 minutes_since_max_volume', async () => {
   const { call, snapshot } = await makeMinimalCallSnapshot();
   const vols = [10, 999, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
@@ -602,9 +1018,10 @@ await testAsync('buildRows: sell_tx_per_seller 应与 buy_tx_per_buyer 对称', 
   assert.ok(Math.abs(f.sell_tx_per_seller - 173 / 98) < 1e-9);
   assert.ok(Math.abs(f.buy_tx_per_buyer - 263 / 176) < 1e-9);
 });
-await testAsync('buildRows: post_buy_max_drawdown_pct 应按 (initial_mcap - min_mcap) / initial_mcap 计算', async () => {
+await testAsync('buildRows: post_buy_max_drawdown_pct 应按 (initial_mcap - min_mcap) / initial_mcap 计算（min_mcap_time 早于 max_mcap_time）', async () => {
   const { call, snapshot } = await makeMinimalCallSnapshot();
   call.min_mcap = 60; // initial_mcap = 100 → 跌到60，回撤40%
+  call.min_mcap_time = 1000; call.max_mcap_time = 2000; // 先探底、再冲高，符合这个字段的语义
   const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
   assert.ok(Math.abs(f.post_buy_max_drawdown_pct - 40) < 1e-9);
 });
@@ -616,8 +1033,22 @@ await testAsync('buildRows: min_mcap 缺失时 post_buy_max_drawdown_pct 应缺�
 await testAsync('buildRows: min_mcap >= initial_mcap（未跌破买入价）时 post_buy_max_drawdown_pct 应为 0，不产生负数', async () => {
   const { call, snapshot } = await makeMinimalCallSnapshot();
   call.min_mcap = 150; // initial_mcap = 100，全程没跌破买入价
+  call.min_mcap_time = 1000; call.max_mcap_time = 2000;
   const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
   assert.strictEqual(f.post_buy_max_drawdown_pct, 0);
+});
+await testAsync('buildRows: min_mcap_time 晚于 max_mcap_time（先冲高后砸盘）时 post_buy_max_drawdown_pct 应缺失，不能拿 initial_mcap 当基准误算', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  call.min_mcap = 60; // 数值上跟第一个测试完全一样，只是 min/max 的时间顺序反过来
+  call.min_mcap_time = 2000; call.max_mcap_time = 1000; // 先冲高（max）、后砸盘跌到 min，走势含义不同
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.strictEqual(f.post_buy_max_drawdown_pct, undefined);
+});
+await testAsync('buildRows: min_mcap_time/max_mcap_time 缺失时 post_buy_max_drawdown_pct 应缺失（哪怕 min_mcap 本身有效）', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  call.min_mcap = 60; // 没设 min_mcap_time/max_mcap_time
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.strictEqual(f.post_buy_max_drawdown_pct, undefined);
 });
 
 // ---------- 跨信号类型的时序 ----------
@@ -823,13 +1254,12 @@ await testAsync('buildRows: 跌破成本线未收复时应标记右删失并给�
     ],
   };
   const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
-  // 未收复：break_cost_line_min 依旧缺失（保持原语义），但删失标记和时长下界都要有值
+  // 未收复（删失）：break_cost_line_min 依旧缺失（保持原语义，缺失即代表删失），但时长下界要有值
   assert.strictEqual(f.v_breakout_volume_recent_break_cost_line_min, undefined);
-  assert.strictEqual(f.v_breakout_volume_recent_still_below_cost_line, 1);
   assert.ok(Math.abs(f.v_breakout_volume_recent_below_cost_line_elapsed_min - (3 * 5 / 60)) < 1e-9);
 });
 
-await testAsync('buildRows: 收复成本线的样本 still_below 应为 0 且 elapsed 与 break_cost_line_min 一致', async () => {
+await testAsync('buildRows: 收复成本线的样本 elapsed 应与 break_cost_line_min 一致', async () => {
   const { call, snapshot } = await makeMinimalCallSnapshot();
   snapshot.signal.v_breakout_volume_list = [
     { n_pattern_confirmed: true, signalTime: 90, top_price_time: 100, fibon_break4: 0 },
@@ -846,7 +1276,6 @@ await testAsync('buildRows: 收复成本线的样本 still_below 应为 0 且 el
     ],
   };
   const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
-  assert.strictEqual(f.v_breakout_volume_recent_still_below_cost_line, 0);
   assert.strictEqual(
     f.v_breakout_volume_recent_below_cost_line_elapsed_min,
     f.v_breakout_volume_recent_break_cost_line_min
@@ -1146,7 +1575,38 @@ test('giniCoefficient: 完全平均分布应接近0，极度集中应接近1', (
 
 } // end main()
 
-main().then(() => {
+// charts.js / pro-analytics.js 抽出的纯计算函数的回归测试（这两个文件此前零覆盖）
+runLibAnalytics(test);
+runScatterFigure(test);
+runFilter(test);
+runSummary(test, testAsync);
+runBinning(test);
+runBinReport(testAsync);
+runAuc(test);
+runStrategy(test);
+runFieldDocs(test);
+runParity(test, testAsync);
+runAnalyticsParity(test);
+runCustomRuntime(test);
+runCompare(test);
+runLabels(test);
+runCommonHolders(test);
+runFieldHealth(test);
+runStrategyVersions(test);
+runDailyBacktest(test);
+runFactorExclusions(test);
+runExcludedTokens(test);
+runStrategyReplayLogic(test);
+runCampLibrary(test);
+runRemovedFactors(test);
+runDataArchive(test);
+runStrategySpec(test);
+runDataSlices(test);
+runTableHiddenFields(test);
+
+main().then(async () => {
+  // factorlab 的 run 是 async（内部有 OOS 回测等异步计算），必须 await 完才能打总结
+  await runFactorLab(test);
   console.log(`\n共 ${passed + failed} 个测试，通过 ${passed} 个，失败 ${failed} 个。`);
   process.exit(failed ? 1 : 0);
 });

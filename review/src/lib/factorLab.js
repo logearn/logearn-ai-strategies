@@ -291,6 +291,38 @@ export function factorCorrelations(rows, fields, { threshold = 0.7, minN = 20 } 
   return out.sort((x, y) => Math.abs(y.rho) - Math.abs(x.rho));
 }
 
+// ---------- 候选因子的边际 ρ 贡献 ----------
+// 北极星指标是 score↔returnMax 的 Spearman ρ（策略调参页同一口径），而不是单字段 AUC——
+// AUC 只看"这个字段自己"，没回答"把它加进当前打分池，对最终排序能力有没有增量"。
+// 这里把候选字段临时并入当前已选因子池（自动配权），对比加入前后 rows 整体 score 与
+// returnMax 的 ρ，差值就是"进池后的边际贡献"——可能出现"单字段 AUC 不错但边际贡献接近 0"
+// （信息与已选因子高度重叠，见 factorCorrelations）或反过来的情况。
+function scorePoolRho(rows, factorSet, missingPolicy) {
+  if (!factorSet.length) return NaN;
+  const scored = scoreRows(rows, factorSet, { missingPolicy });
+  const pairs = [];
+  for (const s of scored) {
+    const ret = Number(s.row.returnMax);
+    if (Number.isFinite(s.score) && Number.isFinite(ret)) pairs.push([s.score, ret]);
+  }
+  return pairs.length >= 8 ? spearman(pairs) : NaN;
+}
+
+// currentFactors：当前已选因子池（不含候选自己）；candidate：来自扫描结果的候选行
+// （需带 .interval，否则无法推导打分边界）；camp：候选所属阵营。
+export function factorMarginalRho(rows, currentFactors, candidate, camp, winThreshold = WIN_THRESHOLD, opts = {}) {
+  const { shape = 'trap', missingPolicy = 'zero' } = opts;
+  if (!candidate || !candidate.interval) return { error: '该字段无可信区间，无法评估' };
+  const { factors: withOne } = buildFactors(rows, [candidate], [{ field: candidate.field, camp }], winThreshold, { shape });
+  if (!withOne.length) return { error: '无法推导打分边界' };
+  const baseline = scorePoolRho(rows, autoWeights(currentFactors), missingPolicy);
+  const merged = autoWeights([...currentFactors, ...withOne]);
+  const withCandidate = scorePoolRho(rows, merged, missingPolicy);
+  const delta = Number.isFinite(withCandidate) && Number.isFinite(baseline) ? withCandidate - baseline
+    : Number.isFinite(withCandidate) ? withCandidate : NaN;
+  return { baseline, withCandidate, delta };
+}
+
 // ---------- 打分与回测 ----------
 // 总分归一到 -100~100：Σ(±w·s)/Σw × 100。按权重和归一而不是假设 Σw=100——用户手动改权重后
 // 总和可能不是 100，归一保证 cutoff 的含义（"满分的百分之几"）不随之漂移。

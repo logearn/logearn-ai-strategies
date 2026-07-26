@@ -10,6 +10,7 @@ import {
   scoreRow, scoreRows, buildScoreDeciles, sweepScoreCutoffs, backtestFactors,
   runOOSBacktest, compareWithHardGate, resolveCtxAccessor, generateStrategyCode,
   buildFactors, scanFactorCandidates, missingRate, classifyFieldOrigin, factorCorrelations,
+  factorMarginalRho,
 } from '../src/lib/factorLab.js';
 import { compileStrategy, runStrategyOnRow, aggregateScoreStats, parseFactorCheck } from '../src/lib/proAnalytics.js';
 import { mergeDaily } from '../src/lib/mergeDaily.js';
@@ -612,6 +613,43 @@ export async function run(test) {
     const rows = [{ id: 1, returnMax: 1, features: { a: 1, b: 2 } }];
     assert.strictEqual(factorCorrelations(rows, ['a', 'b']).length, 0);
   });
+
+  // ---------- factorMarginalRho（P2-2：候选字段进池后对 score↔returnMax ρ 的边际贡献）----------
+  {
+    // 复用 planted：field 'x' 在 [30,60] 集中高倍信号；额外造一个与 x 完全重复的字段 'xDup'，
+    // 用来验证"信息重叠时边际贡献应趋近 0"（即便它自己单独进池的边际贡献不小）。
+    const plantedDup = planted.map(r => ({ ...r, features: { x: r.features.x, xDup: r.features.x } }));
+
+    test('factorMarginalRho: 空因子池时，候选自己进池应给出正的边际贡献（withCandidate=delta）', async () => {
+      const scan = await scanFactorCandidates(plantedDup, ['x'], { winThreshold: T, bootstrapB: 60 });
+      const c = scan.candidates[0];
+      assert.ok(c.interval, 'x 应挖出可信区间');
+      const res = factorMarginalRho(plantedDup, [], c, 'hero', T);
+      assert.ok(!res.error, res.error);
+      assert.ok(!Number.isFinite(res.baseline), `空池 baseline 应为 NaN，实际 ${res.baseline}`);
+      assert.ok(Number.isFinite(res.withCandidate) && res.withCandidate > 0, `withCandidate=${res.withCandidate}`);
+      assert.strictEqual(res.delta, res.withCandidate);
+    });
+
+    test('factorMarginalRho: 候选与已选因子信息完全重叠时，边际贡献应远小于其独立进池的贡献', async () => {
+      const scan = await scanFactorCandidates(plantedDup, ['x', 'xDup'], { winThreshold: T, bootstrapB: 60 });
+      const cx = scan.candidates.find(c => c.field === 'x');
+      const cDup = scan.candidates.find(c => c.field === 'xDup');
+      assert.ok(cx.interval && cDup.interval);
+      const { factors: poolWithX } = buildFactors(plantedDup, [cx], [{ field: 'x', camp: 'hero' }], T);
+      const alone = factorMarginalRho(plantedDup, [], cDup, 'hero', T);
+      const withXInPool = factorMarginalRho(plantedDup, poolWithX, cDup, 'hero', T);
+      assert.ok(Number.isFinite(alone.delta) && alone.delta > 0.05, `alone.delta=${alone.delta}`);
+      assert.ok(Number.isFinite(withXInPool.delta), `withXInPool.delta=${withXInPool.delta}`);
+      assert.ok(withXInPool.delta < alone.delta * 0.5,
+        `重复字段的边际贡献应显著小于独立贡献：alone=${alone.delta} withPool=${withXInPool.delta}`);
+    });
+
+    test('factorMarginalRho: 无可信区间的候选应报错而不是抛异常', () => {
+      const res = factorMarginalRho(plantedDup, [], { field: 'x', interval: null }, 'hero', T);
+      assert.ok(res.error);
+    });
+  }
 
   // ---------- 缺失重归一（missingPolicy: renorm）----------
   {

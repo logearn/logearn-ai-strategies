@@ -85,6 +85,7 @@ export default function FieldHealth({ rows, fields }) {
             衡量方式是<b>连续优势长度</b>：滑窗胜率高于整体基准的最长连续段有多少条样本。
             光看长度会被噪声骗（滑窗自带自相关，纯噪声也能凑出约一个窗口宽的连续段），所以要和打散标签后的随机基线比。
             本次扫了 {peaks.scanned} 个字段、每个 {peaks.effPermN} 次置换。
+            <br />注：这是<b>发现/显著性</b>工具，回答"有没有甜蜜区间"；打分因子实际用的"高倍落点区间"由「回测·因子」和「阵营库·高倍落点校验」统一用 findHotInterval 给出，两者口径不同、各司其职，不要混用。
           </Typography.Paragraph>
           <Table size="small" rowKey="field" columns={peakCols} dataSource={filterHidden(peaks.rows, hidden)}
             scroll={{ x: 1150, y: 340 }} pagination={{ pageSize: 30, size: 'small' }} />

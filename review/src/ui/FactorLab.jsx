@@ -11,6 +11,7 @@ import {
   scanFactorCandidates, buildFactors, autoWeights, baseStats,
   backtestFactors, runOOSBacktest, compareWithHardGate,
   resolveCtxAccessor, generateStrategyCode, classifyFieldOrigin, factorCorrelations,
+  factorMarginalRho,
 } from '../lib/factorLab.js';
 import { loadFactorExclusions, saveFactorExclusions, excludeFactor,
          unexcludeFactor, filterExcluded } from '../lib/factorExclusions.js';
@@ -27,7 +28,8 @@ const fmtInterval = iv => iv ? `[${fmtBound(iv.lo)}, ${fmtBound(iv.hi)})` : '-';
 // 邪恶阵营的 interval 只是换成了"输家集中区"（findColdInterval 的结果），不是另一套字段。
 // onExclude(field)：把这个字段标记成"不适合该阵营"，持久化排除——以后扫描/勾选都不再出现，
 // 跟"删除已选因子"（removeFactor，只是取消这次勾选）是两回事，这个是更强的"判定"。
-function makeScanColumns(camp, onExclude) {
+// getMarginal(field) -> undefined（未算）| { error } | { baseline, withCandidate, delta }
+function makeScanColumns(camp, onExclude, getMarginal) {
   const isEvil = camp === 'evil';
   const cols = [
     { title: '字段', dataIndex: 'field', width: 230, fixed: 'left',
@@ -45,6 +47,26 @@ function makeScanColumns(camp, onExclude) {
     cols.push({ title: '方向', dataIndex: 'direction', width: 80,
       render: v => (v === 'high' ? '值大更好' : '值小更好') });
   }
+  cols.push({
+    title: <Tooltip title="把该字段临时并入当前已选因子池（自动配权）后，score↔returnMax 的 Spearman ρ 相比不加它的变化。北极星是 ρ 不是单字段 AUC——两者可能不一致（如信息与已选因子重叠，边际贡献会趋近 0）。">边际ρ贡献</Tooltip>,
+    width: 100, align: 'right',
+    sorter: (a, b) => {
+      const ma = getMarginal(a.field), mb = getMarginal(b.field);
+      return (Number.isFinite(ma?.delta) ? ma.delta : -Infinity) - (Number.isFinite(mb?.delta) ? mb.delta : -Infinity);
+    },
+    render: (_, r) => {
+      const m = getMarginal(r.field);
+      if (!m) return <Typography.Text type="secondary" style={{ fontSize: 11 }}>未算</Typography.Text>;
+      if (m.error) return <Tooltip title={m.error}><Typography.Text type="secondary" style={{ fontSize: 11 }}>-</Typography.Text></Tooltip>;
+      if (!Number.isFinite(m.delta)) return <Typography.Text type="secondary" style={{ fontSize: 11 }}>-</Typography.Text>;
+      const sign = m.delta > 0 ? '+' : '';
+      return <Tooltip title={`池外ρ=${Number.isFinite(m.baseline) ? m.baseline.toFixed(3) : '-'} → 池内ρ=${m.withCandidate.toFixed(3)}`}>
+        <span style={{ color: m.delta > 0 ? '#30d158' : m.delta < 0 ? '#ff453a' : undefined, fontSize: 11 }}>
+          {sign}{m.delta.toFixed(3)}
+        </span>
+      </Tooltip>;
+    },
+  });
   cols.push(
     { title: isEvil ? '输家集中区间' : '高倍集中区间', width: 150,
       render: (_, r) => r.interval
@@ -95,6 +117,10 @@ export default function FactorLab({ rows, fields, light }) {
   const [replay, setReplay] = useState(null);
   const [replayBusy, setReplayBusy] = useState(false);
   const [gen, setGen] = useState(null);
+  // 候选字段的边际 ρ 贡献：按需算（synchronous 扫一遍候选表对样本量较大的池子有开销，不跟着每次
+  // 渲染自动重算），key = camp+':'+field；poolKey 记录算这份结果时的因子池签名，池子变了就判过期。
+  const [marginalRho, setMarginalRho] = useState(null); // { poolKey, map }
+  const [marginalBusy, setMarginalBusy] = useState(false);
 
   const base = useMemo(() => baseStats(rows, threshold), [rows, threshold]);
   const scopedFields = useMemo(
@@ -124,6 +150,7 @@ export default function FactorLab({ rows, fields, light }) {
 
   async function runScan() {
     setScanBusy(true);
+    setMarginalRho(null); // 新一轮扫描的候选区间/AUC 全变了，旧的边际ρ结果直接作废
     await new Promise(r => setTimeout(r, 0));   // 让出一帧，按钮 loading 才能画出来
     try {
       const scanOpts = { winThreshold: threshold, bootstrapB: 200 };
@@ -260,10 +287,37 @@ export default function FactorLab({ rows, fields, light }) {
   }
 
   const staleScan = (scanHero || scanEvil) && (scanThreshold !== threshold || scanScope !== fieldScope);
+  // 因子池签名：谁在池子里、打分方式/缺失口径是什么——任一项变了，已算出的边际ρ就该判过期
+  // （不是删掉，界面上仍显示但标"已过期"，避免因子发现表整片瞬间清空造成跳动）
+  const poolKey = factors.map(f => f.camp + ':' + f.field).sort().join(',') + '|' + scoreShape + '|' + missingPolicy + '|' + threshold;
+  const marginalStale = marginalRho && marginalRho.poolKey !== poolKey;
+  const getMarginal = field => (marginalRho ? marginalRho.map.get(field) : undefined);
+
+  async function runMarginalRho() {
+    setMarginalBusy(true);
+    await new Promise(r => setTimeout(r, 0));
+    try {
+      const map = new Map();
+      const heroSelSet = new Set(selectedHero), evilSelSet = new Set(selectedEvil);
+      const pools = [
+        [visibleHeroCandidates, 'hero', heroSelSet],
+        [visibleEvilCandidates, 'evil', evilSelSet],
+      ];
+      for (const [list, camp, selSet] of pools) {
+        if (!list) continue;
+        for (const c of list) {
+          if (!c.interval || selSet.has(c.field)) continue; // 已在池子里的因子不算"加入"边际
+          map.set(c.field, factorMarginalRho(rows, factors, c, camp, threshold, { shape: scoreShape, missingPolicy }));
+        }
+      }
+      setMarginalRho({ poolKey, map });
+    } finally { setMarginalBusy(false); }
+  }
+
   // 不用 useMemo 缓存：列定义要闭包住当前这一份 handleExcludeCandidate（引用了随渲染变化的
   // selectedHero/selectedEvil/scanHero/scanEvil），缓存住旧闭包会让"移除"按钮操作到过期的状态。
-  const scanHeroColumns = makeScanColumns('hero', field => handleExcludeCandidate('hero', field));
-  const scanEvilColumns = makeScanColumns('evil', field => handleExcludeCandidate('evil', field));
+  const scanHeroColumns = makeScanColumns('hero', field => handleExcludeCandidate('hero', field), getMarginal);
+  const scanEvilColumns = makeScanColumns('evil', field => handleExcludeCandidate('evil', field), getMarginal);
   // 已排除但候选表本身没扫出来（比如刚移除、还没重新扫描）的字段也该能在"已移除"里看到并恢复，
   // 所以不是单纯从 candidates 反查——扫描前已经把它们从 scopedFields 里过滤掉了。
   const excludedHero = exclusions.filter(x => x.camp === 'hero');
@@ -385,6 +439,10 @@ export default function FactorLab({ rows, fields, light }) {
             options={[{ label: '原字段', value: 'original' }, { label: '组装字段', value: 'assembled' }]} />
           <Button type="primary" loading={scanBusy} disabled={!rows.length || !scopedFields.length}
             onClick={runScan}>扫描 {scopedFields.length} 个{fieldScope === 'original' ? '原' : '组装'}字段（两阵营）</Button>
+          <Tooltip title="逐个把候选字段临时并入当前因子池，看 score↔returnMax 的 Spearman ρ 变化——比单字段 AUC 更贴近北极星指标">
+            <Button loading={marginalBusy} disabled={!scanHero && !scanEvil}
+              onClick={runMarginalRho}>计算候选边际ρ贡献</Button>
+          </Tooltip>
         </Space>}>
         <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 12 }}>
           两个阵营各自独立扫描：<b>勇者阵营</b>挖"高倍盘集中的取值区间"，命中 = 好迹象、加分；
@@ -399,6 +457,8 @@ export default function FactorLab({ rows, fields, light }) {
           message={scanScope !== fieldScope
             ? `扫描结果是「${scanScope === 'original' ? '原字段' : '组装字段'}」范围的，当前已切到「${fieldScope === 'original' ? '原字段' : '组装字段'}」，请重新扫描。`
             : `扫描结果是在 ${scanThreshold}x 阈值下算的，当前已切到 ${threshold}x，请重新扫描。`} />}
+        {marginalStale && <Alert style={{ marginBottom: 12 }} type="warning" showIcon
+          message="因子池/打分方式/缺失口径/阈值已变化，「边际ρ贡献」列是旧结果，请重新计算。" />}
 
         {scanHero && (
           <>

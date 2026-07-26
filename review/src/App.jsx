@@ -20,12 +20,10 @@ import BinBarCard from './ui/BinBarCard.jsx';
 import AucPanel from './ui/AucPanel.jsx';
 import FieldHealth from './ui/FieldHealth.jsx';
 import StrategyReplay from './ui/StrategyReplay.jsx';
-import ComparePanel from './ui/ComparePanel.jsx';
 import CustomFields from './ui/CustomFields.jsx';
 import FieldBrowser from './ui/FieldBrowser.jsx';
 import ScatterBoard from './ui/ScatterBoard.jsx';
 import FactorLab from './ui/FactorLab.jsx';
-import MatrixTable from './ui/MatrixTable.jsx';
 import { isNonAnalyticField, getFeature, ROW_LEVEL_FIELDS } from './lib/data.js';
 
 const { Header, Content } = Layout;
@@ -149,29 +147,26 @@ export default function App() {
             onActiveRows={(r, isF) => { setActiveRows(r); setFiltered(isF); }} />}
           {hasData && <SummaryPanel activeRows={activeRows} allRows={workingRows}
             onDedup={r => { setActiveRows(r); setFiltered(true); }} />}
-          {hasData && <ErrorBoundary title="快照速查渲染出错" resetKey={rows.length}><SnapshotInspector rows={workingRows} labels={labels} onLabel={setOneLabel} light={!dark} /></ErrorBoundary>}
         </Space>
       ),
     },
     {
-      key: 'corr', label: '相关性与显著性', disabled: !hasData,
+      // P2-1：原「相关性与显著性」+「图表」+「回测·因子」三个并列的"找因子"入口合一。
+      // FactorLab（回测·因子）是超集（挖区间+lift+捕获率+样本外+生成代码），放最前面当主体；
+      // 散点/相关性/AUC/字段体检是复核视角，折叠在其后，减少重复入口、tab 数 7→5。
+      key: 'findFactor', label: '找因子', disabled: !hasData,
       children: (
         <Space direction="vertical" size={16} style={{ width: '100%' }}>
-          <CorrTable rows={activeRows} />
-          <AucPanel rows={activeRows} fields={fields} />
-          <FieldHealth rows={activeRows} fields={fields} />
-        </Space>
-      ),
-    },
-    {
-      key: 'chart', label: '图表', disabled: !hasData,
-      children: (
-        <Space direction="vertical" size={16} style={{ width: '100%' }}>
-          <MatrixTable rows={activeRows} fields={fields} light={!dark} />
-          <BinBarCard rows={activeRows} fields={fields} light={!dark} />
+          <ErrorBoundary title="回测·因子面板渲染出错" resetKey={activeRows.length}>
+            <FactorLab rows={activeRows} fields={fields} light={!dark} />
+          </ErrorBoundary>
           <ScatterBoard rows={activeRows} fields={fields} light={!dark} onAddToCampLibrary={addToCampLibrary}
             campGroups={groupCampEntries(campLibrary, [campActiveGroup]).map(g => g.group)}
             campActiveGroup={campActiveGroup} onCampActiveGroupChange={setCampActiveGroup} />
+          <CorrTable rows={activeRows} />
+          <AucPanel rows={activeRows} fields={fields} />
+          <FieldHealth rows={activeRows} fields={fields} />
+          <BinBarCard rows={activeRows} fields={fields} light={!dark} />
         </Space>
       ),
     },
@@ -193,17 +188,6 @@ export default function App() {
             onExclude={excludeOneToken}
             pendingLines={pendingStrategyLines}
             onConsumePendingLines={() => setPendingStrategyLines([])} />
-          <ComparePanel activeRows={activeRows} />
-        </Space>
-      ),
-    },
-    {
-      key: 'factor', label: '回测·因子', disabled: !hasData,
-      children: (
-        <Space direction="vertical" size={16} style={{ width: '100%' }}>
-          <ErrorBoundary title="回测·因子面板渲染出错" resetKey={activeRows.length}>
-            <FactorLab rows={activeRows} fields={fields} light={!dark} />
-          </ErrorBoundary>
         </Space>
       ),
     },
@@ -214,6 +198,7 @@ export default function App() {
           <CustomFields rows={workingRows} fields={fields}
             onApplied={() => { setCustomVersion(v => v + 1); setActiveRows(a => [...a]); }} />
           <FieldBrowser fields={fields} />
+          {hasData && <ErrorBoundary title="快照速查渲染出错" resetKey={rows.length}><SnapshotInspector rows={workingRows} labels={labels} onLabel={setOneLabel} light={!dark} /></ErrorBoundary>}
           <LabelPanel rows={labeledRows} labels={labels} onLabel={setOneLabel}
             onClearAll={() => { setLabels({}); saveLabels({}); }}
             excludedTokens={excludedTokens} onUnexclude={unexcludeOneToken} />

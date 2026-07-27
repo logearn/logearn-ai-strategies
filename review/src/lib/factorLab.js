@@ -11,7 +11,7 @@
 //     这里若用 >= 会在阈值恰好落在样本值上时与 AUC 面板对不上。
 //   - 缺失值（字段值为 null/undefined/空串/非数值）一律记 0 分，不做均值填充——
 //     生成的策略代码必须复刻同一语义（见 generateStrategyCode 里的 V()）。
-import { percentile, wilsonInterval, spearman, WIN_THRESHOLD } from './utils.js';
+import { percentile, wilsonInterval, spearman, splitTrainTest, WIN_THRESHOLD } from './utils.js';
 import { collectAucSamples, scanFieldsAuc } from './auc.js';
 import { getFeature, isAssembledField, isKlineVolumeField, PERCENT_FRACTION_FIELDS } from './data.js';
 
@@ -308,19 +308,326 @@ function scorePoolRho(rows, factorSet, missingPolicy) {
   return pairs.length >= 8 ? spearman(pairs) : NaN;
 }
 
+// 分层增益：以"筛垃圾"为第一目标的策略，北极星从"全程 ρ 单调"降为"分段台阶"
+// （见项目北极星笔记的例外条款）。最早版本只拿 cutoff 二分的台阶差(above.length×Δ命中率)当
+// 目标函数——这是纯"计数阈值"函数，不是像 ρ 那样看全排序的平滑目标，坐标上升会找到"角点解"：
+// 哪个因子单独对这一刀最敏感就把权重全堆过去、其它因子推到 0（实测复现：2 因子池退化成
+// 100/0）。这不是"配权"，是"挑单一分界因子"。
+// 用户订正："应该先排序，然后再分层，只是不需要要求每个粒度单调"——即分段台阶该看的是
+// "先按 score 排序、切成粗粒度的若干档，档位越高命中率越高这个粗趋势"，不要求 decile 级细粒度
+// 处处爬升。于是改成两部分加权（"秩相关 + cutoff 主台阶"）：
+//   ① 主台阶 tierGap（权重 0.7）：仍是 cutoff 天然切出的"过线/未过线"两层命中率差，∈[-1,1]——
+//      这是笔记里的核心判据，权重给高，保证 cutoff 处的台阶差仍是主导信号；
+//   ② 粗粒度秩相关 tierRho（权重 0.3）：仿 computeScoreBuckets 的做法——按 score 排序切
+//      K=3~5 档（样本不够多就少切，同分样本绝不跨档），算 spearman(档序号, 档命中率)，∈[-1,1]。
+//      它是"多点约束"：因子必须在好几个档位上都排得对才能拿到高分，单一因子很难同时喂饱
+//      cutoff 这一刀 + 好几个档位的排序，逼着坐标上升保留多个因子而不是清零到只剩一个。
+// 触发数(above.length)默认仍作规模因子——同样的台阶差，覆盖更多触发样本更有价值（呼应
+// recommendCutoff 的"净超额命中数"思路），这贴合"筛垃圾"策略（尽量多留好币、只踢真垃圾）。
+// 但"推荐"类策略（想要少而精的候选名单）用同一个乘数会反向起作用：坐标上升会为了拉高
+// above.length 而把权重往"谁都容易触发"的方向偏，实测过（2026-07-28）：同一因子池，ρ最优配权
+// 在 cutoff 下触发率79%，分层增益（带该乘数）配权触发率飙到92%，过滤能力形同虚设。
+// opts.volumeWeighted=false 时去掉这个乘数，
+// 只留台阶差+粗粒度秩相关的方向性分数（不奖励触发量大小），配权时不会再被"放量"牵着走。
+// 但这样也去掉了它的一个副作用——above.length 越小、乘出来的分数天然越小，客观上在惩罚
+// "过线组样本太少、统计上不可信"的情况。实测过（2026-07-28）：去掉乘数后，held-out test 台阶差
+// 直接翻车（train 涨、test 从正变负），比默认版更容易过拟合——因为坐标上升不再需要顾忌"过线组
+// 够不够大"，会在 train 上找一个"过线组恰好差异很大"的权重组合，哪怕这个组在 train 上样本很少、
+// 纯属抽样运气。minGroupN（默认 20，呼应 computeScoreBuckets"每桶~20条才有统计意义"的口径）就是
+// 补回这层保护：不管 volumeWeighted 开不开，过线/未过线两层都必须达到这个样本量才评估台阶差，
+// 逼着搜索只能在统计上站得住脚的分组上找权重，不能靠小样本噪声投机取巧。
+// 垃圾/高倍标签口径跟"找因子"体系一致：直接用 returnMax > winThreshold，不引入独立的垃圾标签字段。
+function scorePoolTierGain(rows, factorSet, cutoff, missingPolicy, winThreshold, volumeWeighted = true, minGroupN = 20) {
+  if (!factorSet.length) return NaN;
+  const scored = scoreRows(rows, factorSet, { missingPolicy });
+  const pairs = [];
+  for (const s of scored) {
+    const ret = Number(s.row.returnMax);
+    if (Number.isFinite(s.score) && Number.isFinite(ret)) pairs.push({ score: s.score, ret });
+  }
+  const n = pairs.length;
+  if (n < 10) return NaN;
+
+  // ① 主台阶：cutoff 二分的命中率差
+  const above = pairs.filter(p => p.score >= cutoff);
+  const below = pairs.filter(p => p.score < cutoff);
+  if (above.length < minGroupN || below.length < minGroupN) return NaN;   // 两层都要有起码的统计意义才评估台阶差
+  const hitRateOf = arr => arr.filter(p => p.ret > winThreshold).length / arr.length;
+  const tierGap = hitRateOf(above) - hitRateOf(below);
+
+  // ② 粗粒度秩相关：排序后切 K 档（不拆同分），要求"档序号"与"档命中率"秩相关
+  const K = n >= 60 ? 5 : (n >= 30 ? 3 : 0);
+  let tierRho = 0;
+  if (K > 0) {
+    const sorted = pairs.slice().sort((a, b) => a.score - b.score);
+    const buckets = [];
+    let start = 0;
+    for (let k = 1; k <= K && start < n; k++) {
+      let end = Math.floor(k * n / K);
+      if (end <= start) continue;                                     // 上一档已把这段吃掉
+      while (end < n && sorted[end].score === sorted[end - 1].score) end++;  // 别在同分处切开
+      const chunk = sorted.slice(start, end);
+      start = end;
+      if (!chunk.length) continue;
+      const wins = chunk.filter(p => p.ret > winThreshold).length;
+      buckets.push(wins / chunk.length);
+    }
+    if (buckets.length >= 3) {
+      const rho = spearman(buckets.map((wr, i) => [i, wr]));
+      tierRho = Number.isFinite(rho) ? rho : 0;
+    }
+  }
+
+  const gapScore = 0.7 * tierGap + 0.3 * tierRho;
+  return volumeWeighted ? above.length * gapScore : gapScore;
+}
+
 // currentFactors：当前已选因子池（不含候选自己）；candidate：来自扫描结果的候选行
-// （需带 .interval，否则无法推导打分边界）；camp：候选所属阵营。
+// （需带 .interval，否则无法推导打分边界）；camp：候选所属阵营。rows 用于评估目标函数（通常是
+// 全体样本，因为最终是要在全体样本上打分）；opts.buildRows 用于推导梯形边界，默认等于 rows——
+// 如果候选的 .interval 是在另一份子集（如残差子集）上挖出来的，应传入同一份子集，保证区间与
+// 梯形边界口径一致。opts.scoreFn 是"打分池→目标值"的评估函数，默认 scorePoolRho（全程强单调）；
+// 不写死在函数体里，是为了让"评估用哪个目标函数"这件事可以从调用侧决定，而不是散落在各处改字面量。
 export function factorMarginalRho(rows, currentFactors, candidate, camp, winThreshold = WIN_THRESHOLD, opts = {}) {
-  const { shape = 'trap', missingPolicy = 'zero' } = opts;
+  const { shape = 'trap', missingPolicy = 'zero', buildRows = rows, scoreFn = scorePoolRho } = opts;
   if (!candidate || !candidate.interval) return { error: '该字段无可信区间，无法评估' };
-  const { factors: withOne } = buildFactors(rows, [candidate], [{ field: candidate.field, camp }], winThreshold, { shape });
+  const { factors: withOne } = buildFactors(buildRows, [candidate], [{ field: candidate.field, camp }], winThreshold, { shape });
   if (!withOne.length) return { error: '无法推导打分边界' };
-  const baseline = scorePoolRho(rows, autoWeights(currentFactors), missingPolicy);
+  const baseline = scoreFn(rows, autoWeights(currentFactors), missingPolicy);
   const merged = autoWeights([...currentFactors, ...withOne]);
-  const withCandidate = scorePoolRho(rows, merged, missingPolicy);
+  const withCandidate = scoreFn(rows, merged, missingPolicy);
   const delta = Number.isFinite(withCandidate) && Number.isFinite(baseline) ? withCandidate - baseline
     : Number.isFinite(withCandidate) ? withCandidate : NaN;
   return { baseline, withCandidate, delta };
+}
+
+// 计算 held-out（验证段）与样本内（训练段/全样本） 目标函数的增量对照。
+// - 在训练段推导区间/梯形边界（build on train），在验证段计算目标函数的增量（held-out Δ）
+// - 同时返回训练段内的 Δ 供对照（样本内 Δ），帮助识别过拟合（两者背离大）
+// opts.scoreFn 同 factorMarginalRho，默认 scorePoolRho。
+// 返回 { baselineTrain, withTrain, deltaTrain, baselineTest, withTest, deltaTest, nTrain, nTest }
+export function computeHeldOutDeltaRho(rows, currentFactors, candidate, camp, winThreshold = WIN_THRESHOLD, opts = {}) {
+  const { shape = 'trap', missingPolicy = 'zero', trainRatio = 0.7, timeField = 'swapBeginTime', splitMethod = 'time',
+          scoreFn = scorePoolRho } = opts;
+  if (!candidate || !candidate.interval) return { error: '该字段无可信区间，无法评估' };
+  const { train, test } = splitTrainTest(rows, splitMethod, trainRatio, timeField);
+  if (!train.length || !test.length) return { error: '训练/验证分割后样本不足' };
+
+  // 构造只含 candidate 的因子（在 train 上推导梯形/界限）
+  const built = buildFactors(train, [candidate], [{ field: candidate.field, camp }], winThreshold, { shape }).factors;
+  if (!built || !built.length) return { error: '无法在训练段推导出 candidate 的打分边界' };
+
+  // baseline 用当前因子池（假定为已推导好的因子对象数组）
+  const baselineTrain = scoreFn(train, autoWeights(currentFactors || []), missingPolicy);
+  const withTrain = scoreFn(train, autoWeights([...(currentFactors || []), ...built]), missingPolicy);
+  const deltaTrain = Number.isFinite(withTrain) && Number.isFinite(baselineTrain) ? withTrain - baselineTrain
+    : Number.isFinite(withTrain) ? withTrain : NaN;
+
+  // 验证段（held-out）：注意因子边界来自训练段，因此用 built 推到 test 上
+  const baselineTest = scoreFn(test, autoWeights(currentFactors || []), missingPolicy);
+  const withTest = scoreFn(test, autoWeights([...(currentFactors || []), ...built]), missingPolicy);
+  const deltaTest = Number.isFinite(withTest) && Number.isFinite(baselineTest) ? withTest - baselineTest
+    : Number.isFinite(withTest) ? withTest : NaN;
+
+  return {
+    baselineTrain, withTrain, deltaTrain,
+    baselineTest, withTest, deltaTest,
+    nTrain: train.length, nTest: test.length,
+  };
+}
+
+// ---------- ρ 驱动配权（北极星直接优化，默认口径：全程强单调）----------
+// autoWeights 按 |AUC−0.5| 分权，那是单字段二值判别力，跟"总分↔returnMax 单调(Spearman ρ)"这个
+// 唯一目标只是相关、不是一回事。这里直接搜非负权重最大化 ρ：
+//   - ρ 只由 score 的秩序决定，score=Σ(±w·s)/Σw×100 的分母对所有样本同值（zero 口径），
+//     所以优化的就是分子 Σ(±w·s) 的排序；每个因子的 ±s 与权重无关（scorePoolRho 内部现算）。
+//   - 无梯度（ρ 对权重分段常数）→ 乘法坐标上升：每个因子试 ×(1±δ) 和"置 0（丢弃）"，ρ 变好就留，
+//     扫完一轮 δ 减半，直到无改进/δ 过小。两个初值（autoWeights + 等权）各跑一次取 train ρ 最优，
+//     降低卡局部最优的概率。确定性，无随机种子。
+// 防过拟合：用 splitTrainTest 在 train 上拟合、test 上验证（跟 OOS 面板同口径 swapBeginTime/0.7）。
+// 返回 { factors(带新权重,归一到100), rhoTrainBefore/After, rhoTestBefore/After, zeroedFields, n* }
+// 或 { error }。before 用【当前】权重，让用户看到相对现状的提升。
+const applyWeights = (factors, weights) => factors.map((f, i) => ({ ...f, weight: weights[i] }));
+
+// 通用乘法坐标上升：给一个"打分函数"objFn(rowsSet, weightedFactors, missingPolicy)->越大越好的目标值，
+// 搜非负权重最大化它。ρ 最优配权、分层增益配权共用这一套搜索外壳，只是 objFn 换了——
+// 前者塞 scorePoolRho（可由调用方注入别的目标函数），后者塞 scorePoolTierGain（多绑一个 cutoff/winThreshold）。
+function coordinateAscentGeneric(objFn, rowsSet, factors, start, missingPolicy, maxRounds) {
+  const valueOf = w => objFn(rowsSet, applyWeights(factors, w), missingPolicy);
+  let w = start.map(x => (Number.isFinite(x) && x > 0 ? x : 0));
+  if (w.every(x => x === 0)) w = w.map(() => 1);   // 全 0 起点退化成等权
+  let val = valueOf(w);
+  if (!Number.isFinite(val)) return { w, rho: -Infinity };
+  let delta = 0.5;
+  for (let round = 0; round < maxRounds; round++) {
+    let improved = false;
+    for (let i = 0; i < w.length; i++) {
+      // 候选动作：放大、缩小、直接丢弃（置 0，让目标值无贡献/有害的因子能被彻底剔除）
+      for (const cand of [w[i] * (1 + delta), w[i] * (1 - delta), 0]) {
+        if (cand === w[i]) continue;
+        const w2 = w.slice(); w2[i] = cand;
+        if (w2.every(x => x === 0)) continue;        // 不允许全 0
+        const r = valueOf(w2);
+        if (Number.isFinite(r) && r > val + 1e-9) { w = w2; val = r; improved = true; }
+      }
+    }
+    if (!improved) { delta *= 0.5; if (delta < 1e-3) break; }
+  }
+  return { w, rho: val };
+}
+
+// opts.scoreFn 是注入的目标函数（同 factorMarginalRho/computeHeldOutDeltaRho），默认 scorePoolRho；
+// 不写死在函数体里，跟 coordinateAscentGeneric(objFn, ...) 是同一个原则——"该用哪个目标函数"由
+// 调用方决定，避免同一套逻辑改个目标就要在多处复制粘贴。
+export function optimizeWeightsForRho(rows, factors, opts = {}) {
+  const { missingPolicy = 'zero', trainRatio = 0.7, timeField = 'swapBeginTime',
+          splitMethod = 'time', maxRounds = 40, zeroEps = 0.05, scoreFn = scorePoolRho } = opts;
+  if (!Array.isArray(factors) || factors.length < 2) return { error: '至少要有 2 个因子才谈得上配权' };
+  const { train, test } = splitTrainTest(rows, splitMethod, trainRatio, timeField);
+  const curWeights = factors.map(f => Number(f.weight) || 0);
+  const rhoTrainBefore = scoreFn(train, factors, missingPolicy);
+  if (!Number.isFinite(rhoTrainBefore)) return { error: 'train 集有效样本不足（<8 对），无法评估 ρ' };
+
+  // 两个初值各跑一次坐标上升，取 train ρ 最优
+  const starts = [autoWeights(factors).map(f => f.weight), factors.map(() => 1)];
+  let best = null;
+  for (const s of starts) {
+    const r = coordinateAscentGeneric(scoreFn, train, factors, s, missingPolicy, maxRounds);
+    if (!best || r.rho > best.rho) best = r;
+  }
+  // 归一到 100（ρ 尺度不变，纯为展示/与手工权重口径一致）
+  const sum = best.w.reduce((a, b) => a + b, 0);
+  const normW = sum > 0 ? best.w.map(x => Math.round(x / sum * 1000) / 10) : best.w.map(() => Math.round(1000 / best.w.length) / 10);
+  const newFactors = applyWeights(factors, normW);
+  const zeroedFields = newFactors.filter(f => f.weight <= zeroEps).map(f => f.field);
+
+  return {
+    factors: newFactors,
+    rhoTrainBefore, rhoTrainAfter: best.rho,
+    rhoTestBefore: scoreFn(test, applyWeights(factors, curWeights), missingPolicy),
+    rhoTestAfter: scoreFn(test, newFactors, missingPolicy),
+    zeroedFields, nTrain: train.length, nTest: test.length,
+  };
+}
+
+// ---------- 分层增益配权（筛垃圾类策略的北极星例外：分段台阶）----------
+// 跟 optimizeWeightsForRho 是同一套框架（train 拟合 δ 坐标上升、两个起点各跑一次取 train 最优、
+// test 段只验证不参与搜索），只是目标函数换成 scorePoolTierGain：
+//   触发数(score>=cutoff) × (0.7×台阶差_过线vs未过线 + 0.3×粗粒度秩相关_档位vs档命中率)
+// "秩相关 + cutoff 主台阶加权"——见 scorePoolTierGain 内部注释：早期纯 cutoff 二分版本会让坐标
+// 上升退化成"单因子全权重"的角点解，加一个粗粒度排序约束能堵住这个漏洞，同时不要求全程细粒度
+// 单调（只切 3~5 档，不逼 decile 级处处爬升）。
+// 适用场景：策略以"过滤垃圾/防踩雷"为第一目标（用户明确说明），而不是要全程精细单调——
+// 此时按 ρ 最优配权会去追逐"处处爬升"，容易被小样本噪声牵着走；分层增益只要求粗粒度的
+// 台阶式区分，更贴合"区分垃圾"本身。返回结构与 optimizeWeightsForRho 对齐（字段名沿用 rho* 前缀
+// 是为了复用同一套展示/报告代码——这里的数值语义是"分层增益"而不是 Spearman ρ）。
+// opts.volumeWeighted（默认 true）：筛垃圾场景要"覆盖更多触发样本"，保持默认。策略若是
+// "推荐"类想要少而精的候选名单，传 false——去掉触发数乘数，配权不再被"放量"牵着走
+// （见 scorePoolTierGain 内部注释，2026-07-28 因"分层增益版触发率飙到92%、形同虚设"而加）。
+// opts.minGroupN（默认 20）：过线/未过线两层各自的最小样本量门槛，volumeWeighted:false 时
+// 尤其关键——去掉触发数乘数后失去了"样本越少分数天然越小"这层隐式正则化，minGroupN 补回来，
+// 见 scorePoolTierGain 内部注释（2026-07-28 因 volumeWeighted:false 版 held-out test 台阶差
+// 翻车、从正变负而加）。
+export function optimizeWeightsForTierGain(rows, factors, cutoff, opts = {}) {
+  const { missingPolicy = 'zero', trainRatio = 0.7, timeField = 'swapBeginTime',
+          splitMethod = 'time', maxRounds = 40, zeroEps = 0.05, winThreshold = DEFAULT_FACTOR_WIN_THRESHOLD,
+          volumeWeighted = true, minGroupN = 20 } = opts;
+  if (!Array.isArray(factors) || factors.length < 2) return { error: '至少要有 2 个因子才谈得上配权' };
+  const { train, test } = splitTrainTest(rows, splitMethod, trainRatio, timeField);
+  const curWeights = factors.map(f => Number(f.weight) || 0);
+  const objFn = (rowsSet, factorSet, mp) => scorePoolTierGain(rowsSet, factorSet, cutoff, mp, winThreshold, volumeWeighted, minGroupN);
+  const gainTrainBefore = objFn(train, factors, missingPolicy);
+  if (!Number.isFinite(gainTrainBefore)) return { error: `train 集在该 cutoff 下两层样本不足（各需 ≥${minGroupN}），无法评估分层增益` };
+
+  const starts = [autoWeights(factors).map(f => f.weight), factors.map(() => 1)];
+  let best = null;
+  for (const s of starts) {
+    const r = coordinateAscentGeneric(objFn, train, factors, s, missingPolicy, maxRounds);
+    if (!best || r.rho > best.rho) best = r;
+  }
+  const sum = best.w.reduce((a, b) => a + b, 0);
+  const normW = sum > 0 ? best.w.map(x => Math.round(x / sum * 1000) / 10) : best.w.map(() => Math.round(1000 / best.w.length) / 10);
+  const newFactors = applyWeights(factors, normW);
+  const zeroedFields = newFactors.filter(f => f.weight <= zeroEps).map(f => f.field);
+
+  return {
+    factors: newFactors,
+    rhoTrainBefore: gainTrainBefore, rhoTrainAfter: best.rho,
+    rhoTestBefore: objFn(test, applyWeights(factors, curWeights), missingPolicy),
+    rhoTestAfter: objFn(test, newFactors, missingPolicy),
+    zeroedFields, nTrain: train.length, nTest: test.length,
+  };
+}
+
+// ---------- 因子推荐：贪心前向，按 held-out 边际 ρ 排（抗过拟合）----------
+// 从 startFactors 出发（组合路径模式）或从空（探索全路径模式，startFactors=[]），每步选
+// 「加进去让验证段 ρ 涨最多」的候选，加入，再算下一步 → 一条 a→b→c 路径。
+// 口径：区间/边界在【训练段】推导（减少泄漏），权重 autoWeights，目标函数在【验证段】评估；
+// 同时给样本内 Δ 供对照（两者背离大=过拟合迹象）。候选先按 |AUC−0.5| 预筛控算力。
+// candidates: [{ field, camp, interval, auc }]（两阵营合并，需带 interval）。
+// opts.scoreFn 同 factorMarginalRho，默认 scorePoolRho——注入而不是写死，避免"换目标函数"要在
+// 多处复制这条贪心搜索逻辑。
+// 返回 { path:[{field,camp,deltaTest,deltaIn,testRho,inRho,overfit}], baseTestRho, nTrain, nTest }。
+export function recommendFactorPath(rows, startFactors, candidates, opts = {}) {
+  const { threshold = WIN_THRESHOLD, missingPolicy = 'zero', shape = 'trap',
+    maxSteps = 6, minGain = 0.003, trainRatio = 0.7, timeField = 'swapBeginTime',
+    splitMethod = 'time', candLimit = 50, batchSize = 10, scoreFn = scorePoolRho } = opts;
+  const { train, test } = splitTrainTest(rows, splitMethod, trainRatio, timeField);
+  const scoreOf = (rowsSet, factorSet) => scoreFn(rowsSet, factorSet, missingPolicy);
+  // 候选：必须有区间；按 |AUC−0.5| 预筛到 candLimit 个控算力；排除已在起点池里的
+  const startKeys = new Set((startFactors || []).map(f => f.camp + ':' + f.field));
+  const pool = (candidates || [])
+    .filter(c => c && c.interval && !startKeys.has(c.camp + ':' + c.field))
+    .sort((a, b) => Math.abs((b.auc ?? 0.5) - 0.5) - Math.abs((a.auc ?? 0.5) - 0.5))
+    .slice(0, candLimit);
+  if (!pool.length) return { path: [], baseTestRho: NaN, nTrain: train.length, nTest: test.length, error: '没有可推荐的候选（先扫描）' };
+
+  const buildOf = (specs, rowsForBuild) => buildFactors(rowsForBuild, candidates, specs, threshold, { shape }).factors;
+  let pathSpecs = (startFactors || []).map(f => ({ field: f.field, camp: f.camp }));
+  const chosen = new Set(startKeys);
+  let baseTestRho = pathSpecs.length ? scoreOf(test, autoWeights(buildOf(pathSpecs, train))) : NaN;
+  let baseInRho = pathSpecs.length ? scoreOf(rows, autoWeights(buildOf(pathSpecs, train))) : NaN;
+  const path = [];
+
+  for (let step = 0; step < maxSteps; step++) {
+    let best = null;
+    // evaluate pool in batches to avoid blocking the event loop
+    for (let i = 0; i < pool.length; i += batchSize) {
+      const batch = pool.slice(i, i + batchSize);
+      for (const c of batch) {
+        const key = c.camp + ':' + c.field;
+        if (chosen.has(key)) continue;
+        const specs = [...pathSpecs, { field: c.field, camp: c.camp }];
+        const built = autoWeights(buildOf(specs, train));
+        const testRho = scoreOf(test, built);
+        if (!Number.isFinite(testRho)) continue;
+        const deltaTest = Number.isFinite(baseTestRho) ? testRho - baseTestRho : testRho;
+        if (!best || deltaTest > best.deltaTest) {
+          const inRho = scoreOf(rows, built);
+          best = { field: c.field, camp: c.camp, testRho, inRho, deltaTest,
+                   deltaIn: Number.isFinite(baseInRho) ? inRho - baseInRho : inRho };
+        }
+      }
+      // synchronous version for Node tests: no yielding
+    }
+    if (!best || !(best.deltaTest > minGain)) break;
+    best.overfit = Number.isFinite(best.deltaIn) && best.deltaIn > 0 && best.deltaTest < best.deltaIn * 0.4;
+    path.push(best);
+    pathSpecs = [...pathSpecs, { field: best.field, camp: best.camp }];
+    chosen.add(best.camp + ':' + best.field);
+    baseTestRho = best.testRho; baseInRho = best.inRho;
+  }
+  return { path, baseTestRho, nTrain: train.length, nTest: test.length };
+}
+
+// Mode A: 从当前池出发（动态组合路径）
+export function buildPathFromPool(rows, currentFactors, candidates, opts = {}) {
+  return recommendFactorPath(rows, currentFactors, candidates, opts);
+}
+
+// Mode B: 从空池出发（独立探索从零最优路径）
+export function buildPathFromZero(rows, candidates, opts = {}) {
+  return recommendFactorPath(rows, [], candidates, opts);
 }
 
 // ---------- 打分与回测 ----------
@@ -425,6 +732,24 @@ export function sweepScoreCutoffs(scored, winThreshold = WIN_THRESHOLD, step = 2
     });
   }
   return { points, base };
+}
+
+// 推荐触发阈值：在扫描网格里找"净超额命中数"最大的 cut——
+// 净超额命中数 = 触发数 × (命中率 − 基准命中率) = 比随机抓同样多样本多命中了多少个高倍盘。
+// 这个指标天然在"命中率"和"捕获率"之间做权衡，不用像 F1 那样瞎猜权重；
+// 只对触发数 ≥ minN 的档位候选，避免顶部样本量太小（几十个）时的噪声档位被选中。
+export function recommendCutoff(sweep, opts = {}) {
+  const { minTriggered = 20, minFrac = 0.05 } = opts;
+  const { points, base } = sweep || {};
+  if (!points?.length || !base?.n) return null;
+  const minN = Math.max(minTriggered, Math.ceil(base.n * minFrac));
+  let best = null;
+  for (const p of points) {
+    if (!Number.isFinite(p.hitRate) || p.triggered < minN) continue;
+    const excess = p.triggered * (p.hitRate - base.baseRate);
+    if (!best || excess > best.excess + 1e-9) best = { ...p, excess };
+  }
+  return best;
 }
 
 export function backtestFactors(rows, factors, winThreshold = WIN_THRESHOLD, scoreOpts = {}) {

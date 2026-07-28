@@ -1,5 +1,5 @@
-import React from 'react';
-import { Typography, Alert, Row, Col, Statistic, Table, Checkbox } from 'antd';
+import React, { useMemo, useState } from 'react';
+import { Typography, Alert, Row, Col, Statistic, Table, Checkbox, Card, Space, InputNumber, Button, App as AntApp } from 'antd';
 import PlotlyChart from '../PlotlyChart.jsx';
 
 // "总分 vs 收益"整块：score-return 相关性统计 + 散点图 + 分位桶胜率表 + 样本外验证。
@@ -7,8 +7,26 @@ import PlotlyChart from '../PlotlyChart.jsx';
 // 哪怕 score 恒为占位常数，也老实展示"没有变化，算不出相关性"，而不是这块直接消失。
 export default function ScoreReturnPanel({
   scoreReturnStats, factorEffectiveness, scoreScatterFig, scoreBuckets, scoreReturnPairsLength,
-  oosEnabled, onOosEnabledChange, scoreReturnOOS,
+  oosEnabled, onOosEnabledChange, scoreReturnOOS, scoreReturnPairs,
 }) {
+  const { message } = AntApp.useApp();
+  // 自定义条件筛CA：returnMax > minReturn 且 score < maxScore（对应散点图左上角那一撮"高分本该
+  // 拦住但没拦住/低分却翻倍"的点）——数值任填，不锁死具体倍数/分数，跟"低分高倍复盘"是同一类工具，
+  // 只是这里筛的是当前策略的真实 score，不是回测·因子面板里的打分池 score。
+  const [minReturn, setMinReturn] = useState(2);
+  const [maxScore, setMaxScore] = useState(30);
+  const filteredPairs = useMemo(() => {
+    if (!scoreReturnPairs || !scoreReturnPairs.length) return [];
+    return scoreReturnPairs
+      .filter(p => p.ret > minReturn && p.score < maxScore)
+      .sort((a, b) => b.ret - a.ret);
+  }, [scoreReturnPairs, minReturn, maxScore]);
+  async function copyFilteredCAs() {
+    try {
+      await navigator.clipboard.writeText(filteredPairs.map(p => p.addr).filter(Boolean).join('\n'));
+      message.success(`已复制 ${filteredPairs.length} 个 CA`);
+    } catch { message.error('复制失败，请手动从表格里复制'); }
+  }
   if (!scoreReturnStats) return null;
   return (
     <>
@@ -48,6 +66,35 @@ export default function ScoreReturnPanel({
             </span>
           } />
           {scoreScatterFig && <PlotlyChart traces={scoreScatterFig.traces} layout={scoreScatterFig.layout} />}
+          <Card size="small" title={`按条件筛CA（${filteredPairs.length} 个）`} style={{ marginTop: 12 }}
+            extra={<Button size="small" disabled={!filteredPairs.length} onClick={copyFilteredCAs}>
+              复制 {filteredPairs.length} 个 CA
+            </Button>}>
+            <Space wrap style={{ marginBottom: 8 }}>
+              <span style={{ fontSize: 12 }}>returnMax &gt;</span>
+              <InputNumber size="small" min={0} step={0.5} style={{ width: 80 }}
+                value={minReturn} onChange={v => setMinReturn(v ?? 0)} />
+              <span style={{ fontSize: 12 }}>且 score &lt;</span>
+              <InputNumber size="small" style={{ width: 80 }}
+                value={maxScore} onChange={v => setMaxScore(v ?? 0)} />
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                对应散点图里"高分本该拦住但没拦住/低分却翻倍"的那一撮点，任意组合两个条件都能筛
+              </Typography.Text>
+            </Space>
+            {filteredPairs.length === 0
+              ? <Typography.Text type="secondary" style={{ fontSize: 12 }}>当前条件下没有匹配样本。</Typography.Text>
+              : <Table size="small" rowKey="addr" pagination={{ pageSize: 10, size: 'small' }}
+                  dataSource={filteredPairs}
+                  columns={[
+                    { title: 'CA', dataIndex: 'addr', width: 220,
+                      render: v => v ? <code style={{ fontSize: 11 }}>{v}</code> : '-' },
+                    { title: 'symbol', dataIndex: 'symbol', width: 100 },
+                    { title: 'score', dataIndex: 'score', width: 80, align: 'right',
+                      sorter: (a, b) => a.score - b.score, render: v => v.toFixed(1) },
+                    { title: 'returnMax', dataIndex: 'ret', width: 100, align: 'right',
+                      sorter: (a, b) => a.ret - b.ret, render: v => v.toFixed(2) + 'x' },
+                  ]} />}
+          </Card>
           {/* score 分位 vs 胜率：定/调 CUTOFF 之前先看这个——不单调就别调阈值。
               每桶胜率带 Wilson 95% 置信区间，桶样本量小（20 条上下）时区间宽到 ±20
               个百分点是常态，单个桶的点估计别当真，看的是整体趋势是否单调。 */}

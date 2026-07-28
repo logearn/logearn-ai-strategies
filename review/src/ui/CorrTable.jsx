@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { Card, Table, Select, InputNumber, Space, Tag, Tooltip, Typography, Button } from 'antd';
+import { Card, Table, Select, InputNumber, Space, Tag, Tooltip, Typography, Button, Switch } from 'antd';
 import { computeCorrelations } from '../lib/data.js';
 import { getFieldDesc } from '../lib/dictionary.js';
 import { loadHiddenFields, saveHiddenFields, addHidden, removeHidden, filterHidden } from '../lib/tableHiddenFields.js';
@@ -11,14 +11,18 @@ const num = (v, d = 4) => (Number.isFinite(v) ? v.toFixed(d) : '-');
 export default function CorrTable({ rows }) {
   const [target, setTarget] = useState('returnMax');
   const [minQuality, setMinQuality] = useState(0);
+  // 只看显著：按主指标 Spearman ρ 的 p 值筛（p.p，见 computeCorrelations），不是线性 r 的 p——
+  // 用户反馈过"p 数值不对"就是因为之前这列算的是 r 的 p，跟加★的 ρ 对不上。
+  const [onlySignificant, setOnlySignificant] = useState(false);
   const [hidden, setHidden] = useState(() => loadHiddenFields('corr'));
   const hide = f => { const n = addHidden(hidden, f); setHidden(n); saveHiddenFields('corr', n); };
   const restore = f => { const n = removeHidden(hidden, f); setHidden(n); saveHiddenFields('corr', n); };
   const restoreAll = () => { setHidden([]); saveHiddenFields('corr', []); };
   const all = useMemo(() => (rows.length ? computeCorrelations(rows) : []), [rows]);
   const list = useMemo(
-    () => filterHidden(all.filter(x => x.target === target && (x.quality ?? 100) >= minQuality), hidden, r => r.feature),
-    [all, target, minQuality, hidden]);
+    () => filterHidden(all.filter(x => x.target === target && (x.quality ?? 100) >= minQuality
+      && (!onlySignificant || (Number.isFinite(x.p) && x.p < 0.05))), hidden, r => r.feature),
+    [all, target, minQuality, onlySignificant, hidden]);
 
   // 候选池治理摘要：这些字段不是"测了不显著"，是根本没进检验。
   // 说清楚很重要——多重比较校正的 m 按参与检验的字段数算，池子越干净真信号越容易冒头。
@@ -46,9 +50,12 @@ export default function CorrTable({ rows }) {
       sorter: (a, b) => Math.abs(a.r ?? 0) - Math.abs(b.r ?? 0),
       render: v => <span style={{ opacity: .5 }}>{num(v)}</span> },
     { title: 'n', dataIndex: 'n', width: 70, align: 'right', sorter: (a, b) => a.n - b.n },
-    { title: 'p', dataIndex: 'p', width: 100, align: 'right',
+    { title: <Tooltip title="Spearman ρ 的双侧 p 值（Fisher z 变换近似）——对应加★的主指标，不是 r·参考 那一列的显著性">p</Tooltip>,
+      dataIndex: 'p', width: 100, align: 'right',
       sorter: (a, b) => (Number.isFinite(a.p) ? a.p : 2) - (Number.isFinite(b.p) ? b.p : 2),
-      render: v => (Number.isFinite(v) ? v.toExponential(2) : '-') },
+      render: v => <span style={{ color: Number.isFinite(v) && v < 0.05 ? '#30d158' : undefined }}>
+        {Number.isFinite(v) ? v.toExponential(2) : '-'}
+      </span> },
     { title: '提示', width: 150, render: (_, r) => <>
         {r.outlierDriven && <Tag color="warning" title="去掉极端值后相关性大幅变化，是被少数离群点带出来的">离群驱动</Tag>}
         {r.unstable && <Tag color="warning" title="前后两半数据的相关性方向或强度差异明显">不稳定</Tag>}
@@ -69,6 +76,12 @@ export default function CorrTable({ rows }) {
           options={TARGETS.map(t => ({ value: t, label: t }))} />
         <span style={{ fontSize: 12 }}>质量分 ≥</span>
         <InputNumber size="small" min={0} max={100} value={minQuality} onChange={v => setMinQuality(v || 0)} style={{ width: 70 }} />
+        <Tooltip title="按 Spearman ρ 的 p 值筛（p<0.05），未经多重比较校正——字段多时假阳性会偏多，仅作粗筛">
+          <Space size={4}>
+            <Switch size="small" checked={onlySignificant} onChange={setOnlySignificant} />
+            <span style={{ fontSize: 12 }}>仅显著（p&lt;0.05）</span>
+          </Space>
+        </Tooltip>
       </Space>}>
       {exTotal > 0 && (
         <Tooltip title={exEntries.map(([k, v]) => `${exLabels[k] || k}：${v.join('、')}`).join('\n')}>

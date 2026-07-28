@@ -2,16 +2,17 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Card, Button, Space, Table, Alert, Statistic, Row, Col, Typography, Input, Select, InputNumber, message, Modal, Checkbox, Tag } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
 import { compileStrategy, runStrategyOnRow, aggregateCheckStats, aggregateScoreStats,
-         parseFactorCheck, buildStrategyVerdict, detectTimeReads } from '../lib/proAnalytics.js';
-import { median, pearson, pearsonPValue, splitTrainTest } from '../lib/utils.js';
+         parseFactorCheck, buildStrategyVerdict, detectTimeReads, extractScoreReturnPair } from '../lib/proAnalytics.js';
+import { median, pearson, pearsonPValue, splitTrainTest, benjaminiHochbergAdjust } from '../lib/utils.js';
 import { getFieldDesc } from '../lib/dictionary.js';
 import { hasAllChecksArchitecture, buildAllChecksRow, insertIntoAllChecks, buildCampCheckLine,
          insertLineIntoStrategySrc, findFieldConflict, applyWeightsToSrc,
          removeCheckLineFromSrc, applyChangeSetToSrc, reAddFactorLine, removeCheckLineByField } from '../lib/campLibrary.js';
 import { computeScoreReturnStats, computeScoreBuckets, campRangeText, campRangeBounds,
          FACTOR_WEIGHT_DEFAULT, suggestWeightAdjustment, factorVerdict, computeStrategyMetrics,
-         crossDayVerdict, CROSS_DAY_MIN_STREAK } from '../lib/strategyReplayLogic.js';
-import { loadBacktestReports, todayDateStr } from '../lib/backtestReports.js';
+         crossDayVerdict, CROSS_DAY_MIN_STREAK, metricsFromStrategyMetrics,
+         buildReplayReportMetrics } from '../lib/strategyReplayLogic.js';
+import { loadBacktestReports, saveBacktestReports, addBacktestReport, addOptimizationReportPair, todayDateStr } from '../lib/backtestReports.js';
 import { checkStrategySpec, applySpecFix, applyAllSpecFixes } from '../lib/strategySpec.js';
 import { loadRemovedFactors, saveRemovedFactors, addRemovedFactor, dropRemovedFactor } from '../lib/removedFactors.js';
 import { useGroupedFieldOptions, renderFieldOption, fieldFilterOption } from './fieldOptions.jsx';
@@ -19,14 +20,15 @@ import { HardConditionsTable, FactorEffectivenessTable } from './strategyReplay/
 import ScoreReturnPanel from './strategyReplay/ScoreReturnPanel.jsx';
 import ScoreFactorPanel from './strategyReplay/ScoreFactorPanel.jsx';
 import StrategyVersions from './strategyReplay/StrategyVersions.jsx';
-import BacktestReports from './strategyReplay/BacktestReports.jsx';
 import TodoList from './strategyReplay/TodoList.jsx';
+import OnlineExportPanel from './strategyReplay/OnlineExportPanel.jsx';
 import { plotColors } from '../theme.js';
 
-const CODE_KEY = 'chart_strategy_diag_code_react';
-
-export default function StrategyReplay({ rows, fields = [], light, onLabel, onExclude, pendingLines, onConsumePendingLines }) {
-  const [src, setSrc] = useState(() => localStorage.getItem(CODE_KEY) || '');
+export default function StrategyReplay({ rows, fields = [], light, onLabel, onExclude, pendingLines, onConsumePendingLines,
+  strategyCode, onStrategyCodeChange, reportsVersion, onReportsChange }) {
+  // 策略源码由 App 提升管理（跟「找因子」tab 共用同一份 state + 持久化），这里不再自己 useState/
+  // 读 localStorage——避免两个 tab 常驻挂载时各自缓存一份旧值、编辑了却互相看不见的问题。
+  const src = strategyCode;
   const [sampleResults, setSampleResults] = useState([]); // 逐样本原始回放结果，供下面的明细表+条形图钻取用
   // 记录"产出当前 sampleResults 的那份代码"。下面所有统计表（硬性条件/因子/打分）都是这份代码
   // 真跑一遍 emit 出来的，不是对 src 做静态解析。所以只要 src 改了还没重跑，表里显示的就是
@@ -49,10 +51,13 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
   const [preview, setPreview] = useState(null); // { title, before, after, next, removedLines, adjustedCount }
   // 已删因子回收站（持久化）——删掉的因子行原文留一份，可"加回来"
   const [removedFactors, setRemovedFactors] = useState(loadRemovedFactors);
+  // 存报告：日期/备注就地存在"策略"tab（用户明确要求不用切去"报告"tab 才能存）——
+  // "报告"tab（BacktestReports）只保留查看/对比/导出，存档动作留在这里，跟刚跑出来的结果挨在一起。
+  const [reportDate, setReportDate] = useState(todayDateStr);
+  const [reportNote, setReportNote] = useState('');
   const fieldOptions = useGroupedFieldOptions(fields);
-  // 存了一份回测报告后 +1，传给 TodoList 触发它重新算"哪天还没存档"——两个组件各自独立读
-  // localStorage，不共享 state，用这个计数器当轻量的"该重新读一次了"信号。
-  const [reportsVersion, setReportsVersion] = useState(0);
+  // reportsVersion/onReportsChange 由 App.jsx 管，在这里既当"读"信号（crossDayOf/TodoList 感知
+  // 存档变化）也当"写"信号（saveReport/confirmPreview 存完新报告都要 bump 它，让"报告"tab 感知到）。
 
   // 把一条 check 追加到策略代码里。
   // 生成 f('字段') 形式——分析字段（features）在策略里要通过 f 访问，不能写 ctx.xxx
@@ -196,12 +201,13 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
     return agg.ranked.filter(st => st.name !== '总分' && !/权重/.test(String(st.expect || '')));
   }, [agg]);
 
-  // 因子有效性一键分析：不管一项现在是硬条件还是打分项，只要它的"实际值"能解析出一个
-  // 有限数字，就把它跟 log(收益) 算单变量相关性——这是判断"这项该不该挪进打分池、
-  // 该给多大权重"的直接依据，之前几轮都是手写 node 脚本干这件事，现在收进工具里。
-  // 硬条件的 value 是纯数字字符串（比如"1800"）；打分因子的 value 是"25 → 1.0分"这种带
-  // 箭头的格式；平台/AO 这类值本身不是单个数字（地址、"5.00e+0/3.00e+0"）解析不出来就跳过，
-  // 不强算一个没意义的数字。
+  // 因子有效性一键分析：只看当前已经在打分池里的项（硬条件不参与打分、改权重不生效，
+  // 且硬性条件清单表已经单独列出来了，这里不重复）。只要它的"实际值"能解析出一个有限数字，
+  // 就把它跟 log(收益) 算单变量相关性——这是判断"该给多大权重"的直接依据，之前几轮都是
+  // 手写 node 脚本干这件事，现在收进工具里。
+  // 打分因子的 value 是"25 → 1.0分"这种带箭头的格式；解析不出数字的跳过，不强算。
+  // 同批算了 n 项（多重比较），跟这个代码库其他扫描面板（AUC/相关性）一样做 BH-FDR 校正，
+  // 否则测的项一多，纯噪声也会有假阳性冒出来。
   const factorEffectiveness = useMemo(() => {
     if (!freshResults.length) return [];
     const byName = new Map();
@@ -214,7 +220,8 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
       for (const c of res.checks) {
         if (c.name === '总分') continue;
         const isFactor = /权重/.test(String(c.expect || ''));
-        const rawName = isFactor ? c.name.replace(/\(分\)$/, '') : c.name;
+        if (!isFactor) continue;
+        const rawName = c.name.replace(/\(分\)$/, '');
         const valStr = String(c.value);
         let val = null;
         const arrowMatch = valStr.match(/^(-?[\d.]+)\s*→/);
@@ -231,16 +238,19 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
       const r = pearson(pairs);
       out.push({ name, n: pairs.length, r, p: pearsonPValue(r, pairs.length), isFactor, expect });
     }
+    const pAdj = benjaminiHochbergAdjust(out.map(f => f.p));
+    out.forEach((f, i) => { f.pAdj = pAdj[i]; });
     out.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
     return out;
   }, [freshResults]);
 
-  // 推荐权重：只给"当前已经是打分项"的字段算——硬条件字段就算相关性再强，权重改了也不生效
-  // （还在 VETO_NAMES 里），要不要把它挪进打分组是判断题，工具不替你做这个决定，
-  // 只负责把已经在打分池里的这些字段，权重按 |r| 等比例缩放（最强的那个给 10，其余按比例，
-  // 下限 1——不能有字段权重变 0，见 code-score.js 那次"占位 0 没人记得改"的教训）。
+  // 推荐权重：只给"校正后仍显著"（pAdj<0.05）的打分项算——同批测了多个字段，原始 p 没校正过就
+  // 拿来排权重，等于在用可能是噪声的相关性指挥调参，跟"校正后显著"这个判定自相矛盾。字段不多、
+  // 效应又不够强时，完全可能一个都过不了校正——这时如实说"没有可推荐的"，不该硬凑一个出来。
+  // 权重按 |r| 等比例缩放（最强的那个给 10，其余按比例，下限 1——不能有字段权重变 0，
+  // 见 code-score.js 那次"占位 0 没人记得改"的教训）。
   const recommendedWeights = useMemo(() => {
-    const factorRows = factorEffectiveness.filter(f => f.isFactor);
+    const factorRows = factorEffectiveness.filter(f => f.isFactor && Number.isFinite(f.pAdj) && f.pAdj < 0.05);
     if (!factorRows.length) return [];
     const maxAbsR = Math.max(...factorRows.map(f => Math.abs(f.r)));
     if (!(maxAbsR > 0)) return [];
@@ -321,7 +331,7 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
     setPreview({ title, before, after, oos, next, removedLines, adjustedCount, changeSet });
   }
 
-  // 确认应用试算：真写回代码 + 把删掉的因子塞进回收站 + 重跑
+  // 确认应用试算：真写回代码 + 把删掉的因子塞进回收站 + 重跑 + 自动存一对优化前/后报告
   function confirmPreview() {
     if (!preview) return;
     save(preview.next);
@@ -330,7 +340,24 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
       for (const r of preview.removedLines) list = addRemovedFactor(list, r);
       setRemovedFactors(list); saveRemovedFactors(list);
     }
-    message.success(`已应用：调整 ${preview.adjustedCount} 个、删除 ${preview.removedLines.length} 个，已重新回放`);
+    let savedNote = '';
+    // 试算时已经算好 before/after（computeStrategyMetrics），确认应用这一刻直接落成报告——
+    // 不用用户再手动点一次"存报告"，试算→确认这个动作本身就该留痕，方便日后跟别的天对比看
+    // 这次优化到底有没有用（BacktestReports 对比弹窗会据此给"保留/观察/回退"的建议）。
+    if (preview.before?.ok && preview.after?.ok) {
+      const removedNames = preview.removedLines.map(r => r.name).join('、');
+      const changeSummary = `调整${preview.adjustedCount}个权重、删除${preview.removedLines.length}个因子${removedNames ? `（${removedNames}）` : ''}`;
+      const nextReports = addOptimizationReportPair(loadBacktestReports(), {
+        date: todayDateStr(), beforeCode: src, afterCode: preview.next,
+        beforeMetrics: metricsFromStrategyMetrics(preview.before),
+        afterMetrics: metricsFromStrategyMetrics(preview.after),
+        changeSummary,
+      });
+      saveBacktestReports(nextReports);
+      onReportsChange?.();
+      savedNote = '，已自动存一对优化前/后报告';
+    }
+    message.success(`已应用：调整 ${preview.adjustedCount} 个、删除 ${preview.removedLines.length} 个，已重新回放${savedNote}`);
     if (rows.length) run(preview.next);
     setPreview(null);
   }
@@ -393,22 +420,21 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
   const scoreReturnPairs = useMemo(() => {
     const out = [];
     for (const r of freshResults) {
-      const res = r.res;
-      if (!res || res.error || !Array.isArray(res.checks)) continue;
-      const totalCheck = res.checks.find(c => c.name === '总分');
-      if (!totalCheck) continue;
-      const score = parseFloat(totalCheck.value);
-      const ret = Number(r.row.returnMax);
-      if (!Number.isFinite(score) || !Number.isFinite(ret) || ret <= 0) continue;
-      out.push({ score, ret, symbol: r.row.symbol, addr: r.row.tokenAddress, swapBeginTime: r.row.swapBeginTime });
+      // extractScoreReturnPair：取【硬否决通过】的全部样本（命中 + veto过但分低），排除 veto 未过。
+      // 分数优先读 checks 的 '总分'，缺失时回退日志 SCORE= 标记——这样"总分 push 在 return 之后"
+      // 的策略也能把 score<cutoff 的样本画进散点，而不是只剩命中侧那一撮。
+      const pair = extractScoreReturnPair(r.res, r.row);
+      if (!pair) continue;
+      out.push({ ...pair, symbol: r.row.symbol, addr: r.row.tokenAddress, swapBeginTime: r.row.swapBeginTime });
     }
     return out;
   }, [freshResults]);
 
   const scoreReturnStats = useMemo(() => computeScoreReturnStats(scoreReturnPairs), [scoreReturnPairs]);
 
-  // 北极星提示：单调性 ρ（score↔returnMax 的 spearman，就是散点图底下那个 ρ）是这个项目的
-  // 唯一北极星指标。用户要求"以后有改动就提示我"——不只调权建议试算，任何触发重跑的改动
+  // 北极星提示：单调性 ρ（score↔returnMax 的 spearman，就是散点图底下那个 ρ）是这个项目北极星的
+  // 默认口径（筛垃圾类策略例外，改看过线/未过线分层台阶，见 lib/factorLab.js 的 scorePoolTierGain）。
+  // 用户要求"以后有改动就提示我"——不只调权建议试算，任何触发重跑的改动
   // （手动改代码、加条件、应用推荐权重、标垃圾改 returnMax、切过滤条件……）只要让 ρ 变了，
   // 就弹一个 toast 报"ρ 前→后、变强/变弱"。变化 <0.005 不打扰（浮点抖动/无实质变化）；
   // 第一次算出来没有对比基准，也不提示。ρ 变强用 success（绿）、变弱用 warning（黄）提醒。
@@ -525,7 +551,21 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
     return drillDown.checks.filter(c => c.name !== '总分' && !parseFactorCheck(c) && !c.ok);
   }, [drillDown]);
 
-  const save = v => { setSrc(v); try { localStorage.setItem(CODE_KEY, v); } catch { /* 隐私模式 */ } };
+  // 手动存一份"今天报告"快照——直接用这次回放已经算出来的 agg/scoreAgg/scoreReturnStats/
+  // scoreBuckets（跟 confirmPreview 自动存优化前/后报告同一套 buildReplayReportMetrics 口径），
+  // 存完 bump 一下 reportsVersion，让"报告"tab 立刻看到新存的这条。
+  const canSaveReport = !!agg;
+  function saveReport() {
+    if (!canSaveReport || !reportDate.trim()) return;
+    const metrics = buildReplayReportMetrics({ agg, scoreAgg, scoreReturnStats, scoreBuckets });
+    const next = addBacktestReport(loadBacktestReports(), { date: reportDate.trim(), code: src, note: reportNote, metrics });
+    saveBacktestReports(next);
+    setReportNote('');
+    message.success(`已存为 ${reportDate.trim()} 的回测报告，去「报告」tab 可查看/对比`);
+    onReportsChange?.();
+  }
+
+  const save = v => onStrategyCodeChange(v);
 
   // 从策略版本库加载一份存档：覆盖编辑框内容，跟"直接手动粘贴一份新代码"是同一件事，
   // 所以复用同一套自动重跑逻辑——已经跑过一次的话（hasRunOnce）改 src 会触发上面那个
@@ -545,22 +585,31 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
   useEffect(() => {
     if (!pendingLines || !pendingLines.length) return;
     let next = src;
-    let inserted = 0, updated = 0;
+    const insertedFields = [], updatedFields = [];
     const vetoSkipped = []; // 已是硬性条件的字段：改成打分项没意义（能进打分环节的样本必满足它），跳过
     for (const entry of pendingLines) {
       const conflict = findFieldConflict(next, entry.field);
       // 已经是硬否决 → 跳过（加成打分项无区分度）；已是打分项 → upsert：先删旧行再插新行（更新区间/权重）；
       // 不存在 → 直接插入。这样阵营库里"修正"后再发送，策略里的打分项会被更新，而不是撞出重复行。
       if (conflict && conflict.isVeto) { vetoSkipped.push(entry.field); continue; }
-      if (conflict) { next = removeCheckLineByField(next, entry.field).next; updated++; }
-      else inserted++;
+      if (conflict) { next = removeCheckLineByField(next, entry.field).next; updatedFields.push(entry.field); }
+      else insertedFields.push(entry.field);
       next = hasAllChecksArchitecture(next)
         ? insertIntoAllChecks(next, buildAllChecksRow(entry))
         : insertLineIntoStrategySrc(next, buildCampCheckLine(entry));
     }
     save(next);
-    if (inserted || updated) message.success(`已从阵营库${inserted ? `插入 ${inserted} 条` : ''}${inserted && updated ? '、' : ''}${updated ? `更新 ${updated} 条` : ''} check，重新回放看效果`);
+    // 具体列出字段名（而不只是数量）：切完 tab 之后一眼就能核对是不是刚才那几条，不用回代码框里翻找。
+    // 超过 4 个截断加"等 N 个"，避免消息条太长换行。
+    const fmtFieldList = list => (list.length <= 4 ? list.join('、') : `${list.slice(0, 4).join('、')} 等 ${list.length} 个`);
+    if (insertedFields.length || updatedFields.length) {
+      message.success({
+        content: `已从阵营库${insertedFields.length ? `插入「${fmtFieldList(insertedFields)}」` : ''}${insertedFields.length && updatedFields.length ? '，' : ''}${updatedFields.length ? `更新「${fmtFieldList(updatedFields)}」` : ''}，重新回放看效果`,
+        duration: 4,
+      });
+    }
     if (vetoSkipped.length) message.warning(`${vetoSkipped.join('、')} 已是硬性条件（一票否决），未改成打分项`);
+    const inserted = insertedFields.length, updated = updatedFields.length;
     onConsumePendingLines?.();
     if ((inserted || updated) && rows.length) run(next);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -613,6 +662,9 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
         style={{ fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12 }}
         placeholder={'const checks = [\n  ["买家数", ctx.buyer_count > 100, ctx.buyer_count, "> 100"],\n];\nreturn checks.every(c => c[1]);'} />
 
+      {/* 生成上线代码：编辑区只留策略本体，f 垫片在导出时按需装配 + 逐字段数值自检（详见 lib/onlineExport.js） */}
+      <OnlineExportPanel src={src} rows={rows} />
+
       {/* 策略代码规范校验：贴/改代码后实时提示违规，可自动修的一键修正（详见 策略代码规范.md）。 */}
       {src.trim() && specViolations.length > 0 && (
         <Alert type={specViolations.some(v => v.level === 'error') ? 'error' : 'warning'} showIcon style={{ marginTop: 8 }}
@@ -649,8 +701,18 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
       )}
 
       <StrategyVersions code={src} onLoad={loadVersion} />
-      <BacktestReports agg={agg} scoreAgg={scoreAgg} scoreReturnStats={scoreReturnStats} scoreBuckets={scoreBuckets}
-        code={src} light={light} onSaved={() => setReportsVersion(v => v + 1)} />
+      <Card size="small" style={{ marginTop: 12 }} styles={{ body: { padding: 8 } }}>
+        <Space wrap>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>回测报告存档：</Typography.Text>
+          <Input style={{ width: 140 }} value={reportDate} onChange={e => setReportDate(e.target.value)} placeholder="日期 YYYY-MM-DD" />
+          <Input style={{ width: 220 }} value={reportNote} onChange={e => setReportNote(e.target.value)} placeholder="备注（可选）" onPressEnter={saveReport} />
+          <Button size="small" type="primary" disabled={!canSaveReport || !reportDate.trim()} onClick={saveReport}
+            title={canSaveReport ? '' : '先点上方「在当前数据源回放」跑出结果，才能存档'}>
+            存为今天报告
+          </Button>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>存档的查看/对比/导出在单独的「报告」tab。</Typography.Text>
+        </Space>
+      </Card>
       {err && <Alert type="warning" showIcon style={{ marginTop: 12 }} message={err} />}
 
       {/* 表格已过期提示：src 改了但还没重跑（ranCode 是上一次回放的代码）。下面所有表都是 ranCode
@@ -701,6 +763,25 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
                 </div>
               } />
           )}
+          {/* 回放报错诊断：res.error 的样本压根没跑完（既算不出分、也进不了散点）。
+              界面只显示一个红色数字看不出原因，这里按去重后的报错文案列出来——
+              最常见是"缺快照(没 rawCtx)"或策略读了 undefined 属性。 */}
+          {agg.errored > 0 && (
+            <Alert type="error" showIcon style={{ marginTop: 12 }}
+              message={
+                <div style={{ fontSize: 12, lineHeight: 1.8 }}>
+                  <b>{agg.errored}</b> 条样本<b>回放报错</b>——策略在这些样本上抛了异常、没跑完，所以既不算命中/未命中，也进不了"总分 vs 收益"散点。
+                  {agg.errorReasons && agg.errorReasons.length > 0 && (
+                    <><br />报错原因（按出现次数）：
+                      {agg.errorReasons.map((x, i) => (
+                        <div key={i} style={{ opacity: .8, paddingLeft: 8 }}>· ×{x.count}　{x.reason}</div>
+                      ))}
+                    </>
+                  )}
+                  <br />常见原因：① 该样本没有原始快照（<code>rawCtx</code> 缺失，历史数据没存下来）；② 策略读了当前数据源里不存在的字段/结构（如 <code>ao_bars</code>、<code>chip_analysis</code> 为空时点属性）。第 ② 类加个 <code>?.</code> 兜底或前置判空即可。
+                </div>
+              } />
+          )}
           {/* 未命中的账拆开——回答"单点否决合计为什么对不上未命中数"：
               命中 + 只卡1条（= 各条单点否决之和）+ 卡≥2条 = 总数。
               差额就是被多条 check 同时拦掉的样本，放宽任何单一条件都还是过不了。 */}
@@ -721,7 +802,7 @@ export default function StrategyReplay({ rows, fields = [], light, onLabel, onEx
           <ScoreReturnPanel
             scoreReturnStats={scoreReturnStats} factorEffectiveness={factorEffectiveness}
             scoreScatterFig={scoreScatterFig} scoreBuckets={scoreBuckets}
-            scoreReturnPairsLength={scoreReturnPairs.length}
+            scoreReturnPairsLength={scoreReturnPairs.length} scoreReturnPairs={scoreReturnPairs}
             oosEnabled={oosEnabled} onOosEnabledChange={setOosEnabled} scoreReturnOOS={scoreReturnOOS} />
           <ScoreFactorPanel
             scoreAgg={scoreAgg} sampleRows={sampleRows} onLabel={onLabel} onExclude={onExclude}
@@ -755,8 +836,9 @@ function WeightSuggestionPreview({ preview, onCancel, onConfirm }) {
   const fmtPct = v => (v == null ? '-' : (v * 100).toFixed(1) + '%');
   const fmtX = v => (v == null ? '-' : v.toFixed(2) + 'x');
   const fmtR = v => (v == null ? '-' : v.toFixed(3));
-  // 判定北极星＝score↔倍率的强单调性（spearman ρ），跟散点图底下那个 ρ 同口径：高倍集中高分、
-  // 低倍落低分，越强越好。高倍率命中率（>2x/>5x/>10x）是"高倍有没有真的落到高分侧"的体现，共同判据。
+  // 判定北极星默认口径＝score↔倍率的强单调性（spearman ρ），跟散点图底下那个 ρ 同口径：高倍集中高分、
+  // 低倍落低分，越强越好（筛垃圾类策略的北极星走分层台阶例外，此弹窗仍按默认 ρ 口径展示试算对比）。
+  // 高倍率命中率（>2x/>5x/>10x）是"高倍有没有真的落到高分侧"的体现，共同判据。
   // 通过率中性不上色；r(log) 佐证。
   const hasRemoves = removedLines.length > 0;
   const fmtRho = v => (v == null ? '-' : v.toFixed(3));

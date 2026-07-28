@@ -28,7 +28,7 @@ export function todayDateStr() {
   return localDateStr(new Date());
 }
 
-export function addBacktestReport(list, { date, code, note, metrics }) {
+export function addBacktestReport(list, { date, code, note, metrics, kind = 'daily', pairId = null, changeSummary = null }) {
   const item = {
     id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     date,
@@ -36,8 +36,27 @@ export function addBacktestReport(list, { date, code, note, metrics }) {
     note: note || '',
     metrics,
     savedAt: Date.now(),
+    kind,          // 'daily'（手动存的日报）| 'optimized'（应用调权/优化建议时自动存）
+    pairId,        // 'optimized' 报告成对出现（优化前/优化后），同一次优化共享此 id
+    changeSummary, // 优化报告的改动摘要，如「调整3个权重、删除1个因子（xxx）」
   };
   return [item, ...list];
+}
+
+// 应用一次"调权/优化建议"时，把 before/after 两份指标打包存成一对报告（同一个 pairId）。
+// 直接复用 openPreview/confirmPreview 里已经算好的 before/after 指标（转换成报告口径），
+// 不用用户额外点一次"存报告"——试算→确认这个动作本身就该留痕，方便日后跟别的天对比看这次优化到底有没有用。
+export function addOptimizationReportPair(list, { date, beforeCode, afterCode, beforeMetrics, afterMetrics, changeSummary }) {
+  const pairId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  let next = addBacktestReport(list, {
+    date, code: beforeCode, note: `优化前 · ${changeSummary}`, metrics: beforeMetrics,
+    kind: 'optimized', pairId, changeSummary,
+  });
+  next = addBacktestReport(next, {
+    date, code: afterCode, note: `优化后 · ${changeSummary}`, metrics: afterMetrics,
+    kind: 'optimized', pairId, changeSummary,
+  });
+  return next;
 }
 
 export function removeBacktestReport(list, id) {

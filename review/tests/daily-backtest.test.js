@@ -1,5 +1,6 @@
 import assert from 'node:assert';
-import { addBacktestReport, removeBacktestReport, localDateStr } from '../src/lib/backtestReports.js';
+import { addBacktestReport, removeBacktestReport, localDateStr,
+         addOptimizationReportPair } from '../src/lib/backtestReports.js';
 import { addTodo, toggleTodo, removeTodo, ignoreDate, unignoreDate,
          findMissingReportDates } from '../src/lib/todoList.js';
 
@@ -28,6 +29,41 @@ export function run(test) {
     const next = removeBacktestReport(list, targetId);
     assert.strictEqual(next.length, 1);
     assert.strictEqual(next[0].date, '2026-07-25');
+  });
+
+  test('addBacktestReport: 默认 kind=daily，pairId/changeSummary 默认 null', () => {
+    const list = addBacktestReport([], { date: '2026-07-24', code: 'a', metrics: {} });
+    assert.strictEqual(list[0].kind, 'daily');
+    assert.strictEqual(list[0].pairId, null);
+    assert.strictEqual(list[0].changeSummary, null);
+  });
+
+  test('addOptimizationReportPair: 存两条 kind=optimized 的报告，共享同一个 pairId，各自带 before/after 的 metrics 和 code', () => {
+    const before = { hitRate: 0.1, scoreReturn: { rho: 0.2 } };
+    const after = { hitRate: 0.15, scoreReturn: { rho: 0.3 } };
+    const list = addOptimizationReportPair([], {
+      date: '2026-07-24', beforeCode: 'old code', afterCode: 'new code',
+      beforeMetrics: before, afterMetrics: after, changeSummary: '调整2个权重、删除1个因子（foo）',
+    });
+    assert.strictEqual(list.length, 2);
+    assert.ok(list.every(r => r.kind === 'optimized'));
+    assert.strictEqual(list[0].pairId, list[1].pairId, '两条应共享同一个 pairId');
+    assert.strictEqual(list[0].changeSummary, '调整2个权重、删除1个因子（foo）');
+    // addBacktestReport 是"插到最前面"，所以 after 那条（后调用）应该排在最前面
+    assert.deepStrictEqual(list[0].metrics, after);
+    assert.deepStrictEqual(list[1].metrics, before);
+    assert.strictEqual(list[0].code, 'new code');
+    assert.strictEqual(list[1].code, 'old code');
+  });
+
+  test('addOptimizationReportPair: 追加到已有报告列表前面，不影响已有条目', () => {
+    let list = addBacktestReport([], { date: '2026-07-23', code: 'x', metrics: {} });
+    list = addOptimizationReportPair(list, {
+      date: '2026-07-24', beforeCode: 'a', afterCode: 'b',
+      beforeMetrics: { hitRate: 0.1 }, afterMetrics: { hitRate: 0.2 }, changeSummary: '调整1个权重',
+    });
+    assert.strictEqual(list.length, 3);
+    assert.strictEqual(list[2].date, '2026-07-23', '旧报告应还在最后');
   });
 
   test('localDateStr: 按本地日历日格式化，不受时区跨天影响到"用哪一天"的判断逻辑本身', () => {

@@ -5,7 +5,7 @@ import { useGroupedFieldOptions, renderFieldOption, fieldFilterOption } from './
 import FieldPickerModal from './FieldPickerModal.jsx';
 
 export default function ScatterBoard({ rows, fields, light, onAddToCampLibrary,
-  campGroups = [], campActiveGroup, onCampActiveGroupChange }) {
+  campGroups = [], campActiveGroup, onCampActiveGroupChange, isCampFieldExisting, isStrategyFactorField }) {
   const fieldOptions = useGroupedFieldOptions(fields);
   const [pick, setPick] = useState();
   const [charts, setCharts] = useState([]);
@@ -61,6 +61,7 @@ export default function ScatterBoard({ rows, fields, light, onAddToCampLibrary,
         <ScatterCard key={f} rows={rows} xField={f} yField="returnMax"
           colorField={colorField} light={light} onAddToCampLibrary={onAddToCampLibrary}
           campGroups={campGroups} campActiveGroup={campActiveGroup} onCampActiveGroupChange={onCampActiveGroupChange}
+          isCampFieldExisting={isCampFieldExisting} isStrategyFactorField={isStrategyFactorField}
           highlightCAs={highlightCAs}
           onRemove={() => setCharts(c => c.filter(x => x !== f))} />
       ))}

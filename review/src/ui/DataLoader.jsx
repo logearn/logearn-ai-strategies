@@ -1,13 +1,14 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState, startTransition } from 'react';
 import { Card, Upload, Button, Space, Typography, Alert, Progress, Tag, Checkbox, Popconfirm, Table, Select, Modal, Input, message } from 'antd';
 import { UploadOutlined, DeleteOutlined, FolderOpenOutlined, FolderAddOutlined, EditOutlined } from '@ant-design/icons';
 import { buildRows, readJson, detectFileKind } from '../lib/data.js';
 import { mergeDaily } from '../lib/mergeDaily.js';
 import { groupBatches, deriveBatchStrategy, groupKeyOf, UNNAMED, UNKNOWN_ID } from '../lib/dataArchive.js';
 import { loadFolders, saveFolders, addFolder, removeFolder, renameFolder } from '../lib/dataFolders.js';
-import { loadSliceCategories, saveSliceCategories, assignDays, daysInRange,
-         selectRowsBySlice, summarizeSlices, CATEGORIES, loadSliceSel, saveSliceSel, groupRowsByDay,
-         loadSliceScope, saveSliceScope, dayOf } from '../lib/dataSlices.js';
+import { loadSliceCategories, saveSliceCategories, assignDays, dayInRange,
+         selectRowsBySlice, summarizeSlices, CATEGORIES, loadSliceSel, saveSliceSel,
+         loadSliceScope, saveSliceScope, dayOf, strategyOf, sliceKeyOf,
+         loadDeletedDays, saveDeletedDays, filterDeletedRows } from '../lib/dataSlices.js';
 import * as idbStore from '../lib/dataStore.js';
 import * as fsStore from '../lib/fsStore.js';
 
@@ -51,6 +52,7 @@ export default function DataLoader({ onRows }) {
   const [sliceCats, setSliceCats] = useState(loadSliceCategories); // 天→类别 归类表（持久化）
   const [sliceSel, setSliceSel] = useState(loadSliceSel); // 当前分析范围（切片，持久化）
   const [sliceSelectedDays, setSliceSelectedDays] = useState([]); // 切片表勾选的天
+  const [deletedDays, setDeletedDays] = useState(loadDeletedDays); // 已持久删除的【策略×天】名单
   const [rangeStart, setRangeStart] = useState('');
   const [rangeEnd, setRangeEnd] = useState('');
   // 数据源管理（批次/文件夹归档）默认折叠——有持久化作用域时会自动载入训练集/基准库，让切片成为主体；
@@ -274,14 +276,23 @@ export default function DataLoader({ onRows }) {
   }
 
   // ── 时间切片：归类 + 按切片选分析范围 ──
+  // 归类以策略名为第一层维度（跟数据源管理归档树一个口径）。sliceCats/summarizeSlices/
+  // selectRowsBySlice 都按样本自带的 strategyName 走，不需要靠这里的 sliceKey 去区分——
+  // sliceKey 只用来记"上次分析选了哪个作用域"，供批次就绪后自动重新载入用。
   // 分析/自动载入的共同收尾：留住全量样本、记作用域、恢复上次的分析范围（切片）、把切好片的样本发下游。
-  function emitRows(rows, key) {
+  // 先过滤掉持久删除名单里的【策略×天】——不然刷新页面/重新点「分析」会从存储读回全量数据，
+  // 删过的天又出现了。
+  function emitRows(rawRows, key) {
+    const rows = filterDeletedRows(rawRows, deletedDays);
     setAllRows(rows);
     setSliceKey(key); saveSliceScope(key);
     let sel = loadSliceSel();
-    if (sel.mode === 'day' && !new Set(groupRowsByDay(rows).map(d => d.day)).has(sel.day)) sel = { mode: 'all' };
+    if (sel.mode === 'day') {
+      const stillValid = rows.some(r => strategyOf(r) === sel.strategyName && (dayOf(r.buyTimestamp) || '未知') === sel.day);
+      if (!stillValid) sel = { mode: 'all' };
+    }
     setSliceSel(sel); saveSliceSel(sel); setSliceSelectedDays([]);
-    onRows(selectRowsBySlice(rows, key, sliceCats, sel));
+    onRows(selectRowsBySlice(rows, sliceCats, sel));
   }
   // 启动自动载入"上次规划好的训练集/基准库"——不用再选批次点分析。只读已存批次，不碰上传/入库。
   const autoLoadedRef = useRef(false);
@@ -311,44 +322,146 @@ export default function DataLoader({ onRows }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [batches]);
 
-  const sliceSummary = useMemo(() => summarizeSlices(allRows, sliceKey, sliceCats), [allRows, sliceKey, sliceCats]);
-  // 归类一批天到某类别（cat=null 移出）；若当前分析范围按类别选，改完立刻重过滤重发
-  function assignSliceDays(days, cat) {
+  const sliceSummary = useMemo(() => summarizeSlices(allRows, sliceCats), [allRows, sliceCats]);
+  // 归类树：策略 → 天，供 Table 的 children 展开（跟数据源管理归档树同一个交互套路）。
+  const sliceTreeData = useMemo(() => sliceSummary.strategies.map(s => ({
+    key: 'st::' + s.strategyName, rowType: 'strategy', strategyName: s.strategyName, count: s.count, tally: s.tally,
+    daysAll: s.days.filter(d => d.day !== '未知').map(d => d.day),
+    children: s.days.length ? s.days.map(d => ({
+      key: `dy::${s.strategyName}::${d.day}`, rowType: 'day', strategyName: s.strategyName, day: d.day, count: d.count, category: d.category,
+    })) : undefined,
+  })), [sliceSummary]);
+  // key → {strategyName, day} 查表：勾选框返回的是 key 数组，批量操作要靠它还原成实际的"策略+天"。
+  const dayKeyMap = useMemo(() => {
+    const m = new Map();
+    for (const s of sliceTreeData) for (const c of (s.children || [])) m.set(c.key, { strategyName: c.strategyName, day: c.day });
+    return m;
+  }, [sliceTreeData]);
+  // 把 selectedRowKeys（可能混着策略行/天行的 key）归并成 Map<策略名, 天[]>，只取天行——
+  // 策略行的 key 本身不代表任何实际数据，checkStrictly=false 时它会跟着子节点一起出现在数组里。
+  function daysFromKeys(keys) {
+    const out = new Map();
+    for (const k of keys || []) {
+      const info = dayKeyMap.get(k);
+      if (!info) continue;
+      if (!out.has(info.strategyName)) out.set(info.strategyName, []);
+      out.get(info.strategyName).push(info.day);
+    }
+    return out;
+  }
+  const rowsOfKeys = (keys) => {
+    const grouped = daysFromKeys(keys);
+    if (!grouped.size) return [];
+    return allRows.filter(r => (grouped.get(strategyOf(r)) || []).includes(dayOf(r.buyTimestamp) || '未知'));
+  };
+  // 归类某策略的一批天到某类别（cat=null 移出）；改完立刻按当前分析范围重过滤重发。
+  function assignSliceDays(strategyName, days, cat) {
     if (!days.length) return;
-    const next = assignDays(sliceCats, sliceKey, days, cat);
+    const next = assignDays(sliceCats, strategyName, days, cat);
     setSliceCats(next); saveSliceCategories(next); setSliceSelectedDays([]);
-    // 归类后勾选清空 → 视图回到「分析范围」下拉的口径（用新归类表重算，基准库/训练集计数会跟着变）
-    onRows(selectRowsBySlice(allRows, sliceKey, next, sliceSel));
+    startTransition(() => onRows(selectRowsBySlice(allRows, next, sliceSel)));
     const label = cat ? CATEGORIES[cat] : '未分配';
-    message.success(`已把 ${days.length} 天转入「${label}」`);
+    message.success(`已把「${strategyName}」${days.length} 天转入「${label}」`);
   }
-  function assignRange(cat) {
-    const days = daysInRange(allRows, rangeStart.trim(), rangeEnd.trim());
-    if (!days.length) { message.warning('该区间内没有样本天'); return; }
-    assignSliceDays(days, cat);
+  // 勾选框里的天可能跨多个策略——按策略分组后逐个调用 assignDays，一次性提交一份新归类表。
+  function assignSelectedDays(cat) {
+    const grouped = daysFromKeys(sliceSelectedDays);
+    if (!grouped.size) return;
+    let next = sliceCats, totalDays = 0;
+    for (const [strategyName, days] of grouped) { next = assignDays(next, strategyName, days, cat); totalDays += days.length; }
+    setSliceCats(next); saveSliceCategories(next); setSliceSelectedDays([]);
+    startTransition(() => onRows(selectRowsBySlice(allRows, next, sliceSel)));
+    message.success(`已把 ${totalDays} 天转入「${cat ? CATEGORIES[cat] : '未分配'}」`);
   }
-  // 一键把【当前工作集里所有天】归到某类（跨分页，不用逐天勾）。数据少的阶段：全部先进训练集。
-  function assignAllDays(cat) {
-    const days = sliceSummary.days.map(d => d.day).filter(d => d !== '未知');
+  // 彻底删除某策略某几天的样本（跟"移出"不同——移出只是取消基准库/训练集归类，样本还在；这个是从
+  // allRows 里拿掉，n 会变小）。常见场景：某天数据明显异常（比如批次重复导入、抓取出错）。
+  // 不动底层已存批次/数据库本身（那份文件原样留着），但会把这几天记进持久化的删除名单——
+  // 刷新页面/重新点「分析」/自动载入都会用这份名单继续过滤，不会再自己冒出来，除非手动「恢复」。
+  function deleteDays(strategyName, days) {
     if (!days.length) return;
-    assignSliceDays(days, cat);
+    const match = r => strategyOf(r) === strategyName && days.includes(dayOf(r.buyTimestamp) || '未知');
+    const dropped = allRows.filter(match).length;
+    const kept = allRows.filter(r => !match(r));
+    setAllRows(kept);
+    const next = assignDays(sliceCats, strategyName, days, null);
+    setSliceCats(next); saveSliceCategories(next); setSliceSelectedDays([]);
+    const nextDeleted = [...new Set([...deletedDays, ...days.map(d => sliceKeyOf(strategyName, d))])];
+    setDeletedDays(nextDeleted); saveDeletedDays(nextDeleted);
+    startTransition(() => onRows(selectRowsBySlice(kept, next, sliceSel)));
+    message.success(`已删除「${strategyName}」${days.length} 天共 ${dropped} 条样本`);
+  }
+  // 勾选框里跨策略的批量删除，同 assignSelectedDays 按策略分组逐个处理。
+  function deleteSelectedDays() {
+    const grouped = daysFromKeys(sliceSelectedDays);
+    if (!grouped.size) return;
+    let kept = allRows, next = sliceCats, totalDropped = 0, totalDays = 0;
+    const newDeletedKeys = [];
+    for (const [strategyName, days] of grouped) {
+      const match = r => strategyOf(r) === strategyName && days.includes(dayOf(r.buyTimestamp) || '未知');
+      totalDropped += kept.filter(match).length;
+      kept = kept.filter(r => !match(r));
+      next = assignDays(next, strategyName, days, null);
+      totalDays += days.length;
+      newDeletedKeys.push(...days.map(d => sliceKeyOf(strategyName, d)));
+    }
+    setAllRows(kept); setSliceCats(next); saveSliceCategories(next); setSliceSelectedDays([]);
+    const nextDeleted = [...new Set([...deletedDays, ...newDeletedKeys])];
+    setDeletedDays(nextDeleted); saveDeletedDays(nextDeleted);
+    startTransition(() => onRows(selectRowsBySlice(kept, next, sliceSel)));
+    message.success(`已删除 ${totalDays} 天共 ${totalDropped} 条样本`);
+  }
+  // 恢复一条已删除的【策略×天】：从删除名单移出即可——底层数据一直都在，下次自动载入/重新
+  // 分析该策略批次时就会自然把它带回来（不用在这里手动拼回 allRows，避免拼出跟真实存储不一致的数据）。
+  function restoreDeletedDay(key) {
+    const next = deletedDays.filter(k => k !== key);
+    setDeletedDays(next); saveDeletedDays(next);
+    message.info('已从删除名单移出，重新点「分析」或重新载入对应数据源即可恢复这天的样本');
+  }
+  // 区间归类：跨策略——按每个策略自己的天集合分别截取落在区间内的部分再归类。
+  function assignRange(cat) {
+    const start = rangeStart.trim(), end = rangeEnd.trim();
+    let next = sliceCats, totalDays = 0;
+    for (const s of sliceSummary.strategies) {
+      const days = s.days.map(d => d.day).filter(d => dayInRange(d, start, end));
+      if (!days.length) continue;
+      next = assignDays(next, s.strategyName, days, cat);
+      totalDays += days.length;
+    }
+    if (!totalDays) { message.warning('该区间内没有样本天'); return; }
+    setSliceCats(next); saveSliceCategories(next); setSliceSelectedDays([]);
+    startTransition(() => onRows(selectRowsBySlice(allRows, next, sliceSel)));
+    message.success(`已把区间内共 ${totalDays} 天转入「${CATEGORIES[cat]}」`);
+  }
+  // 一键把【当前工作集里所有策略的所有天】归到某类（跨分页，不用逐天勾）。数据少的阶段：全部先进训练集。
+  function assignAllDays(cat) {
+    let next = sliceCats, totalDays = 0;
+    for (const s of sliceSummary.strategies) {
+      if (!s.daysAll?.length) continue;
+      next = assignDays(next, s.strategyName, s.daysAll, cat);
+      totalDays += s.daysAll.length;
+    }
+    if (!totalDays) return;
+    setSliceCats(next); saveSliceCategories(next); setSliceSelectedDays([]);
+    startTransition(() => onRows(selectRowsBySlice(allRows, next, sliceSel)));
+    message.success(`已把全部 ${totalDays} 天转入「${CATEGORIES[cat]}」`);
   }
   // 切换分析范围（切片）→ 清掉逐天勾选（下拉优先）、持久化、重新过滤重发
   function changeSliceSel(sel) {
     setSliceSel(sel); saveSliceSel(sel); setSliceSelectedDays([]);
-    onRows(selectRowsBySlice(allRows, sliceKey, sliceCats, sel));
+    startTransition(() => onRows(selectRowsBySlice(allRows, sliceCats, sel)));
   }
   // 勾选表里的天 = 分析就用这些天（总览/下游立即跟着变）；取消全部勾选则回到「分析范围」下拉的口径。
   // 勾选同时也是"批量归类"的选择对象（下方转入基准库/训练集按钮用的就是它）。
-  const rowsOfDays = (days) => allRows.filter(r => days.includes(dayOf(r.buyTimestamp) || '未知'));
-  function selectDays(days) {
-    setSliceSelectedDays(days);
-    onRows(days.length ? rowsOfDays(days) : selectRowsBySlice(allRows, sliceKey, sliceCats, sliceSel));
+  function selectDays(keys) {
+    // 勾选框本身要秒响应；下游联动（App 里 setRows/setActiveRows 会牵出 FactorLab 等一大串重算）
+    // 用 startTransition 标成低优先级，浏览器先把这次勾选的视觉反馈画出来，重算不阻塞连续点击。
+    setSliceSelectedDays(keys);
+    startTransition(() => onRows(keys.length ? rowsOfKeys(keys) : selectRowsBySlice(allRows, sliceCats, sliceSel)));
   }
   // 当前实际分析的样本数：勾了天就按勾选，否则按分析范围下拉
   const effectiveCount = sliceSelectedDays.length
-    ? rowsOfDays(sliceSelectedDays).length
-    : selectRowsBySlice(allRows, sliceKey, sliceCats, sliceSel).length;
+    ? rowsOfKeys(sliceSelectedDays).length
+    : selectRowsBySlice(allRows, sliceCats, sliceSel).length;
 
   async function deleteBatchIds(ids) {
     for (const id of ids) await store.deleteBatch(id).catch(() => {});
@@ -540,14 +653,11 @@ export default function DataLoader({ onRows }) {
       {allRows.length > 0 && (
         <div style={{ marginTop: 12, borderTop: '1px solid var(--border,#303030)', paddingTop: 12 }}>
           <Space style={{ marginBottom: 6 }} size={8} wrap>
-            <Typography.Text strong style={{ fontSize: 12 }}>时间切片（按信号买入时刻分天；训练集调参、基准库做样本外验证）</Typography.Text>
+            <Typography.Text strong style={{ fontSize: 12 }}>时间切片（按信号买入时刻分天，第一层按策略分组；训练集调参、基准库做样本外验证）</Typography.Text>
             <Tag color="blue">🟦 基准库 {sliceSummary.tally.baseline.days}天/{sliceSummary.tally.baseline.count}条</Tag>
             <Tag color="green">🟩 训练集 {sliceSummary.tally.train.days}天/{sliceSummary.tally.train.count}条</Tag>
             <Tag>未分配 {sliceSummary.tally.unassigned.days}天/{sliceSummary.tally.unassigned.count}条</Tag>
-            {sliceKey === '__all__'
-              ? <Tag color="warning">混合策略：切片归类不区分策略</Tag>
-              : <Tag>作用域：{sliceKey}</Tag>}
-            {/* 数据少的阶段：一键把所有天先归进训练集，基准库以后慢慢攒 */}
+            {/* 数据少的阶段：一键把所有策略的所有天先归进训练集，基准库以后慢慢攒 */}
             <Button size="small" onClick={() => assignAllDays('train')}>全部→训练集</Button>
             <Button size="small" onClick={() => assignAllDays('baseline')}>全部→基准库</Button>
           </Space>
@@ -557,11 +667,16 @@ export default function DataLoader({ onRows }) {
             <span style={{ fontSize: 12, color: 'var(--muted,#8e8e93)' }}>分析范围（切片）</span>
             <Select size="small" style={{ width: 140 }} value={sliceSel.mode === 'range' ? 'range' : sliceSel.mode}
               onChange={m => {
-                if (m === 'day') changeSliceSel({ mode: 'day', day: sliceSummary.days[0] && sliceSummary.days[0].day });
+                if (m === 'day') {
+                  const first = sliceSummary.strategies.flatMap(s =>
+                    s.days.filter(d => d.day !== '未知').map(d => ({ strategyName: s.strategyName, day: d.day })))[0];
+                  changeSliceSel(first ? { mode: 'day', ...first } : { mode: 'day' });
+                }
                 else if (m === 'range') changeSliceSel({ mode: 'range', start: rangeStart.trim(), end: rangeEnd.trim() });
                 else changeSliceSel({ mode: m });
               }}
               options={[
+                { value: 'none', label: '未选择' },
                 { value: 'all', label: '全部' },
                 { value: 'baseline', label: '🟦 基准库' },
                 { value: 'train', label: '🟩 训练集' },
@@ -569,29 +684,38 @@ export default function DataLoader({ onRows }) {
                 { value: 'range', label: '自定义区间（用下方区间框）' },
               ]} />
             {sliceSel.mode === 'day' && (
-              <Select size="small" style={{ width: 160 }} value={sliceSel.day} showSearch
-                onChange={day => changeSliceSel({ mode: 'day', day })}
-                options={sliceSummary.days.filter(d => d.day !== '未知').map(d => ({ value: d.day, label: `${d.day}（${d.count}）` }))} />
+              <Select size="small" style={{ width: 220 }} showSearch
+                value={sliceSel.strategyName != null ? `${sliceSel.strategyName}::${sliceSel.day}` : undefined}
+                onChange={v => { const i = v.indexOf('::'); changeSliceSel({ mode: 'day', strategyName: v.slice(0, i), day: v.slice(i + 2) }); }}
+                options={sliceSummary.strategies.flatMap(s => s.days.filter(d => d.day !== '未知').map(d => ({
+                  value: `${s.strategyName}::${d.day}`, label: `${s.strategyName} · ${d.day}（${d.count}）`,
+                })))} />
             )}
-            <Tag color="blue" style={{ fontSize: 12 }}>当前分析 {effectiveCount} 条</Tag>
+            {sliceSel.mode === 'none'
+              ? <Tag color="warning" style={{ fontSize: 12 }}>未选分析范围，下游面板暂不显示数据</Tag>
+              : <Tag color="blue" style={{ fontSize: 12 }}>当前分析 {effectiveCount} 条</Tag>}
             {sliceSelectedDays.length > 0 && (
-              <span style={{ fontSize: 12, color: '#faad14' }}>（按勾选的 {sliceSelectedDays.length} 天，取消勾选回到上面的范围）</span>
+              <span style={{ fontSize: 12, color: '#faad14' }}>（按勾选的 {sliceSelectedDays.length} 项，取消勾选回到上面的范围）</span>
             )}
           </Space>
 
           {/* 归类操作条（勾选天后出现）*/}
           {sliceSelectedDays.length > 0 && (
             <Space style={{ marginBottom: 6 }} size={8} wrap>
-              <Tag color="blue">已选 {sliceSelectedDays.length} 天</Tag>
+              <Tag color="blue">已选 {sliceSelectedDays.length} 项</Tag>
               <span style={{ fontSize: 12 }}>转入</span>
-              <Button size="small" onClick={() => assignSliceDays(sliceSelectedDays, 'baseline')}>🟦 基准库</Button>
-              <Button size="small" onClick={() => assignSliceDays(sliceSelectedDays, 'train')}>🟩 训练集</Button>
-              <Button size="small" onClick={() => assignSliceDays(sliceSelectedDays, null)}>移出</Button>
+              <Button size="small" onClick={() => assignSelectedDays('baseline')}>🟦 基准库</Button>
+              <Button size="small" onClick={() => assignSelectedDays('train')}>🟩 训练集</Button>
+              <Button size="small" onClick={() => assignSelectedDays(null)}>移出</Button>
+              <Popconfirm title={`彻底删除已选 ${sliceSelectedDays.length} 项的样本？`} description="不动底层已存批次本身，但会记进删除名单——刷新页面/重新分析都不会再出现，除非手动恢复。"
+                okText="删除" okType="danger" cancelText="取消" onConfirm={deleteSelectedDays}>
+                <Button size="small" danger>删除</Button>
+              </Popconfirm>
               <Button size="small" type="text" onClick={() => setSliceSelectedDays([])}>取消选择</Button>
             </Space>
           )}
 
-          {/* 区间：一次选一段——可设为分析范围，或批量归类 */}
+          {/* 区间：一次选一段（跨策略）——可设为分析范围，或批量归类 */}
           <Space style={{ marginBottom: 6 }} size={4} wrap>
             <span style={{ fontSize: 12, color: 'var(--muted,#8e8e93)' }}>区间</span>
             <Input size="small" style={{ width: 118 }} placeholder="起 2026-07-24" value={rangeStart} onChange={e => setRangeStart(e.target.value)} />
@@ -602,26 +726,68 @@ export default function DataLoader({ onRows }) {
             <Button size="small" onClick={() => assignRange('train')}>转入训练集</Button>
           </Space>
 
-          <Table size="small" rowKey="day" pagination={{ pageSize: 10, size: 'small' }}
-            dataSource={sliceSummary.days}
+          <Table size="small" rowKey="key" pagination={false}
+            defaultExpandAllRows={sliceTreeData.length <= 5}
+            dataSource={sliceTreeData}
             rowSelection={{
+              checkStrictly: false,
               selectedRowKeys: sliceSelectedDays, onChange: selectDays,
-              getCheckboxProps: r => ({ disabled: r.day === '未知' }),
+              getCheckboxProps: r => ({ disabled: r.rowType === 'day' && r.day === '未知' }),
             }}
             columns={[
-              { title: '日期', dataIndex: 'day', width: 150 },
+              { title: '策略 / 日期', render: (_, r) => r.rowType === 'strategy'
+                ? <b>📦 {r.strategyName}</b> : r.day },
               { title: '样本数', dataIndex: 'count', width: 90, align: 'right' },
-              { title: '类别', width: 120, render: (_, r) => r.category === 'baseline'
+              { title: '类别', width: 200, render: (_, r) => r.rowType === 'strategy'
+                ? <Space size={4}>
+                    <Tag color="blue">🟦{r.tally.baseline.days}</Tag>
+                    <Tag color="green">🟩{r.tally.train.days}</Tag>
+                    <Tag>未分配{r.tally.unassigned.days}</Tag>
+                  </Space>
+                : r.category === 'baseline'
                 ? <Tag color="blue">🟦 基准库</Tag> : r.category === 'train'
                 ? <Tag color="green">🟩 训练集</Tag> : <span style={{ opacity: .5 }}>未分配</span> },
-              { title: '', width: 190, render: (_, r) => r.day === '未知' ? null : (
-                <Space size={2}>
-                  <Button size="small" type="link" onClick={() => assignSliceDays([r.day], 'baseline')}>基准库</Button>
-                  <Button size="small" type="link" onClick={() => assignSliceDays([r.day], 'train')}>训练集</Button>
-                  {r.category && <Button size="small" type="link" onClick={() => assignSliceDays([r.day], null)}>移出</Button>}
-                </Space>
-              ) },
+              { title: '', width: 240, render: (_, r) => {
+                if (r.rowType === 'strategy') return !r.daysAll.length ? null : (
+                  <Space size={2}>
+                    <Button size="small" type="link" onClick={() => assignSliceDays(r.strategyName, r.daysAll, 'baseline')}>全部→基准库</Button>
+                    <Button size="small" type="link" onClick={() => assignSliceDays(r.strategyName, r.daysAll, 'train')}>全部→训练集</Button>
+                  </Space>
+                );
+                if (r.day === '未知') return null;
+                return (
+                  <Space size={2}>
+                    <Button size="small" type="link" onClick={() => assignSliceDays(r.strategyName, [r.day], 'baseline')}>基准库</Button>
+                    <Button size="small" type="link" onClick={() => assignSliceDays(r.strategyName, [r.day], 'train')}>训练集</Button>
+                    {r.category && <Button size="small" type="link" onClick={() => assignSliceDays(r.strategyName, [r.day], null)}>移出</Button>}
+                    <Popconfirm title={`彻底删除「${r.strategyName}」${r.day} 这 ${r.count} 条样本？`} description="不动底层已存批次本身，但会记进删除名单——刷新页面/重新分析都不会再出现，除非手动恢复。"
+                      okText="删除" okType="danger" cancelText="取消" onConfirm={() => deleteDays(r.strategyName, [r.day])}>
+                      <Button size="small" type="link" danger>删除</Button>
+                    </Popconfirm>
+                  </Space>
+                );
+              } },
             ]} />
+
+          {deletedDays.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                已删除 {deletedDays.length} 天（底层数据还在，只是不再纳入分析；点标签可恢复）：
+              </Typography.Text>
+              <div style={{ marginTop: 4 }}>
+                <Space wrap size={4}>
+                  {deletedDays.map(k => {
+                    const i = k.lastIndexOf('|');
+                    return (
+                      <Tag key={k} closable onClose={() => restoreDeletedDay(k)}>
+                        {k.slice(0, i)} · {k.slice(i + 1)}
+                      </Tag>
+                    );
+                  })}
+                </Space>
+              </div>
+            </div>
+          )}
         </div>
       )}
 

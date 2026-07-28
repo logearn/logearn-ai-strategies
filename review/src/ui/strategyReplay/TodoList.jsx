@@ -74,7 +74,7 @@ export default function TodoList({ refreshKey }) {
             <List.Item
               actions={[<Button key="ignore" size="small" onClick={() => handleIgnore(item.date)}>忽略</Button>]}>
               <Tag color="warning">自动</Tag>
-              <span style={{ fontSize: 13 }}>{item.date} 有数据，但还没存回测报告——去"策略"tab 跑一遍回放并存档</span>
+              <span style={{ fontSize: 13 }}>{item.date} 有数据，但还没存回测报告——去"策略"tab 跑一遍回放，再去"报告"tab 存档</span>
             </List.Item>
           ) : (
             <List.Item

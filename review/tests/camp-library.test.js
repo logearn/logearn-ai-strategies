@@ -2,9 +2,79 @@ import assert from 'node:assert';
 import { applyWeightsToSrc, removeCheckLineFromSrc, applyChangeSetToSrc, reAddFactorLine, removeCheckLineByField,
          addCampEntry, campGroupOf, groupCampEntries, renameCampGroup, moveCampEntriesToGroup,
          DEFAULT_CAMP_GROUP, campGroupThresholdOf, setCampGroupThreshold, applyCampEntryInterval,
-         intervalChanged, roundCampBound, DEFAULT_CAMP_WIN_THRESHOLD } from '../src/lib/campLibrary.js';
+         intervalChanged, roundCampBound, DEFAULT_CAMP_WIN_THRESHOLD, dedupeCampEntries,
+         buildAllChecksRow, parseVetoNames, replaceScoreRowsInAllChecks } from '../src/lib/campLibrary.js';
 
 export function run(test) {
+  // ---------- 发送到策略：整体替换打分段 ----------
+  const baseStrategy = [
+    "const CUTOFF = 60",
+    "const ALL_CHECKS = [",
+    "  ['平台', f('platform_ok'), 1, 1, 1, 1, 1, null, '白名单'],",   // 硬否决行（在 VETO_NAMES 里）
+    "  ['旧因子A', f('old_a'), 20, 0, 0, 5, 5, null, '0~5'],",         // 旧打分行（要被替换）
+    "  ['旧因子B', f('old_b'), 30, -Infinity, -Infinity, 2, 2, null, '~2'],",
+    "]",
+    "const VETO_NAMES = new Set(['平台'])",
+    "for (const c of ALL_CHECKS) {}",
+  ].join('\n');
+
+  test('buildAllChecksRow: 给四点梯形应原样写出 lo0/lo1/hi1/hi0，不再零宽度', () => {
+    const row = buildAllChecksRow({ field: 'x', camp: 'hero', weight: 12.5, lo0: -Infinity, lo1: -Infinity, hi1: 1.5, hi0: 31.7 });
+    assert.ok(row.includes("f('x')"));
+    assert.ok(row.includes('12.5'));
+    assert.ok(row.includes('-Infinity, -Infinity, 1.5, 31.7'), row);
+  });
+
+  test('buildAllChecksRow: 邪恶阵营应写负权重', () => {
+    const row = buildAllChecksRow({ field: 'y', camp: 'evil', weight: 8, lo0: 0, lo1: 0, hi1: 3, hi0: 3 });
+    assert.ok(/,\s*-8,/.test(row), row);
+  });
+
+  test('buildAllChecksRow: 只给 lo/hi（阵营库老口径）应退回零宽度', () => {
+    const row = buildAllChecksRow({ field: 'z', camp: 'hero', weight: 5, lo: 2, hi: 9 });
+    assert.ok(row.includes('2, 2, 9, 9'), row);
+  });
+
+  test('parseVetoNames: 解析出 VETO_NAMES 集合', () => {
+    const s = parseVetoNames(baseStrategy);
+    assert.ok(s.has('平台'));
+    assert.strictEqual(s.size, 1);
+  });
+
+  test('replaceScoreRowsInAllChecks: 保留硬否决行、替换打分行、同步 CUTOFF', () => {
+    const factors = [
+      { field: 'new_a', camp: 'hero', weight: 40, lo0: -Infinity, lo1: -Infinity, hi1: 1.5, hi0: 31.7 },
+      { field: 'new_b', camp: 'evil', weight: 25, lo0: 5, lo1: 5, hi1: Infinity, hi0: Infinity },
+    ];
+    const res = replaceScoreRowsInAllChecks(baseStrategy, factors, { cutoff: 80 });
+    assert.ok(!res.error, res.error);
+    assert.strictEqual(res.removed, 2);      // 旧因子A/B 被删
+    assert.strictEqual(res.inserted, 2);
+    assert.ok(res.next.includes("f('platform_ok')"), '硬否决行必须保留');
+    assert.ok(!res.next.includes("f('old_a')") && !res.next.includes("f('old_b')"), '旧打分行必须删除');
+    assert.ok(res.next.includes("f('new_a')") && res.next.includes("f('new_b')"), '新因子必须写入');
+    assert.ok(/,\s*-25,/.test(res.next), '邪恶因子应负权重');
+    assert.ok(res.cutoffSynced && res.next.includes('const CUTOFF = 80'), 'CUTOFF 应同步为 80');
+  });
+
+  test('replaceScoreRowsInAllChecks: 非 ALL_CHECKS 架构应返回 error', () => {
+    const res = replaceScoreRowsInAllChecks("const checks = []\nreturn true", [{ field: 'a', camp: 'hero', weight: 1, lo0: 0, lo1: 0, hi1: 1, hi0: 1 }], {});
+    assert.ok(res.error);
+  });
+
+  test('replaceScoreRowsInAllChecks: VETO 行即便用 f() 取值也不被删', () => {
+    const s = [
+      "const ALL_CHECKS = [",
+      "  ['防雷', f('scam'), 1, 1, 1, 1, 1, null, 'x'],",
+      "  ['打分', f('sig'), 10, 0, 0, 5, 5, null, 'y'],",
+      "]",
+      "const VETO_NAMES = new Set(['防雷'])",
+    ].join('\n');
+    const res = replaceScoreRowsInAllChecks(s, [], {});
+    assert.strictEqual(res.removed, 1);              // 只删打分行
+    assert.ok(res.next.includes("f('scam')"));       // VETO 行（用 f()）保留
+  });
+
   // ---------- 高倍落点校验：分组级阈值 + 区间比对 ----------
   test('campGroupThresholdOf: 分组没设过回落默认，设了用分组自己的', () => {
     assert.strictEqual(campGroupThresholdOf({}, '强势盘'), DEFAULT_CAMP_WIN_THRESHOLD);
@@ -64,6 +134,35 @@ export function run(test) {
     assert.strictEqual(withG.group, '强势盘v1');
     const noG = addCampEntry([], { field: 'y', camp: 'evil' })[0];
     assert.strictEqual(noG.group, DEFAULT_CAMP_GROUP);
+  });
+
+  test('addCampEntry: 同一字段同一阵营再次收藏是更新，不是新增重复行', () => {
+    const first = addCampEntry([], { field: 'x', camp: 'hero', lo: 1, hi: 5, group: 'A', weight: 10 });
+    const second = addCampEntry(first, { field: 'x', camp: 'hero', lo: 2, hi: 8, group: 'B' });
+    assert.strictEqual(second.length, 1, '同字段同阵营不应变成两条');
+    assert.strictEqual(second[0].id, first[0].id, '就地更新，id 不变');
+    assert.strictEqual(second[0].lo, 2);
+    assert.strictEqual(second[0].hi, 8);
+    assert.strictEqual(second[0].group, 'A', '重新收藏不应把已归好的分组挪走');
+    assert.strictEqual(second[0].weight, 10, '没传新权重时保留原权重');
+  });
+
+  test('addCampEntry: 同字段不同阵营（hero/evil）各自独立，不互相覆盖', () => {
+    const withHero = addCampEntry([], { field: 'x', camp: 'hero', lo: 1, hi: 5 });
+    const withBoth = addCampEntry(withHero, { field: 'x', camp: 'evil', lo: -5, hi: -1 });
+    assert.strictEqual(withBoth.length, 2);
+  });
+
+  test('dedupeCampEntries: 同字段同阵营只留 addedAt 最新的一条', () => {
+    const list = [
+      { field: 'x', camp: 'hero', addedAt: 1, id: 'old' },
+      { field: 'x', camp: 'hero', addedAt: 2, id: 'new' },
+      { field: 'y', camp: 'evil', addedAt: 1, id: 'y1' },
+    ];
+    const deduped = dedupeCampEntries(list);
+    assert.strictEqual(deduped.length, 2);
+    assert.ok(deduped.some(e => e.id === 'new'));
+    assert.ok(!deduped.some(e => e.id === 'old'));
   });
 
   test('groupCampEntries: 按组归拢 + 注入空的额外分组（当前收藏组还没东西也要显示）', () => {

@@ -16,11 +16,24 @@ export function campGroupOf(entry) {
   return g != null && String(g).trim() !== '' ? String(g).trim() : DEFAULT_CAMP_GROUP;
 }
 
+// 按 field+camp 去重：同一字段同一阵营只留一条，多条时留 addedAt 最新的那条。
+// addCampEntry 改成 upsert 之后新收藏不会再产生重复，这里是清掉历史已经攒下的重复
+// （比如这个修复上线前反复从图表收藏同一字段攒出来的那些）。
+export function dedupeCampEntries(list) {
+  const byKey = new Map();
+  for (const e of list || []) {
+    const key = e.field + ':' + (e.camp === 'evil' ? 'evil' : 'hero');
+    const prev = byKey.get(key);
+    if (!prev || (e.addedAt || 0) >= (prev.addedAt || 0)) byKey.set(key, e);
+  }
+  return list.filter(e => byKey.get(e.field + ':' + (e.camp === 'evil' ? 'evil' : 'hero')) === e);
+}
+
 export function loadCampLibrary() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
+    return Array.isArray(arr) ? dedupeCampEntries(arr) : [];
   } catch { return []; }
 }
 
@@ -36,11 +49,30 @@ export function saveCampActiveGroup(name) {
   try { localStorage.setItem(ACTIVE_GROUP_KEY, name || DEFAULT_CAMP_GROUP); } catch { /* 隐私模式 */ }
 }
 
+// 同一字段同一阵营再次收藏＝更新，不再插入新的一条——反复从图表收藏同一字段（比如换了个时间段
+// 重新看区间）以前会一直堆重复行，现在就地覆盖 lo/hi/weight/note，分组和 id 保留原来那条的
+// （不会因为重新收藏而被挪到别的分组），addedAt 刷新成本次时间。
 export function addCampEntry(list, entry) {
+  const camp = entry.camp === 'evil' ? 'evil' : 'hero';
+  const idx = list.findIndex(x => x.field === entry.field && (x.camp === 'evil' ? 'evil' : 'hero') === camp);
+  if (idx >= 0) {
+    const prev = list[idx];
+    const updated = {
+      ...prev,
+      lo: entry.lo,
+      hi: entry.hi,
+      weight: Number.isFinite(entry.weight) ? entry.weight : prev.weight,
+      note: entry.note || prev.note,
+      addedAt: Date.now(),
+    };
+    const next = [...list];
+    next[idx] = updated;
+    return next;
+  }
   const item = {
     id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     field: entry.field,
-    camp: entry.camp === 'evil' ? 'evil' : 'hero',
+    camp,
     lo: entry.lo,
     hi: entry.hi,
     weight: Number.isFinite(entry.weight) ? entry.weight : 10,
@@ -53,6 +85,14 @@ export function addCampEntry(list, entry) {
 
 export function removeCampEntry(list, id) {
   return list.filter(x => x.id !== id);
+}
+
+// 批量删除：一次性过滤掉所有 ids，供"一键删除"用。不能用循环调用 removeCampEntry 实现——
+// 调用方那层 setState 每次都是基于同一份闭包里的旧 list 算 next，循环调多次只有最后一次生效，
+// 前面几条删除会被悄悄吞掉。
+export function removeCampEntries(list, ids) {
+  const idSet = new Set(ids);
+  return list.filter(x => !idSet.has(x.id));
 }
 
 // 按分组归拢收藏，给界面渲染分组表用。extraGroups 传"名单里有、但还没收藏落进去"的空分组
@@ -193,11 +233,18 @@ export function hasAllChecksArchitecture(src) {
 // value 用 f('field') 取值——f 是 compileStrategy 注入进函数作用域的，ALL_CHECKS 数组字面量
 // 里能直接调用。危险区（evil）用负权重实现："命中危险区" 时 s=1，total += -|weight| 是实打实扣分；
 // 没命中时 s=0，贡献是 0（不额外加分）——不用改这条策略自己的 for 循环就能支持扣分语义。
-export function buildAllChecksRow({ field, camp, lo, hi, weight, label: labelOverride }) {
+// 支持两种入参：
+//   - 阵营库单区间：{lo, hi} → 写成 lo0=lo1=lo、hi1=hi0=hi 的零宽度阶跃（区间内满分、外 0）；
+//   - 找因子因子池：{lo0, lo1, hi1, hi0} → 原样写四点梯形（带过渡带），忠实搬运找因子挖出的形状。
+export function buildAllChecksRow({ field, camp, lo, hi, lo0, lo1, hi1, hi0, weight, label: labelOverride }) {
   const label = labelOverride || fieldLabel(field);
   const w = camp === 'evil' ? -Math.abs(weight) : Math.abs(weight);
-  const loText = boundText(lo, '-Infinity'), hiText = boundText(hi, 'Infinity');
-  return `  ['${label}', f('${field}'), ${w}, ${loText}, ${loText}, ${hiText}, ${hiText}, null, '${loText}~${hiText}'],`;
+  const has4 = lo0 !== undefined || lo1 !== undefined || hi1 !== undefined || hi0 !== undefined;
+  const lo0T = boundText(has4 ? lo0 : lo, '-Infinity');
+  const lo1T = boundText(has4 ? lo1 : lo, '-Infinity');
+  const hi1T = boundText(has4 ? hi1 : hi, 'Infinity');
+  const hi0T = boundText(has4 ? hi0 : hi, 'Infinity');
+  return `  ['${label}', f('${field}'), ${w}, ${lo0T}, ${lo1T}, ${hi1T}, ${hi0T}, null, '${lo1T}~${hi1T}'],`;
 }
 
 // 插入到 ALL_CHECKS 数组里——跟 insertLineIntoStrategySrc 一样，换行必须紧跟在插入行后面，
@@ -247,6 +294,49 @@ export function removeCheckLineByField(src, field) {
   const lines = String(src).split('\n');
   const kept = lines.filter(line => !fieldRefRe.test(line));
   return { next: kept.join('\n'), removed: lines.length - kept.length };
+}
+
+// 解析源码里的 VETO_NAMES 硬否决名单（跟 findFieldConflict 里同一套读法）
+export function parseVetoNames(src) {
+  const m = String(src).match(/VETO_NAMES\s*=\s*new\s+Set\(\s*\[([\s\S]*?)\]\s*\)/);
+  const names = new Set();
+  if (m) { const re = /['"]([^'"]+)['"]/g; let nm; while ((nm = re.exec(m[1]))) names.add(nm[1]); }
+  return names;
+}
+
+// 「找因子 → 发送到策略」整体替换打分段：
+//   - 保留 VETO_NAMES 里的硬否决行（哪怕它们也用 f('字段') 取值，靠名字判定，绝不误删）；
+//   - 删掉其余"本工具生成的打分行"（value 是 f('字段') 且名字不在 VETO_NAMES 里）；
+//   - 把因子池整体写成新的 ALL_CHECKS 打分行（带真实梯形四点 + 真实权重，负权重=邪恶阵营扣分）；
+//   - 可选把 const CUTOFF 同步成找因子的触发阈值。
+// factors: [{field, camp, weight, lo0, lo1, hi1, hi0}]（就是 FactorLab 的因子池）。
+// 返回 { next, removed, inserted, cutoffSynced } 或 { error }。
+// 注意：只删 f('字段') 形态的打分行——手写 ctx 表达式的打分行认不出、不动（跟 removeCheckLineByField 同口径）。
+export function replaceScoreRowsInAllChecks(src, factors, { cutoff } = {}) {
+  if (!hasAllChecksArchitecture(src)) {
+    return { error: '当前策略不是 ALL_CHECKS 架构（没找到 const ALL_CHECKS = [...]），无法自动替换打分段。请先在「策略」tab 放一份 ALL_CHECKS 架构的基础策略（含硬否决段）。' };
+  }
+  const veto = parseVetoNames(src);
+  // 打分行特征：行首是 [ '名称', f( ...；名字不在 VETO_NAMES 里才算打分行（VETO 行一律保留）
+  const rowRe = /^\s*\[\s*['"]([^'"]+)['"]\s*,\s*f\(/;
+  const lines = String(src).split('\n');
+  let removed = 0;
+  const kept = lines.filter(line => {
+    const m = line.match(rowRe);
+    if (m && !veto.has(m[1])) { removed++; return false; }
+    return true;
+  });
+  let next = kept.join('\n');
+  const rows = (factors || []).map(f => buildAllChecksRow({
+    field: f.field, camp: f.camp, weight: f.weight, lo0: f.lo0, lo1: f.lo1, hi1: f.hi1, hi0: f.hi0,
+  }));
+  if (rows.length) next = next.replace(ALL_CHECKS_DECL_RE, `$1\n${rows.join('\n')}\n`);
+  let cutoffSynced = false;
+  if (cutoff !== undefined && cutoff !== null) {
+    const cutRe = /((?:var|const|let)\s+CUTOFF\s*=\s*)(-?\d+(?:\.\d+)?)/;
+    if (cutRe.test(next)) { next = next.replace(cutRe, `$1${cutoff}`); cutoffSynced = true; }
+  }
+  return { next, removed, inserted: rows.length, cutoffSynced };
 }
 
 // 批量把权重数字写回源码——在源码文本里找 ['字段名', ... , 权重数字, ... 这一行，替换权重数字。

@@ -56,6 +56,25 @@ export function run(test) {
     assert.ok(agg.noCheckReasons.length > 0, '应给出退出原因');
   });
 
+  test('aggregateCheckStats: 回放报错的样本要计入 errored 并按去重原因给样例', () => {
+    // 真实场景：大批样本回放时抛同一个异常（读了 undefined 属性），只有少数跑通。
+    // errored 要如实计数，errorReasons 要把重复文案去重、按次数降序，方便一眼看出"这批错都一样"。
+    const c = compileStrategy('const checks = []; return ctx.a.b.c;');   // ctx.a 为 undefined 时读 .b 抛错
+    const good = compileStrategy('const checks=[["x",true,1,""]]; return true;');
+    const mk = (a, ret) => ({ symbol: 'S', tokenAddress: 'CA', returnMax: ret, buyTimestamp: 1784690000, rawCtx: { a }, features: {} });
+    const results = [
+      { input: '', row: mk(undefined, 3), res: runStrategyOnRow(c, mk(undefined, 3)) },   // 报错
+      { input: '', row: mk(undefined, 2), res: runStrategyOnRow(c, mk(undefined, 2)) },   // 报错（同因）
+      { input: '', row: mk(undefined, 5), res: runStrategyOnRow(c, mk(undefined, 5)) },   // 报错（同因）
+      { input: '', row: mk(9, 4), res: runStrategyOnRow(good, mk(9, 4)) },                // 跑通命中
+    ];
+    const agg = aggregateCheckStats(results);
+    assert.strictEqual(agg.errored, 3, '3 条报错');
+    assert.strictEqual(agg.valid, 1, '只有 1 条跑通');
+    assert.ok(agg.errorReasons.length >= 1, '应给出报错原因样例');
+    assert.strictEqual(agg.errorReasons[0].count, 3, '同一个报错文案应去重后计数=3');
+  });
+
   test('runStrategyOnRow: 没有 rawCtx 的样本应给出可读错误而不是抛异常', () => {
     const c = compileStrategy(SRC);
     const r = runStrategyOnRow(c, { returnMax: 2 });

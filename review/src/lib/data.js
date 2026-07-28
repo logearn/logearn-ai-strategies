@@ -1551,12 +1551,13 @@ function isSignalField(key) {
 const DEV_FIELDS = new Set([
   'gmgn.dev.creator_open_count',        // 创建者历史发币数（发币越多越像惯犯）
   'gmgn.dev.top_10_holder_rate',        // 前10大持有人占比
-  'gmgn.dev.creator_token_balance',     // 创建者当前持仓数量
+  // gmgn.dev.creator_token_balance 已删除：与 gmgn.stat.creator_token_balance 同名同义，
+  // 未核实出与 top_10_holder_rate 那样的口径差异，保留 stat 那份即可，避免同一信号在
+  // 因子有效性分析/相关性扫描里被当成两个独立字段各算一次。
   'gmgn.dev.twitter_create_token_count',// 推特宣传过的发币数
   'gmgn.dev.twitter_del_post_token_count', // 删除过的发币帖子数
   'gmgn.dev.twitter_name_change_count', // 推特改名次数（本工具从数组算出的派生字段）
   'gmgn.dev.dexscr_boost_fee',          // 是否买 DexScreener Boost
-  'gmgn.dev.dexscr_trending_bar',       // 是否上过 DexScreener 趋势榜（0/1 标志保留；对应的 _ts 时间戳无分析意义，已剔除）
 ]);
 function isDevField(key) { return DEV_FIELDS.has(key); }
 
@@ -1653,6 +1654,9 @@ const NON_ANALYTIC_FIELDS = new Set([
   // （meme 币动辄 10 亿枚，和收益无关），它有用的形态是换手率 kline_turnover_pct，已经算好了。
   // 注意这里是精确匹配，gmgn.total_supply 是另一个字段（用于算流通占比），不受影响。
   'total_record', 'total_supply',
+  // 创建者历史上表现最好的【另一个】代币的历史最高市值：绝对美元数值，且说的是别的代币，
+  // 不是当前正在评估的这一个，跨样本不可比（同 kline_and_indicators 原始价格那类问题）。
+  'gmgn.dev.ath_token_info.ath_mc',
 ]);
 
 // 整棵子树都不参与分析的前缀：
@@ -1796,7 +1800,11 @@ function computeCorrelations(rows) {
           quality: score,
           qualityReasons: reasons,
           n: pairs.length,
-          p: pearsonPValue(r, pairs.length),
+          // p 对应主指标 Spearman ρ（Fisher z 变换近似，同一个函数对 r/ρ 都适用），不是线性 r 的 p——
+          // 表格里 ρ 是加★的主排序列，p 若还按 r 算，会出现"ρ 很大但 p 却是 r 的显著性"这种对不上的
+          // 情况（之前的 bug：r 弱但 ρ 强的字段，p 会显示成不显著，跟星标的主指标脱节）。
+          p: pearsonPValue(rho, pairs.length),
+          pr: pearsonPValue(r, pairs.length),
           rho,
           delta: Number.isFinite(rho) ? Math.abs(r - rho) : NaN
         });

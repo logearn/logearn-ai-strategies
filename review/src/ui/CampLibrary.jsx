@@ -20,7 +20,7 @@ const fmtInterval = (lo, hi) => {
 // （字段/阵营/区间/权重），点"发送到策略"会把它转成一行 check 插进"策略"tab 正在编辑的代码里。
 // 分组：一批收藏往往来自同一轮策略调参（比如"强势盘v1"测出来的一组因子），用分组把它们归拢，
 // 可改名、可把选中的收藏挪到别的组；图表里新收藏默认落进"当前分组"（activeGroup）。
-export default function CampLibrary({ library, rows = [], onRemove, onSendToStrategy,
+export default function CampLibrary({ library, rows = [], onRemove, onRemoveMany, onSendToStrategy,
   activeGroup, onActiveGroupChange, onRenameGroup, onMoveEntries,
   groupThresholds = {}, onSetGroupThreshold, onApplyCorrection, onApplyCorrections }) {
   // 多选批量发送/移动：onSendToStrategy 每次调用往 App 的 pendingStrategyLines 队列追加一条，
@@ -36,6 +36,12 @@ export default function CampLibrary({ library, rows = [], onRemove, onSendToStra
 
   const sendSelected = () => {
     library.filter(r => selectedIds.includes(r.id)).forEach(r => onSendToStrategy(r));
+    setSelectedIds([]);
+  };
+  const deleteSelected = () => {
+    const ids = selectedIds;
+    if (onRemoveMany) onRemoveMany(ids); else ids.forEach(id => onRemove(id));
+    message.success(`已删除 ${ids.length} 条收藏`);
     setSelectedIds([]);
   };
   const doMove = () => {
@@ -151,6 +157,9 @@ export default function CampLibrary({ library, rows = [], onRemove, onSendToStra
           <Select size="small" style={{ width: 180 }} value={moveTo} onChange={setMoveTo}
             placeholder="选择目标分组" options={groupNames.map(g => ({ value: g, label: g }))} />
           <Button size="small" disabled={!moveTo} onClick={doMove}>确认移动</Button>
+          <Popconfirm title={`删除选中的 ${selectedIds.length} 条收藏？`} onConfirm={deleteSelected}>
+            <Button size="small" danger>一键删除</Button>
+          </Popconfirm>
           <Button size="small" type="text" onClick={() => setSelectedIds([])}>取消选择</Button>
         </Space>
       )}

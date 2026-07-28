@@ -1,0 +1,119 @@
+import assert from 'node:assert';
+import {
+  extractUsedFields, generateOnlineCode, verifyParity, exportWithVerify, classifyFields,
+} from '../src/lib/onlineExport.js';
+
+// 造带 rawCtx + features 的样本：resolveCtxAccessor 靠"raw×倍率 === feature"核对路径。
+//   - shit_volume（直接、倍率1）：ctx.logearn.shit_volume === feature
+//   - gmgn.stat.bot_degen_rate（直接、倍率100）：ctx.gmgn.stat.bot_degen_rate × 100 === feature
+//   - buy_sell_count_ratio（派生）：ctx 里没有，靠 simple 块从 buyer/seller 现算
+function mkRows(n = 12, { tamperDerived = false } = {}) {
+  const rows = [];
+  for (let i = 0; i < n; i++) {
+    const shit = (i % 5) + 0.5;
+    const frac = ((i * 7) % 100) / 1000; // 0~0.099
+    const buyers = (i % 4) + 3, sellers = (i % 3) + 1;
+    const ratio = buyers / sellers;
+    rows.push({
+      tokenAddress: 'T' + i, buyTimestamp: 1000 + i, returnMax: 2,
+      features: {
+        shit_volume: shit,
+        'gmgn.stat.bot_degen_rate': frac * 100,
+        buy_sell_count_ratio: tamperDerived ? ratio + 99 : ratio, // tamper 时 review 值故意写错
+      },
+      rawCtx: {
+        logearn: { shit_volume: shit, buyer_count_d1: buyers, seller_count_d1: sellers },
+        gmgn: { stat: { bot_degen_rate: frac } },
+      },
+    });
+  }
+  return rows;
+}
+
+const directSrc = `const ALL_CHECKS = [
+  ['垃圾量', f('shit_volume'), 10, -Infinity, -Infinity, 0, 2, null, '~0'],
+  ['bot', f('gmgn.stat.bot_degen_rate'), 20, 30, 45, 55, 62, null, '45~55'],
+]`;
+
+export function run(test) {
+  test('extractUsedFields: 注释里的示例 f() 不算数', () => {
+    const s = `// 示例 f('foobar_x')\n${directSrc}`;
+    assert.deepStrictEqual(extractUsedFields(s).sort(), ['gmgn.stat.bot_degen_rate', 'shit_volume']);
+  });
+
+  test('generateOnlineCode: 直接字段→命名 const（__Vp 路径,倍率），行里引用命名，无 f、无垫片', () => {
+    const g = generateOnlineCode(directSrc, mkRows());
+    assert.ok(g.code.includes("const F_shit_volume = __Vp('logearn.shit_volume', 1);"), g.code);
+    assert.ok(g.code.includes("const F_gmgn_stat_bot_degen_rate = __Vp('gmgn.stat.bot_degen_rate', 100);"), '占比字段应 ×100');
+    assert.ok(g.code.includes("['垃圾量', F_shit_volume,"), '行里应引用命名 const');
+    assert.ok(!/f\('shit_volume'\)/.test(g.code), 'f() 应被替换掉');
+    assert.ok(!/\bvar f =/.test(g.code) && !g.code.includes('typeof f ==='), '不应有 f 垫片构造');
+    assert.strictEqual(g.direct.length, 2);
+    assert.strictEqual(g.derived.length, 0);
+    assert.strictEqual(g.unresolved.length, 0);
+  });
+
+  test('generateOnlineCode: 剥掉源码里遗留的 f 垫片', () => {
+    const withShim = `// ===== f 兼容垫片 =====\nvar f = (typeof f === 'function') ? f : (function () { return function(){}; })();\n// ===== f 垫片结束 =====\n${directSrc}`;
+    const g = generateOnlineCode(withShim, mkRows());
+    assert.ok(!/\bvar f =/.test(g.code), '遗留垫片应被剥掉');
+    assert.ok(!g.code.includes('f 兼容垫片'), '垫片 banner 应被剥掉');
+  });
+
+  test('generateOnlineCode: 派生字段→命名 const（__Dget），内联 __D 预算块', () => {
+    const src = `const ALL_CHECKS = [ ['买卖比', f('buy_sell_count_ratio'), 10, 1, 1, 5, 5, null, '1~5'] ]`;
+    const g = generateOnlineCode(src, mkRows());
+    assert.ok(g.derived.includes('buy_sell_count_ratio'));
+    assert.ok(g.code.includes('var __D = (function () {'), '应内联派生预算块');
+    assert.ok(g.code.includes("const F_buy_sell_count_ratio = __Dget('buy_sell_count_ratio');"), g.code);
+    assert.ok(g.code.includes("['买卖比', F_buy_sell_count_ratio,"));
+    assert.ok(!/f\('buy_sell_count_ratio'\)/.test(g.code));
+  });
+
+  test('classifyFields: 直接/派生/无法解析三类正确', () => {
+    const cls = classifyFields(['shit_volume', 'buy_sell_count_ratio', 'nope_field_xyz'], mkRows());
+    assert.ok(cls.direct.has('shit_volume'));
+    assert.ok(cls.derived.includes('buy_sell_count_ratio'));
+    assert.strictEqual(cls.unresolved[0].field, 'nope_field_xyz');
+  });
+
+  test('verifyParity: native 取值与 review 一致时 ok，标注 kind', () => {
+    const r = verifyParity(directSrc, mkRows());
+    assert.strictEqual(r.ok, true);
+    assert.ok(r.rowsChecked > 0);
+    assert.ok(r.fields.every(f => f.kind === 'direct'));
+  });
+
+  test('verifyParity: 派生字段口径不一致（review 被篡改）→ 自检失败并定位字段', () => {
+    const src = `const ALL_CHECKS = [ ['买卖比', f('buy_sell_count_ratio'), 10, 1, 1, 5, 5, null, '1~5'] ]`;
+    const r = verifyParity(src, mkRows(12, { tamperDerived: true }));
+    assert.strictEqual(r.ok, false);
+    const f = r.fields.find(x => x.field === 'buy_sell_count_ratio');
+    assert.strictEqual(f.status, 'mismatch');
+    assert.ok(f.mismatches > 0 && f.sample);
+  });
+
+  test('generateOnlineCode: 无法解析的字段退化成 null，并列进 unresolved', () => {
+    const src = `const ALL_CHECKS = [ ['x', f('nope_field_xyz'), 10, 0, 0, 1, 1, null, '~1'] ]`;
+    const g = generateOnlineCode(src, mkRows());
+    assert.strictEqual(g.unresolved.length, 1);
+    assert.strictEqual(g.unresolved[0].field, 'nope_field_xyz');
+    assert.ok(g.code.includes('const F_nope_field_xyz = null;'), '无法解析 → 命名 const = null');
+    assert.ok(g.code.includes("['x', F_nope_field_xyz,"), '行里引用命名 const');
+  });
+
+  test('exportWithVerify: 返回 code + report + 三类字段', () => {
+    const out = exportWithVerify(directSrc, mkRows());
+    assert.ok(out.code.includes('__Vp'));
+    assert.strictEqual(out.report.ok, true);
+    assert.strictEqual(out.direct.length, 2);
+    assert.strictEqual(out.unresolved.length, 0);
+  });
+
+  test('生成的 native 代码可被编译（语法正确）', () => {
+    const g = generateOnlineCode(directSrc, mkRows());
+    // 包一层 function(ctx){...} 编译，确认无语法错误
+    // eslint-disable-next-line no-new-func
+    assert.doesNotThrow(() => new Function('ctx', g.code + '\nreturn true;'));
+  });
+}

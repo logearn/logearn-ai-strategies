@@ -1,6 +1,8 @@
 import assert from 'node:assert';
 import { factorVerdict, suggestWeightAdjustment, computeStrategyMetrics, computeScoreBuckets,
-         accumulateVerdict, dailyFactorVerdicts, crossDayVerdict } from '../src/lib/strategyReplayLogic.js';
+         accumulateVerdict, dailyFactorVerdicts, crossDayVerdict,
+         metricsFromStrategyMetrics, suggestFromReportMetrics } from '../src/lib/strategyReplayLogic.js';
+import { extractScoreReturnPair } from '../src/lib/proAnalytics.js';
 
 // 跨天判定测试用的三档单日 stats（跟上面 factorVerdict 用例同源）：
 const WORSE = { scoredWin: 0.075, scoredN: 400, zeroWin: 0.75, zeroN: 100, camp: 'hero' }; // 无效应组明显更高 → 反向
@@ -146,6 +148,60 @@ export function run(test) {
     assert.ok(m.spearmanRho < 0.5, `乱序时单调性应明显偏弱，实际 ρ=${m.spearmanRho}`);
   });
 
+  // ── score vs 收益散点：应画【硬否决通过】的全部样本，不只是命中的 ────────────────
+  // 真实 bug：策略把 checks.push(['总分'...]) 写在 veto/分低 return false 之后，未命中样本
+  // 吐不出"总分"check，散点只剩命中侧那一撮 score>=cutoff。修复＝checks 无"总分"时回退日志 SCORE=。
+  test('computeStrategyMetrics: 总分 push 在 return 之后时，veto通过但分低的样本仍进散点（靠日志SCORE=兜底）', () => {
+    // buggy 写法：只有命中(score>=80)才 push '总分'；未命中只打 SCORE= 日志
+    const code = `const checks = []
+const veto = Number(f('ok')) === 1
+const score = Number(f('s'))
+if (!veto) { ctx.log.error('未命中(否决) SCORE=' + score.toFixed(1)); return false }
+if (score < 80) { ctx.log.error('未命中(分低) SCORE=' + score.toFixed(1)); return false }
+checks.push(['总分', true, score.toFixed(1), '>= 80'])
+ctx.log.success('命中 SCORE=' + score.toFixed(1))
+return true`;
+    const mk = (name, ok, s, ret) => ({ tokenAddress: name, symbol: name, returnMax: ret,
+      buyTimestamp: 1780000000, rawCtx: {}, features: { ok, s } });
+    // 散点单调性 ρ 需要 >=5 个样本才算得出，这里放 6 条 veto 通过 + 1 条 veto 未过
+    const rows = [
+      mk('vetoFail', 0, 30, 9),   // veto 未过 → 排除（给个高倍率，若被误纳入会打乱同序）
+      mk('low1', 1, 40, 1.1),     // veto 过、分低 → 进散点
+      mk('low2', 1, 55, 1.3),     // veto 过、分低 → 进散点
+      mk('low3', 1, 70, 2.5),     // veto 过、分低 → 进散点
+      mk('hit1', 1, 82, 4),       // 命中 → 进散点
+      mk('hit2', 1, 90, 6),       // 命中 → 进散点
+      mk('hit3', 1, 95, 8),       // 命中 → 进散点
+    ];
+    const m = computeStrategyMetrics(code, rows);
+    assert.strictEqual(m.ok, true);
+    assert.strictEqual(m.total, 7, '全部 7 条都跑了策略');
+    assert.strictEqual(m.hits, 3, '命中(score>=80)有 3 条');
+    // 散点样本 = 6 条 veto 通过，score↔ret 完全同序 → ρ=1
+    // vetoFail(score=30,ret=9) 若被误纳入会严重打乱同序，ρ 到不了 1，以此断言它确实被排除
+    assert.ok(Math.abs(m.spearmanRho - 1) < 1e-9,
+      `散点应含 veto 通过的 6 条(含分低)且排除 veto 未过的，ρ 应=1，实际 ρ=${m.spearmanRho}`);
+  });
+
+  test('extractScoreReturnPair: veto未过样本排除、命中与分低样本保留、收益无效丢弃', () => {
+    const mkRes = (logsText, checks) => ({ error: null,
+      logs: logsText.map(text => ({ text })), checks });
+    // veto 未过：日志含"(否决)" → null
+    assert.strictEqual(
+      extractScoreReturnPair(mkRes(['未命中(否决) SCORE=30'], null), { returnMax: 2 }), null);
+    // 有'总分'check、命中 → 取 check 值
+    const hit = extractScoreReturnPair(
+      mkRes(['命中'], [{ name: '总分', ok: true, value: '90.0', expect: '>= 80' }]), { returnMax: 5 });
+    assert.deepStrictEqual(hit, { score: 90, ret: 5 });
+    // 无'总分'check、日志有 SCORE= → 兜底取分（分低样本）
+    const low = extractScoreReturnPair(mkRes(['未命中(分低) SCORE=55.0'], []), { returnMax: 3 });
+    assert.deepStrictEqual(low, { score: 55, ret: 3 });
+    // 收益无效(<=0) → null
+    assert.strictEqual(
+      extractScoreReturnPair(mkRes(['命中'], [{ name: '总分', ok: true, value: '90', expect: '' }]),
+        { returnMax: 0 }), null);
+  });
+
   // ── 跨天累计判定（A：连续 N 天同向才动手）────────────────────────────────────
   test('accumulateVerdict: 连续 >= minStreak 天同向才给可执行判定，否则 hold', () => {
     // 最近连续 2 天 worse，minStreak=2 → 可执行 worse
@@ -209,5 +265,83 @@ export function run(test) {
     // 序列应是 [今天 worse(实时), 07-24 worse]，07-25 的历史 better 被 todayDate 过滤掉 → 连续 2 天 worse
     assert.strictEqual(cd.verdict, 'worse');
     assert.strictEqual(cd.streak, 2);
+  });
+
+  // ── metricsFromStrategyMetrics：把试算用的顶层指标转成报告存档口径 ──
+  test('metricsFromStrategyMetrics: 编译失败(ok:false)应返回 null，不硬凑一份假指标', () => {
+    assert.strictEqual(metricsFromStrategyMetrics({ ok: false, error: 'x' }), null);
+    assert.strictEqual(metricsFromStrategyMetrics(null), null);
+  });
+
+  test('metricsFromStrategyMetrics: 字段一一映射，spearmanRho/decileRho 分别落进 scoreReturn.rho / monotonicity.rho', () => {
+    const sm = { ok: true, total: 100, hits: 20, passRate: 0.2, hitMedian: 3, missMedian: 0.8,
+      spearmanRho: 0.55, decileRho: 0.4, rLog: 0.3 };
+    const m = metricsFromStrategyMetrics(sm);
+    assert.strictEqual(m.total, 100);
+    assert.strictEqual(m.hitRate, 0.2, 'hitRate 应取 passRate（跟 buildMetrics 存的 agg.hits/agg.valid 同口径）');
+    assert.strictEqual(m.hitMedian, 3);
+    assert.strictEqual(m.missMedian, 0.8);
+    assert.strictEqual(m.scoreReturn.rho, 0.55);
+    assert.strictEqual(m.scoreReturn.rLog, 0.3);
+    assert.strictEqual(m.monotonicity.rho, 0.4);
+  });
+
+  test('metricsFromStrategyMetrics: rLog/spearmanRho/decileRho 全为 null 时（样本太少）对应字段应为 null 而不是硬造对象', () => {
+    const m = metricsFromStrategyMetrics({ ok: true, total: 3, hits: 1, passRate: 0.33, hitMedian: null, missMedian: null,
+      spearmanRho: null, decileRho: null, rLog: null });
+    assert.strictEqual(m.scoreReturn, null);
+    assert.strictEqual(m.monotonicity, null);
+  });
+
+  // ── suggestFromReportMetrics：报告对比"优化建议"，口径跟试算弹窗的 netHint 一致 ──
+  const mkM = (rho, hitRate, rLog) => ({ hitRate, scoreReturn: { rho, rLog } });
+
+  test('suggestFromReportMetrics: 单调性ρ变强、命中率没变差 → success，建议保留', () => {
+    const r = suggestFromReportMetrics(mkM(0.2, 0.1, 0.1), mkM(0.4, 0.15, 0.2));
+    assert.strictEqual(r.type, 'success');
+    assert.ok(r.text.includes('保留'));
+  });
+
+  test('suggestFromReportMetrics: 单调性ρ变弱 → error，建议回退', () => {
+    const r = suggestFromReportMetrics(mkM(0.4, 0.2, 0.2), mkM(0.2, 0.2, 0.1));
+    assert.strictEqual(r.type, 'error');
+    assert.ok(r.text.includes('回退'));
+  });
+
+  test('suggestFromReportMetrics: 单调性ρ变强但命中率下降 → warning，建议观察', () => {
+    const r = suggestFromReportMetrics(mkM(0.2, 0.3, 0.1), mkM(0.4, 0.2, 0.2));
+    assert.strictEqual(r.type, 'warning');
+  });
+
+  test('suggestFromReportMetrics: ρ 基本不变（<EPS）→ info', () => {
+    const r = suggestFromReportMetrics(mkM(0.30, 0.2, 0.1), mkM(0.3001, 0.2, 0.1));
+    assert.strictEqual(r.type, 'info');
+  });
+
+  test('suggestFromReportMetrics: 两份都没有 ρ，退回看命中率——提升 → success，下降 → error', () => {
+    const before = { hitRate: 0.1, scoreReturn: null };
+    const up = suggestFromReportMetrics(before, { hitRate: 0.2, scoreReturn: null });
+    assert.strictEqual(up.type, 'success');
+    const down = suggestFromReportMetrics(before, { hitRate: 0.05, scoreReturn: null });
+    assert.strictEqual(down.type, 'error');
+  });
+
+  test('suggestFromReportMetrics: 两份都算不出 ρ 和命中率 → info，且明说"无法给出优化建议"', () => {
+    const r = suggestFromReportMetrics({ hitRate: null, scoreReturn: null }, { hitRate: null, scoreReturn: null });
+    assert.strictEqual(r.type, 'info');
+    assert.ok(r.text.includes('无法给出'));
+  });
+
+  test('suggestFromReportMetrics: 缺 before/after 应返回 null，不抛异常', () => {
+    assert.strictEqual(suggestFromReportMetrics(null, mkM(0.2, 0.1, 0.1)), null);
+    assert.strictEqual(suggestFromReportMetrics(mkM(0.2, 0.1, 0.1), undefined), null);
+  });
+
+  test('suggestFromReportMetrics: monotonicity.rho 作为 scoreReturn.rho 缺失时的兜底', () => {
+    const before = { hitRate: 0.1, monotonicity: { rho: 0.2 } };
+    const after = { hitRate: 0.15, monotonicity: { rho: 0.4 } };
+    const r = suggestFromReportMetrics(before, after);
+    assert.strictEqual(r.type, 'success');
+    assert.ok(r.detail.includes('0.200'));
   });
 }

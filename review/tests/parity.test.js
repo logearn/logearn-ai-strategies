@@ -138,13 +138,23 @@ export function run(test, testAsync) {
     for (const nx of newList) {
       const ox = oldMap.get(key(nx));
       if (!ox) { diffs.push(`新版多出 ${key(nx)}`); continue; }
-      for (const f of ['r', 'rho', 'n', 'p', 'quality']) {
+      // 'p' 是有意的行为分叉，不是移植疏漏：旧版（js/data.js，legacy UI 按线性 r 排序/筛选）的 p
+      // 算的是 r 的显著性；新版（React UI）已把 Spearman ρ 提为主排序指标（P1-1），p 若还按 r 算，
+      // 会跟界面上加★的 ρ 对不上（曾是真实 bug）。新版另存了一份 'pr'（=旧版 p 的算法），
+      // 下面单独拿它跟旧版 p 对比，确认"旧算法本身没被改坏"，只是不再挂在 'p' 这个字段名下。
+      for (const f of ['r', 'rho', 'n', 'quality']) {
         const a = ox[f], b = nx[f];
         if (Number.isFinite(a) && Number.isFinite(b)) {
           if (Math.abs(a - b) > 1e-9 * Math.max(1, Math.abs(a))) diffs.push(`${key(nx)}.${f}：旧=${a} 新=${b}`);
         } else if (a !== b && !(Number.isNaN(a) && Number.isNaN(b))) {
           diffs.push(`${key(nx)}.${f}：旧=${a} 新=${b}`);
         }
+      }
+      const op = ox.p, npr = nx.pr;
+      if (Number.isFinite(op) && Number.isFinite(npr)) {
+        if (Math.abs(op - npr) > 1e-9 * Math.max(1, Math.abs(op))) diffs.push(`${key(nx)}.p(旧)≠pr(新)：旧=${op} 新=${npr}`);
+      } else if (op !== npr && !(Number.isNaN(op) && Number.isNaN(npr))) {
+        diffs.push(`${key(nx)}.p(旧)≠pr(新)：旧=${op} 新=${npr}`);
       }
     }
     assert.deepStrictEqual(diffs.slice(0, 8), [], '相关性结果应一致');

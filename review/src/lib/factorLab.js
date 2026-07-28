@@ -11,7 +11,7 @@
 //     这里若用 >= 会在阈值恰好落在样本值上时与 AUC 面板对不上。
 //   - 缺失值（字段值为 null/undefined/空串/非数值）一律记 0 分，不做均值填充——
 //     生成的策略代码必须复刻同一语义（见 generateStrategyCode 里的 V()）。
-import { percentile, wilsonInterval, spearman, splitTrainTest, WIN_THRESHOLD } from './utils.js';
+import { percentile, wilsonInterval, spearman, splitTrainTest, median, WIN_THRESHOLD, benjaminiHochbergAdjust, mulberry32 } from './utils.js';
 import { collectAucSamples, scanFieldsAuc } from './auc.js';
 import { getFeature, isAssembledField, isKlineVolumeField, PERCENT_FRACTION_FIELDS } from './data.js';
 
@@ -39,7 +39,7 @@ export function splitRowsByTime(rows, trainRatio = 0.7) {
 // labels 是外部传入的 0/1 数组：findHotInterval 传"赢"标签，findColdInterval 传"输"标签
 // （对同一份 values 取反），两者共用这一份窗口扫描逻辑，评分/输出字段含义完全对称。
 function scanIntervalCore(values, labels, opts = {}) {
-  const { minCoverage = 0.3, minN, targetLabel = '目标类' } = opts;
+  const { minCoverage = 0.3, minN, targetLabel = '目标类', permB = 200 } = opts;
   const n = values.length;
   const posTotal = labels.reduce((a, b) => a + b, 0);
   if (n < 20) return { error: `有效样本仅 ${n} 条（<20）` };
@@ -51,52 +51,83 @@ function scanIntervalCore(values, labels, opts = {}) {
   const sortedX = values.slice().sort((a, b) => a - b);
   if (new Set(sortedX).size < 4) return { error: '取值种类太少（<4）' };
 
-  // 分位数网格去重后作为窗口边界，两端补 ±Infinity 覆盖单边开区间
+  // 分位数网格去重后作为窗口边界，两端补 ±Infinity 覆盖单边开区间——只依赖 values，跟 labels
+  // 无关，置换检验时反复复用，不用每次重算
   const edgeSet = new Set();
   for (let q = 5; q <= 95; q += 5) edgeSet.add(percentile(sortedX, q / 100));
   const edges = [-Infinity, ...[...edgeSet].sort((a, b) => a - b), Infinity];
+  const numSeg = edges.length - 1;
 
-  // 每个样本归入 [edges[i], edges[i+1]) 段，做前缀和后任意窗口计数 O(1)
-  const segN = new Array(edges.length - 1).fill(0);
-  const segPos = new Array(edges.length - 1).fill(0);
+  // 每个样本落进哪个分位段同样只取决于 values，算一次，置换检验反复复用；
+  // 真正随 labels 变的只是"这个段里有几个目标类"这个聚合，每次置换重新聚合即可
+  const segIdx = new Array(n);
   for (let i = 0; i < n; i++) {
     let s = 0;
-    while (s < edges.length - 2 && values[i] >= edges[s + 1]) s++;
-    segN[s]++; segPos[s] += labels[i];
+    while (s < numSeg - 1 && values[i] >= edges[s + 1]) s++;
+    segIdx[i] = s;
   }
-  const cumN = [0], cumPos = [0];
-  for (let i = 0; i < segN.length; i++) { cumN.push(cumN[i] + segN[i]); cumPos.push(cumPos[i] + segPos[i]); }
 
-  const scan = (covReq) => {
-    let best = null;
-    for (let i = 0; i < edges.length - 1; i++) {
-      for (let j = i + 1; j < edges.length; j++) {
-        const wN = cumN[j] - cumN[i];
-        const wPos = cumPos[j] - cumPos[i];
-        if (wN < minGroup) continue;
-        const coverage = wPos / posTotal;
-        if (coverage < covReq) continue;
-        const rate = wPos / wN;
-        if (rate <= base) continue;
-        const wilsonLo = wilsonInterval(wPos, wN).lo;
-        // 评分乘 √coverage：不加的话，随机波动会让"只圈住信号密集段一小截"的窄窗口胜出，
-        // 挖出的区间比真实目标类集中区窄一圈；捕获率加权把这种 cherry-pick 压回去
-        const score = (wilsonLo / base) * Math.sqrt(coverage);
-        if (!best || score > best.score
-          || (score === best.score && (coverage > best.coverage || (coverage === best.coverage && wN > best.n)))) {
-          best = { lo: edges[i], hi: edges[j], n: wN, pos: wPos, winRate: rate, lift: rate / base,
-                   coverage, wilsonLo, score };
+  // 给一份 labels（真实的或置换后的）算出"能搜到的最优窗口"——真实调用与下面的置换检验
+  // 共用同一套逻辑，保证零假设分布和观测值是同一把尺子量出来的，这是置换检验有效的前提
+  function bestScoreFor(labelsArr) {
+    const segN = new Array(numSeg).fill(0);
+    const segPos = new Array(numSeg).fill(0);
+    for (let i = 0; i < n; i++) { segN[segIdx[i]]++; segPos[segIdx[i]] += labelsArr[i]; }
+    const cumN = [0], cumPos = [0];
+    for (let i = 0; i < numSeg; i++) { cumN.push(cumN[i] + segN[i]); cumPos.push(cumPos[i] + segPos[i]); }
+    const scan = (covReq) => {
+      let best = null;
+      for (let i = 0; i < numSeg; i++) {
+        for (let j = i + 1; j <= numSeg; j++) {
+          const wN = cumN[j] - cumN[i];
+          const wPos = cumPos[j] - cumPos[i];
+          if (wN < minGroup) continue;
+          const coverage = wPos / posTotal;
+          if (coverage < covReq) continue;
+          const rate = wPos / wN;
+          if (rate <= base) continue;
+          const wilsonLo = wilsonInterval(wPos, wN).lo;
+          // 评分乘 √coverage：不加的话，随机波动会让"只圈住信号密集段一小截"的窄窗口胜出，
+          // 挖出的区间比真实目标类集中区窄一圈；捕获率加权把这种 cherry-pick 压回去
+          const score = (wilsonLo / base) * Math.sqrt(coverage);
+          if (!best || score > best.score
+            || (score === best.score && (coverage > best.coverage || (coverage === best.coverage && wN > best.n)))) {
+            best = { lo: edges[i], hi: edges[j], n: wN, pos: wPos, winRate: rate, lift: rate / base,
+                     coverage, wilsonLo, score };
+          }
         }
       }
-    }
-    return best;
-  };
+      return best;
+    };
+    // 找不到满足捕获率的窗口时放宽一次再试——宁可给个窄区间让用户自己判断，也别直接空手而归
+    return scan(minCoverage) || scan(minCoverage / 2);
+  }
 
-  // 找不到满足捕获率的窗口时放宽一次再试——宁可给个窄区间让用户自己判断，也别直接空手而归
-  const best = scan(minCoverage) || scan(minCoverage / 2);
+  const best = bestScoreFor(labels);
   if (!best) return { error: `没有${targetLabel}比率高于基准且样本量达标的区间` };
-  const { score: _s, ...interval } = best;
-  return { ...interval, base, posTotal, total: n };
+
+  // 置换检验：观测到的这个"最优窗口"分数，是从 O(边界数²) 个候选窗口里挑出来的赢家——
+  // 直接对它做"假装区间是提前定好的"检验（比如两比例检验）会系统性低估巧合概率
+  // （look-elsewhere/winner's curse）。做法：labels 完全随机洗牌 permB 次，每次都用同一套
+  // bestScoreFor 重新搜一遍"这次洗牌能凑出的最高分数"，得到一个"纯靠搜索本身就能凑多高"的
+  // 零假设分布，观测分数在这个分布里排第几，才是这次搜索本身的显著性。种子固定
+  // （跟 bootstrapAucCI 同一套 mulberry32 模式）保证同一份数据反复扫结果可复现。
+  const rand = mulberry32(0x2545F491);
+  const shuffled = labels.slice();
+  let geCount = 0;
+  for (let b = 0; b < permB; b++) {
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      const tmp = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = tmp;
+    }
+    const permBest = bestScoreFor(shuffled);
+    if (permBest && permBest.score >= best.score) geCount++;
+  }
+  const pPermutation = (geCount + 1) / (permB + 1);
+
+  // score=(wilsonLo/base)×√coverage 是区间感知、自带小样本抗噪声保护的判别力统计量——
+  // 候选粗筛排序/初始配权改用它（而不是假设方向单调的AUC）时要读这个字段，不能再丢弃
+  return { ...best, base, posTotal, total: n, pPermutation };
 }
 
 // 高倍盘（"赢"）集中区间——勇者阵营用：值落在这个区间 = 好迹象，用来加分。
@@ -203,6 +234,19 @@ export async function scanFactorCandidates(rows, fields, opts = {}) {
       camp,
     });
   }
+  // 区间显著性：pPermutation（scanIntervalCore 内部置换检验算出的，已经为"从很多候选窗口里
+  // 挑最优"这件事做了校正，不是简单的两比例检验）+ BH 多重比较校正——跟上面 AUC 的
+  // significant/significantAdj 同一套纪律，只是检验对象换成区间（区间是判据实际吃的
+  // 东西，AUC 假设方向单调、区间不假设，两者可能给出相反结论，见候选粗筛/配权改用 interval.score
+  // 处的注释）。挂在 interval 上而不是候选顶层，避免跟 AUC 那两个同名字段混淆。
+  const pRaw = out.map(c => c.interval ? c.interval.pPermutation : NaN);
+  const pAdjArr = benjaminiHochbergAdjust(pRaw);
+  out.forEach((c, i) => {
+    if (c.interval) {
+      c.interval.pAdj = pAdjArr[i];
+      c.interval.significantAdj = Number.isFinite(pAdjArr[i]) && pAdjArr[i] < 0.05;
+    }
+  });
   const skipped = results.filter(r => r.reason).map(r => ({ field: r.field, reason: r.reason }));
   return { candidates: out, skipped };
 }
@@ -252,11 +296,14 @@ export function buildFactors(rows, candidates, fieldSpecs, winThreshold = WIN_TH
   return { factors: autoWeights(factors), skipped };
 }
 
-// 权重 ∝ |AUC-0.5|，四舍五入到 1 位小数后用最大余数法修正，总和恰为 100。
-// 全部 AUC 恰为 0.5（理论上不会进到这）时退化为均分。
+// 权重 ∝ interval.score（区间感知、Wilson下界×√coverage，见scanIntervalCore），四舍五入到
+// 1 位小数后用最大余数法修正，总和恰为 100。之前是 |AUC-0.5|——AUC 假设方向单调，"驼峰型"
+// 字段（比如中段区间命中率最高、两头都低）在AUC上会显得没区分度，但区间打分可能很强，两者
+// 会给出相反结论，改用interval.score才能跟下游打分（也是区间/梯形，不假设方向）口径一致。
+// 全部为 0（理论上不会进到这）时退化为均分。
 export function autoWeights(factors) {
   if (!factors.length) return factors;
-  const raw = factors.map(f => Math.abs((Number(f.auc) || 0.5) - 0.5));
+  const raw = factors.map(f => Number(f.interval?.score) || 0);
   const sum = raw.reduce((a, b) => a + b, 0);
   const shares = sum > 0 ? raw.map(x => x / sum * 100) : raw.map(() => 100 / factors.length);
   const floored = shares.map(x => Math.floor(x * 10) / 10);
@@ -268,7 +315,7 @@ export function autoWeights(factors) {
 }
 
 // ---------- 已选因子的两两相关性 ----------
-// 权重按 |AUC-0.5| 各自独立分配，两个高度相关的因子（如 新钱包% 与 新钱包率%）会把
+// 权重按 interval.score 各自独立分配，两个高度相关的因子（如 新钱包% 与 新钱包率%）会把
 // 同一份信息收两次钱。这里用 Spearman（秩相关，抗离群值）扫一遍已选组合，超阈值的
 // 对子交给界面挂提醒——合并成一个或手动降权，由使用者决定。
 export function factorCorrelations(rows, fields, { threshold = 0.7, minN = 20 } = {}) {
@@ -337,6 +384,157 @@ function scorePoolRho(rows, factorSet, missingPolicy) {
 // 补回这层保护：不管 volumeWeighted 开不开，过线/未过线两层都必须达到这个样本量才评估台阶差，
 // 逼着搜索只能在统计上站得住脚的分组上找权重，不能靠小样本噪声投机取巧。
 // 垃圾/高倍标签口径跟"找因子"体系一致：直接用 returnMax > winThreshold，不引入独立的垃圾标签字段。
+//
+// 共享核心：给已排好分数的 pairs 按分位数切 K 档（同分不跨档，仿 computeScoreBuckets），
+// 算"档序号 vs 档统计量"的 spearman——cutoff-free，是 scorePoolTierGain 的"②粗粒度秩相关"
+// 和下面 scorePoolBucketRho（"推荐"场景独立北极星）共用的逻辑，不写两遍。
+//
+// 2026-07-28 订正（用户订正："K=3~5 不可以，相当于原本要几百个桶直接变成3~5个"）：
+// 最早版本 K 固定 3~5、档内统计量用命中率，实测直接踩坑——真实数据里 frequent_volume 单独一个
+// 因子就跑出 Δ=+1.000（理论最大值），贪心只推一步就停。根因：K=3~5 时秩相关只有 3~5 个点参与
+// 计算，"这几个粗糙数字凑巧排对顺序"的概率远高于全局ρ（几百个点）"整条序列都排对"的概率，是
+// 离散网格效应/统计巧合，不是真信号——全局ρ与分层秩相关的核心区别就是参与计算的点数差两个
+// 数量级，这直接决定了两者对巧合的抵抗力天差地别。
+// 第一版改法（按"每档期望命中数≥3"算档大小=max(15,ceil(3/baseWinRate))）上线后，真实数据里
+// 又在另一处撞出同样的 +1.000（这次是 followed_tx_analysis.sell_amount，held-out涨到顶格但
+// 样本内只有+0.200）——回查发现：test 段样本量小、局部命中率一旦比全局基准更低（抽样波动，
+// 完全正常），ceil(3/baseWinRate)会把档点数顶得很大，K 又被压回3（数值上"没跌破K<3的检查"，
+// 但K=3本身就是最初那个问题的原始网格，检查形同虚设）。根子问题：档内统计量早就换成了中位数
+// （连续值，不需要"够3个命中"才稳），"按命中数定档大小"这条逻辑从改中位数那一刻起就已经是
+// 过时的历史包袱，没必要再跟着命中率走——这次直接删掉，档大小固定用中位数稳定所需的点数
+// （15），不再随局部命中率的抽样波动而忽大忽小。同时把"K太小就拒绝评估"的门槛从3提到5——
+// K=3~4 时数值网格依然粗糙（比如n=5时spearman网格步长才0.1，n=3~4时明显更粗），涨到5起步，
+// 网格才算真正跳出"随手一凑就顶格"的危险区。
+//
+// 2026-07-28 再订正（用户诊断："推荐时少算了一个维度，把一个维度算到了极致，导致高度集中在一起——
+// 目标其实是低倍率尽量分散在低分值、高倍率在高分值，这样阈值右侧赚率才高"）：上面这些订正堵住的
+// 是"点数太少导致巧合顶格"，但还有一条完全不同的路能制造出虚高分数——秩相关只看"桶与桶之间"
+// 中位数排得对不对，完全不管"桶内部"混杂成什么样。真实撞过：单独用 max_up_duration 推出的梯形
+// 下界形同虚设（几乎所有样本不管好坏都落在满分区），散点图上score=100那一竖排从1x到200x全挤在
+// 一起——桶间中位数排序看着还行（+0.964），但顶格那个桶把大部分样本饱和堆在同一个分数上，桶内部
+// 完全没有区分度，对实盘"cutoff右侧赚率"这个真实目标没有意义，贪心却因为桶间排序过关就停手，
+// 不会再找下一个因子去把这坨样本摊开。
+// 加一层"饱和度惩罚"：算出最大单桶样本占比 maxBucketFrac，最终值 = 秩相关 × (1 − maxBucketFrac)。
+// 分布均匀时（K个桶均分，各桶占比≈1/K）几乎不打折；出现某个桶吃掉大半样本这种饱和情况时，
+// 狠狠打折——逼着贪心/配权继续找能把饱和样本摊开的因子，而不是满足于"桶间排序对、桶内一锅粥"
+// 的解。scorePoolTierGain 的"②粗粒度秩相关"分量共用这条逻辑，同样受益（筛垃圾也不该允许
+// 大部分样本堆在同一个分数上）。
+// 2026-07-28 三订正（用户诊断："中位数对右偏分布不敏感——倍数分布是一大坨1~3x的普通盘+一小撮
+// 10~200x的尾部，不管总分高低，中位数都被这一大坨普通盘钉死在差不多的位置，尾部涨得再猛中位数
+// 感受不到；Spearman又只看顺序对不对，于是曲线视觉上像噪声带、案例中位数线基本走平，但秩相关
+// 却能算出0.5~0.7——这是数值上技术性满足单调，不是真信号"）：档内统计量从中位数换成命中率
+// （命中率 = 该档 returnMax > winThreshold 的比例），这才是跟十分位表"高倍率5.5%→20.0%一路爬升"
+// 同一个口径的东西，也是用户真正在意的"阈值右侧赚率"。
+// 代价（同样是用户指出的）：命中率在小分桶下方差更大——bucketSize固定15、真实命中率~15%时
+// 每档期望只有2~3个命中，噪声会比中位数明显。防护手段是 bucketSize 按命中率自适应放大：
+// max(15, ceil(minHitCount/rate))，rate 用当前这份 pairs 自己的整体命中率估计（不是历史上踩过坑的
+// "跨 train/test 用不同局部估计"，这里只在这一次调用内部自洽），确保每档期望命中数不至于太可怜。
+// 注意：不能反过来按"某档实际命中数<3就剔除该档"过滤——这是试过又踩的坑：一个 n=65 的大档
+// 实际命中数=0，恰恰是"该档命中率确信地很低（大概率在0~5%附近，样本量摆在那）"，是真信号的一部分，
+// 不是噪声；按绝对命中数剔除会把两端本该确信为低/高命中率的大档一起滤掉，破坏序列完整性，
+// 反而更容易在真实数据上把好因子的分层秩相关判成 NaN。噪声只能靠"分档时保证期望命中数"这层
+// 事前防护来控制，不能靠"看到命中数少就事后剔除"来滤——那等于是拿实现结果去筛统计假设。
+// winThreshold 不是 finite（老调用点没传）时退回旧的中位数口径，保证向后兼容。
+//
+// 按分位数切档的共享核心，拆出来单独导出——bucketRankRho 算 rho 用得到，UI 也想把"档边界/档命中率"
+// 画到散点图上给用户肉眼判断分层是否单调，两边不该各写一份切档逻辑。
+// 返回 null（档数不足，网格太粗不可信）或
+// { buckets: [{loScore,hiScore,medianRet,hitRate,hitCount,n}], maxBucketFrac }。
+export function computeRankBuckets(pairs, winThreshold) {
+  const n = pairs.length;
+  if (n < 10) return null;
+  const minK = 5; // K/实际分档数低于此值，网格太粗，宁可算不出来也不要给一个不可信的数
+  const minBucketSize = 15; // 固定下限：中位数稳定估计所需的最少点数
+  const minHitCount = 3;
+  const useHitRate = Number.isFinite(winThreshold);
+  let bucketSize = minBucketSize;
+  if (useHitRate) {
+    const rate = pairs.filter(p => p.ret > winThreshold).length / n;
+    if (rate > 0) bucketSize = Math.max(minBucketSize, Math.ceil(minHitCount / rate));
+    // rate===0（全员未中）：命中率统计本来就没有意义，退回 minBucketSize——
+    // 下面每档命中数检查会自然把所有档滤掉，最终 bucketRankRho 返回 NaN，不会硬造数字。
+  }
+  const K = Math.floor(n / bucketSize);
+  if (K < minK) return null;
+  const sorted = pairs.slice().sort((a, b) => a.score - b.score);
+  const buckets = [];
+  let maxBucketSize = 0;
+  let start = 0;
+  for (let k = 1; k <= K && start < n; k++) {
+    let end = Math.floor(k * n / K);
+    if (end <= start) continue;                                     // 上一档已把这段吃掉
+    while (end < n && sorted[end].score === sorted[end - 1].score) end++;  // 别在同分处切开
+    const chunk = sorted.slice(start, end);
+    start = end;
+    if (!chunk.length) continue;
+    const hitCount = useHitRate ? chunk.filter(p => p.ret > winThreshold).length : NaN;
+    buckets.push({
+      loScore: chunk[0].score, hiScore: chunk[chunk.length - 1].score,
+      medianRet: median(chunk.map(p => p.ret)), n: chunk.length,
+      hitRate: useHitRate ? hitCount / chunk.length : NaN, hitCount,
+    });
+    maxBucketSize = Math.max(maxBucketSize, chunk.length);
+  }
+  if (buckets.length < minK) return null;   // 同分合并（"别在同分处切开"）可能把实际档数压得比 K 少，这里按实际档数再查一次
+  return { buckets, maxBucketFrac: maxBucketSize / n };
+}
+
+// 诊断用：从一组档（computeRankBuckets 的输出）里挑出"打架"（命中率比前一档还低）的位置，
+// 不用把所有档摊开来人工目测——inversions 数组每项标出具体是哪两档、命中率差多少、
+// 那个分数区间在哪，方便直接定位"贪心这一步加的因子，是不是把哪一段分数区间的排序搅乱了"。
+export function bucketZigzag(buckets) {
+  if (!buckets || buckets.length < 2) return { inversionCount: 0, worstDrop: 0, inversions: [] };
+  const inversions = [];
+  let worstDrop = 0;
+  for (let i = 1; i < buckets.length; i++) {
+    const prev = buckets[i - 1], cur = buckets[i];
+    const drop = prev.hitRate - cur.hitRate;
+    if (drop > 1e-9) {
+      inversions.push({ fromIdx: i - 1, toIdx: i, scoreRange: [prev.loScore, cur.hiScore],
+        fromHitRate: prev.hitRate, toHitRate: cur.hitRate, drop });
+      worstDrop = Math.max(worstDrop, drop);
+    }
+  }
+  return { inversionCount: inversions.length, worstDrop, inversions };
+}
+
+// 2026-07-28 四订正（用户看回测图发现："紫线（档命中率）锯齿很重，这个锯齿程度应该是参数里
+// 重要的衡量指标"）：饱和度惩罚堵住了"桶间排对、桶内一锅粥"，但没堵住另一种虚高——spearman
+// 只看整条序列"大体上"排没排对，一条整体爬升但中间反复倒挂（比如第40档比第39档命中率还低）的
+// 曲线，照样能换出一个不算差的秩相关。`bucketZigzag` 这个诊断函数早就写好了（数相邻档倒挂的
+// 次数/幅度），但之前只在 recommendFactorPath 贪心路径的导出诊断里用，从没接进任何目标函数——
+// 配权时优化器对锯齿完全"失明"。
+// 第一版（用"总跨度"range 归一）在真实数据上直接踩坑：真实数据 K 常有 40+ 档（n=679 时
+// bucketSize 固定至少15，K=floor(679/15)≈45），倒挂次数只要有十几次，totalDrop 累加起来就
+// 轻松超过 range 这个固定值——导致几乎所有候选的锯齿惩罚都封顶在1，边际贡献列几乎全部塌成
+// 0.000、因子推荐只挑得出1个字段。根子问题：totalDrop 是"累加量"，会随档数增多线性变大，
+// 但 range 是跟档数无关的固定常数，两者除出来的比值天然会随档数增多而发散，不该拿一个会随
+// 输入规模变化的分子去除一个不会变的分母。
+// 改用"总变差"（totalVariation = 所有相邻档差值的绝对值之和，涨跌都算）归一：
+// zigzagPenalty = 倒挂步长之和 / 总变差。totalDrop 天然是 totalVariation 的一个子集（只数
+// 跌的部分），比值永远落在 [0,1]，不需要额外封顶，也不会随档数增多而发散——它衡量的是"整条
+// 序列的涨涨跌跌里，有多少比例是在往回跌"，跟档数无关，只跟"跌的部分占涨跌总量的比例"有关。
+function bucketRankRho(pairs, winThreshold) {
+  const built = computeRankBuckets(pairs, winThreshold);
+  if (!built) return NaN;
+  const series = Number.isFinite(winThreshold)
+    ? built.buckets.map((b, i) => [i, b.hitRate])
+    : built.buckets.map((b, i) => [i, b.medianRet]);
+  const rho = spearman(series);
+  if (!Number.isFinite(rho)) return NaN;
+  let zigzagPenalty = 0;
+  if (Number.isFinite(winThreshold)) {
+    const hitRates = built.buckets.map(b => b.hitRate);
+    let totalVariation = 0;
+    for (let i = 1; i < hitRates.length; i++) totalVariation += Math.abs(hitRates[i] - hitRates[i - 1]);
+    if (totalVariation > 0) {
+      const totalDrop = bucketZigzag(built.buckets).inversions.reduce((s, x) => s + x.drop, 0);
+      zigzagPenalty = totalDrop / totalVariation;
+    }
+  }
+  return rho * (1 - built.maxBucketFrac) * (1 - zigzagPenalty);
+}
+
 function scorePoolTierGain(rows, factorSet, cutoff, missingPolicy, winThreshold, volumeWeighted = true, minGroupN = 20) {
   if (!factorSet.length) return NaN;
   const scored = scoreRows(rows, factorSet, { missingPolicy });
@@ -355,31 +553,41 @@ function scorePoolTierGain(rows, factorSet, cutoff, missingPolicy, winThreshold,
   const hitRateOf = arr => arr.filter(p => p.ret > winThreshold).length / arr.length;
   const tierGap = hitRateOf(above) - hitRateOf(below);
 
-  // ② 粗粒度秩相关：排序后切 K 档（不拆同分），要求"档序号"与"档命中率"秩相关
-  const K = n >= 60 ? 5 : (n >= 30 ? 3 : 0);
-  let tierRho = 0;
-  if (K > 0) {
-    const sorted = pairs.slice().sort((a, b) => a.score - b.score);
-    const buckets = [];
-    let start = 0;
-    for (let k = 1; k <= K && start < n; k++) {
-      let end = Math.floor(k * n / K);
-      if (end <= start) continue;                                     // 上一档已把这段吃掉
-      while (end < n && sorted[end].score === sorted[end - 1].score) end++;  // 别在同分处切开
-      const chunk = sorted.slice(start, end);
-      start = end;
-      if (!chunk.length) continue;
-      const wins = chunk.filter(p => p.ret > winThreshold).length;
-      buckets.push(wins / chunk.length);
-    }
-    if (buckets.length >= 3) {
-      const rho = spearman(buckets.map((wr, i) => [i, wr]));
-      tierRho = Number.isFinite(rho) ? rho : 0;
-    }
-  }
+  // ② 粗粒度秩相关：跟 cutoff 无关，见 bucketRankRho；档内统计量用命中率（跟①同一把 winThreshold），
+  // 不用中位数——原因见 bucketRankRho 上方 2026-07-28 三订正的注释。
+  const rawTierRho = bucketRankRho(pairs, winThreshold);
+  const tierRho = Number.isFinite(rawTierRho) ? rawTierRho : 0;
 
   const gapScore = 0.7 * tierGap + 0.3 * tierRho;
   return volumeWeighted ? above.length * gapScore : gapScore;
+}
+
+// ---------- 分层秩相关（cutoff-free，"推荐"场景独立北极星）----------
+// 用户订正（2026-07-28）："围绕 cutoff 判定"这个方向本身就不对——应该先排序，按整体单调性
+// （不要求逐点严格单调，只要求粗粒度分层递增）配好权重，cutoff 是排序定下来之后【从结果里读出来
+// 的一个点】（用现成的「推荐阈值」/recommendCutoff，按净超额命中数找），不该反过来先猜一个 cutoff
+// 去当配权目标函数的输入。上面 scorePoolTierGain 把"cutoff 台阶差"当主判据（权重 0.7）正是这个
+// 本末倒置的来源——cutoff 一变，配权就要整个重来，还牵出触发量乘数是否该奖励、held-out 在固定
+// 切分点两侧样本失衡（甚至算出 NaN）等一串连带问题，这些坑本质上都是"cutoff 绑定"这个设计缺陷的
+// 表现，不是碰巧。
+// scorePoolBucketRho 完全不吃 cutoff：只用 bucketRankRho（自适应分位档，同分不跨档，
+// 档内统计量用命中率）算"档序号 vs 档命中率"的秩相关，∈[-1,1]。适用场景：策略以"推荐"
+// （挑出一批候选，不是卡一条硬线）为第一目标——配完权重后再用「推荐阈值」单独定 cutoff，两件事
+// 彻底解耦，不会因为换 cutoff 就要重新配权。"筛垃圾"场景仍用 scorePoolTierGain（那边确实需要
+// 一条硬过线，cutoff 绑定是合理的）。
+// winThreshold 传给 bucketRankRho 用来算每档命中率——见 2026-07-28 三订正：中位数对右偏的
+// 倍数分布不敏感（一大坨低倍盘钉死中位数，尾部涨多猛都感受不到），命中率才是真正对应
+// "阈值右侧赚率"的统计量。
+export function scorePoolBucketRho(rows, factorSet, missingPolicy, winThreshold) {
+  if (!factorSet.length) return NaN;
+  const scored = scoreRows(rows, factorSet, { missingPolicy });
+  const pairs = [];
+  for (const s of scored) {
+    const ret = Number(s.row.returnMax);
+    if (Number.isFinite(s.score) && Number.isFinite(ret)) pairs.push({ score: s.score, ret });
+  }
+  if (pairs.length < 10) return NaN;
+  return bucketRankRho(pairs, winThreshold);
 }
 
 // currentFactors：当前已选因子池（不含候选自己）；candidate：来自扫描结果的候选行
@@ -437,7 +645,7 @@ export function computeHeldOutDeltaRho(rows, currentFactors, candidate, camp, wi
 }
 
 // ---------- ρ 驱动配权（北极星直接优化，默认口径：全程强单调）----------
-// autoWeights 按 |AUC−0.5| 分权，那是单字段二值判别力，跟"总分↔returnMax 单调(Spearman ρ)"这个
+// autoWeights 按 interval.score 分权，那是单字段区间判别力，跟"总分↔returnMax 单调(Spearman ρ)"这个
 // 唯一目标只是相关、不是一回事。这里直接搜非负权重最大化 ρ：
 //   - ρ 只由 score 的秩序决定，score=Σ(±w·s)/Σw×100 的分母对所有样本同值（zero 口径），
 //     所以优化的就是分子 Σ(±w·s) 的排序；每个因子的 ±s 与权重无关（scorePoolRho 内部现算）。
@@ -559,11 +767,49 @@ export function optimizeWeightsForTierGain(rows, factors, cutoff, opts = {}) {
   };
 }
 
+// ---------- 分层秩相关配权（"推荐"场景的独立北极星：不需要 cutoff）----------
+// 跟 optimizeWeightsForRho/TierGain 同一套框架（train 拟合 δ 坐标上升、两个起点各跑一次取 train
+// 最优、test 段只验证不参与搜索），目标函数换成 scorePoolBucketRho——完全不吃 cutoff，只要求
+// K=3~5 粗粒度分档递增，不追全程精细单调（避免被小样本噪声牵着走），也不绑定任何具体 cutoff
+// （避免 cutoff 一变、配权就要重来，见 scorePoolBucketRho 内部注释）。
+// 配完权重后，cutoff 用「推荐阈值」（recommendCutoff，按净超额命中数找）另外去定，不在这里定。
+export function optimizeWeightsForBucketRho(rows, factors, opts = {}) {
+  const { missingPolicy = 'zero', trainRatio = 0.7, timeField = 'swapBeginTime',
+          splitMethod = 'time', maxRounds = 40, zeroEps = 0.05, winThreshold = DEFAULT_FACTOR_WIN_THRESHOLD } = opts;
+  if (!Array.isArray(factors) || factors.length < 2) return { error: '至少要有 2 个因子才谈得上配权' };
+  const { train, test } = splitTrainTest(rows, splitMethod, trainRatio, timeField);
+  const curWeights = factors.map(f => Number(f.weight) || 0);
+  const objFn = (rowsSet, factorSet, mp) => scorePoolBucketRho(rowsSet, factorSet, mp, winThreshold);
+  const rhoTrainBefore = objFn(train, factors, missingPolicy);
+  if (!Number.isFinite(rhoTrainBefore)) return { error: 'train 集样本不足，切不出至少 3 个有效分位档，无法评估分层秩相关' };
+
+  const starts = [autoWeights(factors).map(f => f.weight), factors.map(() => 1)];
+  let best = null;
+  for (const s of starts) {
+    const r = coordinateAscentGeneric(objFn, train, factors, s, missingPolicy, maxRounds);
+    if (!best || r.rho > best.rho) best = r;
+  }
+  const sum = best.w.reduce((a, b) => a + b, 0);
+  const normW = sum > 0 ? best.w.map(x => Math.round(x / sum * 1000) / 10) : best.w.map(() => Math.round(1000 / best.w.length) / 10);
+  const newFactors = applyWeights(factors, normW);
+  const zeroedFields = newFactors.filter(f => f.weight <= zeroEps).map(f => f.field);
+
+  return {
+    factors: newFactors,
+    rhoTrainBefore, rhoTrainAfter: best.rho,
+    rhoTestBefore: objFn(test, applyWeights(factors, curWeights), missingPolicy),
+    rhoTestAfter: objFn(test, newFactors, missingPolicy),
+    zeroedFields, nTrain: train.length, nTest: test.length,
+  };
+}
+
 // ---------- 因子推荐：贪心前向，按 held-out 边际 ρ 排（抗过拟合）----------
 // 从 startFactors 出发（组合路径模式）或从空（探索全路径模式，startFactors=[]），每步选
 // 「加进去让验证段 ρ 涨最多」的候选，加入，再算下一步 → 一条 a→b→c 路径。
 // 口径：区间/边界在【训练段】推导（减少泄漏），权重 autoWeights，目标函数在【验证段】评估；
-// 同时给样本内 Δ 供对照（两者背离大=过拟合迹象）。候选先按 |AUC−0.5| 预筛控算力。
+// 同时给样本内 Δ 供对照（两者背离大=过拟合迹象）。候选先按 interval.score（区间感知，见
+// scanIntervalCore/autoWeights 注释）预筛控算力——2026-07-28 从 |AUC−0.5| 换过来，AUC 假设
+// 方向单调会漏掉"驼峰型"字段，interval.score 才跟下游打分（区间/梯形）口径一致。
 // candidates: [{ field, camp, interval, auc }]（两阵营合并，需带 interval）。
 // opts.scoreFn 同 factorMarginalRho，默认 scorePoolRho——注入而不是写死，避免"换目标函数"要在
 // 多处复制这条贪心搜索逻辑。
@@ -574,11 +820,18 @@ export function recommendFactorPath(rows, startFactors, candidates, opts = {}) {
     splitMethod = 'time', candLimit = 50, batchSize = 10, scoreFn = scorePoolRho } = opts;
   const { train, test } = splitTrainTest(rows, splitMethod, trainRatio, timeField);
   const scoreOf = (rowsSet, factorSet) => scoreFn(rowsSet, factorSet, missingPolicy);
-  // 候选：必须有区间；按 |AUC−0.5| 预筛到 candLimit 个控算力；排除已在起点池里的
+  // 候选：必须有区间；按 interval.score（区间感知，见 scanIntervalCore/autoWeights 注释）
+  // 预筛到 candLimit 个控算力——之前用 |AUC−0.5|，会误伤"驼峰型"字段（AUC假设方向单调，
+  // 区间打分不假设，两者可能反着来）；排除已在起点池里的。
+  // 2026-07-28 试过又撤销：曾经在这里加过"区间显著性不能明确为false"的硬过滤，真实数据上
+  // 单字段AUC普遍贴着0.5（这套系统本来就是靠很多个体弱信号加权组合，不是靠单字段自证清白），
+  // 硬门槛会把候选池筛空、因子推荐直接变成"没有可推荐的候选"——比偶尔推荐一个不够严谨的
+  // 字段更糟。区间显著性现在只在UI候选表里当展示/参考（跟AUC的判定列待遇一样），不再拿它
+  // 砍候选池——recommendFactorPath 自己的train/test held-out验证已经是足够的把关。
   const startKeys = new Set((startFactors || []).map(f => f.camp + ':' + f.field));
   const pool = (candidates || [])
     .filter(c => c && c.interval && !startKeys.has(c.camp + ':' + c.field))
-    .sort((a, b) => Math.abs((b.auc ?? 0.5) - 0.5) - Math.abs((a.auc ?? 0.5) - 0.5))
+    .sort((a, b) => (b.interval?.score ?? 0) - (a.interval?.score ?? 0))
     .slice(0, candLimit);
   if (!pool.length) return { path: [], baseTestRho: NaN, nTrain: train.length, nTest: test.length, error: '没有可推荐的候选（先扫描）' };
 
@@ -605,13 +858,31 @@ export function recommendFactorPath(rows, startFactors, candidates, opts = {}) {
         if (!best || deltaTest > best.deltaTest) {
           const inRho = scoreOf(rows, built);
           best = { field: c.field, camp: c.camp, testRho, inRho, deltaTest,
-                   deltaIn: Number.isFinite(baseInRho) ? inRho - baseInRho : inRho };
+                   deltaIn: Number.isFinite(baseInRho) ? inRho - baseInRho : inRho, built };
         }
       }
       // synchronous version for Node tests: no yielding
     }
     if (!best || !(best.deltaTest > minGain)) break;
     best.overfit = Number.isFinite(best.deltaIn) && best.deltaIn > 0 && best.deltaTest < best.deltaIn * 0.4;
+    // 诊断日志：这一步选中因子之后，held-out(test) 和样本内(全量 rows) 各自的分档命中率剖面
+    // （跟 UI 散点图紫线同一套 computeRankBuckets/threshold 口径）。目的：定位"贪心某一步选中的
+    // 因子，是不是让中段分数区间命中率打架(锯齿)"，不用再靠人工在 UI 上逐步点 onAdopt 对照图，
+    // 这份数据直接导出就能看出是哪一步、哪个字段引入的锯齿。
+    const bucketsOn = rowsSet => {
+      const scored = scoreRows(rowsSet, best.built, { missingPolicy });
+      const pairs = [];
+      for (const s of scored) {
+        const ret = Number(s.row.returnMax);
+        if (Number.isFinite(s.score) && Number.isFinite(ret)) pairs.push({ score: s.score, ret });
+      }
+      return computeRankBuckets(pairs, threshold)?.buckets ?? null;
+    };
+    best.testBuckets = bucketsOn(test);
+    best.inBuckets = bucketsOn(rows);
+    best.testZigzag = bucketZigzag(best.testBuckets);
+    best.inZigzag = bucketZigzag(best.inBuckets);
+    delete best.built;
     path.push(best);
     pathSpecs = [...pathSpecs, { field: best.field, camp: best.camp }];
     chosen.add(best.camp + ':' + best.field);

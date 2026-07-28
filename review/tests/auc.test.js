@@ -4,6 +4,15 @@ import { aucForField, collectAucSamples, scanFieldsAuc } from '../src/lib/auc.js
 const mk = (n, fn) => Array.from({ length: n }, (_, i) => fn(i));
 
 export function run(test) {
+  test('aucForField: bootstrap 已播固定种子 → 同一批数据重复扫，AUC 置信区间/显著性完全可复现', () => {
+    // 造一批有区分度、又不是完美可分的样本，让 bootstrap CI 落在有意义的区间（能体现"每次一致"）
+    const rows = mk(120, i => ({ features: { a: (i % 7) + (i > 60 ? 3 : 0) }, returnMax: i > 60 ? 6 : 1 }));
+    const r1 = aucForField(rows, 'a', { bootstrapB: 200 });
+    const r2 = aucForField(rows, 'a', { bootstrapB: 200 });
+    assert.deepStrictEqual({ auc: r2.auc, ci: r2.ci, significant: r2.significant },
+      { auc: r1.auc, ci: r1.ci, significant: r1.significant }, 'AUC/CI/显著性两次调用应完全一致');
+  });
+
   test('collectAucSamples: null/空串不能被 Number() 转成 0 混进样本', () => {
     const rows = [
       { features: { a: 5 }, returnMax: 3 },

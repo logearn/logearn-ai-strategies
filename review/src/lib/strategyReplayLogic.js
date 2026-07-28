@@ -2,7 +2,7 @@
 // 也让组件本体只留状态管理和渲染编排。
 
 import { pearson, pearsonPValue, spearman, wilsonInterval, median, WIN_THRESHOLD } from './utils.js';
-import { compileStrategy, runStrategyOnRow, aggregateCheckStats } from './proAnalytics.js';
+import { compileStrategy, runStrategyOnRow, aggregateCheckStats, extractScoreReturnPair } from './proAnalytics.js';
 
 // "Infinity"/"-Infinity" 是生成代码里 ±Infinity 的字面量，界面上显示成 ∞ 更好读
 export const prettyBound = s => (s === 'Infinity' ? '∞' : s === '-Infinity' ? '-∞' : s);
@@ -198,9 +198,11 @@ export function crossDayVerdict({ name, todayStats, reports, todayDate, minStrea
 // React 状态），跟看板上那套 useMemo 出来的数字同源（aggregateCheckStats / computeScoreReturnStats
 // / computeScoreBuckets），所以试算出来的口径和应用之后看板显示的完全一致。
 // 返回 { ok, error?, total, hits, spearmanRho, decileRho, passRate, hit2/hit5/hit10, hitMedian, missMedian, rLog }：
-// 判定一次改动好不好的【北极星】是 score↔returnMax 的强单调性——分数越高倍率越高，高倍集中在高分、
-// 低倍落在低分。越强越好。这就是策略回放看板那张散点图 + 底下 spearman ρ 想量的东西，也是所有调权/
+// 判定一次改动好不好的【北极星】默认是 score↔returnMax 的强单调性——分数越高倍率越高，高倍集中在高分、
+// 低倍落在低分。越强越好。这就是策略回放看板那张散点图 + 底下 spearman ρ 想量的东西，也是大多数调权/
 // 删因子的终极目标。高倍率命中率是这个目标的一种体现（高倍确实落到了高分才会命中），一起看。
+// 例外：若策略第一目标是"筛垃圾"，北极星降级为过线/未过线两层台阶（见 lib/factorLab.js 的
+// scorePoolTierGain），此时本函数的 spearmanRho/decileRho 仍可作参考，但不是唯一判据。
 //   spearmanRho  score 与 returnMax 的秩相关【主判据，越接近 1 越好】——直接量单调性，散点图底下那个 ρ。
 //   decileRho    score 十分位桶 vs 各桶胜率的单调性（分档看更抗离群；样本<60 算不出→null），佐证单调性。
 //   hit2/hit5/hit10  通过组里 returnMax >2x / >5x / >10x 的占比【共同判据，越高越好】——高倍有没有
@@ -213,15 +215,13 @@ export function computeStrategyMetrics(code, rows) {
   if (compiled.error) return { ok: false, error: compiled.error };
   const results = rows.map(row => ({ input: row.tokenAddress, row, res: runStrategyOnRow(compiled, row) }));
   const agg = aggregateCheckStats(results);
-  // score vs 收益：从每条的 '总分' check 里取分数，跟 StrategyReplay 里 scoreReturnPairs 同口径
+  // score vs 收益：取【硬否决通过】的全部样本（命中 + veto过但分低），排除 veto 未过；
+  // 分数优先读 '总分' check，缺失时回退日志 SCORE= 标记。跟 StrategyReplay 的 scoreReturnPairs
+  // 共用 extractScoreReturnPair，两处口径必须一致。
   const pairs = [];
   for (const { row, res } of results) {
-    if (!res || res.error || !Array.isArray(res.checks)) continue;
-    const totalCheck = res.checks.find(c => c.name === '总分');
-    if (!totalCheck) continue;
-    const score = parseFloat(totalCheck.value), ret = Number(row.returnMax);
-    if (!Number.isFinite(score) || !Number.isFinite(ret) || ret <= 0) continue;
-    pairs.push({ score, ret });
+    const pair = extractScoreReturnPair(res, row);
+    if (pair) pairs.push(pair);
   }
   const srStats = computeScoreReturnStats(pairs);
   const buckets = (srStats && !srStats.constant) ? computeScoreBuckets(pairs) : null;
@@ -232,8 +232,9 @@ export function computeStrategyMetrics(code, rows) {
     ok: true,
     total: agg.total,
     hits: agg.hits,
-    // spearmanRho＝score 与 returnMax 的秩相关【核心/北极星】——直接量"分数越高倍率越高"这个单调关系，
-    // 就是散点图底下那个 spearman ρ。策略的终极目标是把它做强：高倍集中高分、低倍落低分。越接近 1 越好。
+    // spearmanRho＝score 与 returnMax 的秩相关【核心/北极星默认口径】——直接量"分数越高倍率越高"这个单调关系，
+    // 就是散点图底下那个 spearman ρ。多数策略的终极目标是把它做强：高倍集中高分、低倍落低分。越接近 1 越好。
+    // （筛垃圾类策略的北极星走分层台阶例外，见上方 computeStrategyMetrics 的说明）
     spearmanRho: usable ? srStats.rho : null,
     // decileRho＝score 十分位桶 vs 各桶胜率的单调性（分档看，比逐点 spearman 更抗离群），佐证单调性
     decileRho: buckets ? buckets.rho : null,
@@ -245,4 +246,84 @@ export function computeStrategyMetrics(code, rows) {
     missMedian: agg.missRets.length ? median(agg.missRets) : null,
     rLog: usable ? srStats.rLog : null,
   };
+}
+
+// 把当前这次回放的聚合结果（StrategyReplay.jsx 里现算的 agg/scoreAgg/scoreReturnStats/
+// scoreBuckets）压成一份可存档的快照——只留核心统计量和这次用的策略代码，不留逐样本明细
+// （明细能从代码 + 当时的数据源原样重新跑一遍拿到，没必要重复占地方）。
+// 跟下面 metricsFromStrategyMetrics() 存的形状保持一致，两处都是"回测报告存档"的 metrics 口径，
+// 手动存的日报和试算确认自动存的优化前/后报告才能用同一套字段对比。
+export function buildReplayReportMetrics({ agg, scoreAgg, scoreReturnStats, scoreBuckets }) {
+  return {
+    total: agg.total,
+    hits: agg.hits,
+    hitRate: agg.valid ? agg.hits / agg.valid : null,
+    hitMedian: agg.hitRets.length ? median(agg.hitRets) : null,
+    missMedian: agg.missRets.length ? median(agg.missRets) : null,
+    cutoff: Number.isFinite(scoreAgg?.cutoff) ? scoreAgg.cutoff : null,
+    scoreReturn: (scoreReturnStats && !scoreReturnStats.constant)
+      ? { n: scoreReturnStats.n, rRaw: scoreReturnStats.rRaw, pRaw: scoreReturnStats.pRaw,
+          rLog: scoreReturnStats.rLog, pLog: scoreReturnStats.pLog, rho: scoreReturnStats.rho }
+      : null,
+    monotonicity: scoreBuckets ? { rho: scoreBuckets.rho, K: scoreBuckets.K } : null,
+    // 阵营因子明细留着不在这版界面展示，是给以后做"逐因子跨天对比"这类更细的功能预留的——
+    // 反正数据已经算好了，存下来不费事，没有就得等真的需要那天回去重新跑历史数据才能补上。
+    campFactors: scoreAgg?.factors ?? null,
+  };
+}
+
+// 把 computeStrategyMetrics() 的输出转成"回测报告存档"用的 metrics 口径（跟上面
+// buildReplayReportMetrics() 存的形状一致），这样应用调权建议时
+// 算好的 before/after 才能直接存成报告，跟手动存的日报用同一套字段对比。
+export function metricsFromStrategyMetrics(sm) {
+  if (!sm || !sm.ok) return null;
+  return {
+    total: sm.total,
+    hits: sm.hits,
+    hitRate: sm.passRate,
+    hitMedian: sm.hitMedian,
+    missMedian: sm.missMedian,
+    cutoff: null,
+    scoreReturn: (sm.rLog != null || sm.spearmanRho != null)
+      ? { n: sm.total, rRaw: null, pRaw: null, rLog: sm.rLog, pLog: null, rho: sm.spearmanRho }
+      : null,
+    monotonicity: sm.decileRho != null ? { rho: sm.decileRho, K: null } : null,
+    campFactors: null,
+  };
+}
+
+// 报告对比"优化建议"：拿两份存档报告（先后顺序不限，谁早谁晚由调用方传对）的 metrics 算出
+// 变化方向，给一句话建议。口径跟 StrategyReplay.jsx 里 WeightSuggestionPreview 的 netHint 一致——
+// 主看单调性 spearman ρ（score↔倍率，北极星默认口径；筛垃圾类策略以分层台阶为准），命中率/r(log) 做共同判据。
+// 三者都读不出时退化成"无法判断"，不瞎猜。
+export function suggestFromReportMetrics(before, after) {
+  if (!before || !after) return null;
+  const EPS_RHO = 1e-3, EPS_RATE = 1e-3, EPS_R = 1e-3;
+  const rhoB = before.scoreReturn?.rho ?? before.monotonicity?.rho ?? null;
+  const rhoA = after.scoreReturn?.rho ?? after.monotonicity?.rho ?? null;
+  const dRho = (rhoB != null && rhoA != null) ? rhoA - rhoB : null;
+  const hitB = before.hitRate, hitA = after.hitRate;
+  const dHit = (hitB != null && hitA != null) ? hitA - hitB : null;
+  const rLogB = before.scoreReturn?.rLog, rLogA = after.scoreReturn?.rLog;
+  const dRLog = (rLogB != null && rLogA != null) ? rLogA - rLogB : null;
+
+  const detail = [];
+  if (dRho != null) detail.push(`单调性ρ ${rhoB.toFixed(3)}→${rhoA.toFixed(3)}${dRho > EPS_RHO ? ' ↑' : dRho < -EPS_RHO ? ' ↓' : '（基本不变）'}`);
+  if (dHit != null) detail.push(`命中率 ${(hitB * 100).toFixed(1)}%→${(hitA * 100).toFixed(1)}%${dHit > EPS_RATE ? ' ↑' : dHit < -EPS_RATE ? ' ↓' : '（基本不变）'}`);
+  if (dRLog != null) detail.push(`r(log) ${rLogB.toFixed(3)}→${rLogA.toFixed(3)}${dRLog > EPS_R ? ' ↑' : dRLog < -EPS_R ? ' ↓' : '（基本不变）'}`);
+
+  let verdict;
+  if (dRho != null) {
+    if (dRho > EPS_RHO && (dHit == null || dHit >= -EPS_RATE)) verdict = { type: 'success', text: '单调性变强、命中率没变差——建议保留本次优化。' };
+    else if (dRho > EPS_RHO) verdict = { type: 'warning', text: '单调性变强但命中率有降，方向对但要留意，建议再观察几天。' };
+    else if (dRho < -EPS_RHO) verdict = { type: 'error', text: '单调性反而变弱——按"验证不了更单调就别改"的原则，建议回退本次优化。' };
+    else verdict = { type: 'info', text: '单调性基本没变化，参考命中率/r(log)辅助判断，应用与否影响不大。' };
+  } else if (dHit != null) {
+    verdict = dHit > EPS_RATE ? { type: 'success', text: '样本不够算单调性ρ，退回看命中率：提升了，可以保留。' }
+      : dHit < -EPS_RATE ? { type: 'error', text: '样本不够算单调性ρ，退回看命中率：下降了，建议回退。' }
+      : { type: 'info', text: '样本不够算单调性ρ，命中率也没什么变化，无法给出明确建议。' };
+  } else {
+    verdict = { type: 'info', text: '两份报告都算不出单调性ρ和命中率，无法给出优化建议（样本太少或打分池为空）。' };
+  }
+  return { ...verdict, detail: detail.join('；') };
 }

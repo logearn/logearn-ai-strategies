@@ -10,7 +10,7 @@ import {
   scoreRow, scoreRows, buildScoreDeciles, sweepScoreCutoffs, backtestFactors,
   runOOSBacktest, compareWithHardGate, resolveCtxAccessor, generateStrategyCode,
   buildFactors, scanFactorCandidates, missingRate, classifyFieldOrigin, factorCorrelations,
-  factorMarginalRho,
+  factorMarginalRho, recommendCutoff, recommendFactorPath,
 } from '../src/lib/factorLab.js';
 import { compileStrategy, runStrategyOnRow, aggregateScoreStats, parseFactorCheck } from '../src/lib/proAnalytics.js';
 import { mergeDaily } from '../src/lib/mergeDaily.js';
@@ -31,7 +31,7 @@ function makeRow(id, x, win, T, extra = {}) {
   };
 }
 
-export async function run(test) {
+export async function run(test, testAsync) {
   const T = 5; // 高倍阈值
 
   // ---------- trapScore ----------
@@ -134,18 +134,36 @@ export async function run(test) {
   });
 
   // ---------- autoWeights ----------
-  test('autoWeights: 权重 ∝ |AUC-0.5|，总和恰为 100', () => {
-    const fs = autoWeights([{ auc: 0.7 }, { auc: 0.6 }, { auc: 0.55 }]);
+  // 2026-07-28 改造：权重从 ∝|AUC-0.5| 换成 ∝interval.score（区间感知，见 scanIntervalCore/
+  // factorLab.js 顶部注释）——AUC 假设方向单调，"驼峰型"字段会被误判成没区分度，改用区间打分
+  // 才跟下游的梯形/区间打分口径一致。下面几个测试改用 interval.score 构造。
+  test('autoWeights: 权重 ∝ interval.score，总和恰为 100', () => {
+    const fs = autoWeights([
+      { interval: { score: 2.0 } }, { interval: { score: 1.0 } }, { interval: { score: 0.5 } },
+    ]);
     const sum = fs.reduce((a, f) => a + f.weight, 0);
     assert.ok(Math.abs(sum - 100) < 1e-6, `sum=${sum}`);
     assert.ok(fs[0].weight > fs[1].weight && fs[1].weight > fs[2].weight);
-    // 0.2 : 0.1 : 0.05 → 约 57.1 : 28.6 : 14.3
+    // 2.0 : 1.0 : 0.5 → 约 57.1 : 28.6 : 14.3
     assert.ok(Math.abs(fs[0].weight - 57.1) < 0.2, `w0=${fs[0].weight}`);
   });
-  test('autoWeights: AUC 全为 0.5 时退化为均分', () => {
-    const fs = autoWeights([{ auc: 0.5 }, { auc: 0.5 }]);
+  test('autoWeights: interval.score 全为 0（或缺失 interval）时退化为均分', () => {
+    const fs = autoWeights([{ interval: { score: 0 } }, {}]);
     assert.ok(Math.abs(fs[0].weight - 50) < 0.11 && Math.abs(fs[1].weight - 50) < 0.11);
     assert.ok(Math.abs(fs[0].weight + fs[1].weight - 100) < 1e-6);
+  });
+  test('autoWeights: 高AUC但驼峰型字段的区间分数不该被单调AUC掩盖——区间强的该拿更高权重，不管AUC显不显著', () => {
+    // 驼峰字段：AUC 因两头对称抵消而不显著（甚至可能<0.5），但区间打分很强；
+    // 弱单调字段：AUC 显著更高，但区间打分更弱（信号弥散、不集中）。
+    // 用旧公式（|AUC-0.5|）算，弱单调字段权重会反而更高——这正是要修的问题。
+    const hump = { field: 'hump', auc: 0.52, interval: { score: 1.45 } };
+    const weakMono = { field: 'weakMono', auc: 0.68, interval: { score: 0.99 } };
+    const fs = autoWeights([hump, weakMono]);
+    const humpF = fs.find(f => f.field === 'hump'), weakF = fs.find(f => f.field === 'weakMono');
+    assert.ok(humpF.weight > weakF.weight, `驼峰字段区间分数更强，权重应更高：hump=${humpF.weight} weakMono=${weakF.weight}`);
+    // 反证：旧公式会把顺序搞反
+    const oldRaw = [Math.abs(hump.auc - 0.5), Math.abs(weakMono.auc - 0.5)];
+    assert.ok(oldRaw[0] < oldRaw[1], '旧公式(|AUC-0.5|)下驼峰字段权重会更低，构造反例本身要成立');
   });
 
   // ---------- scoreRow / sweep / deciles ----------
@@ -232,6 +250,15 @@ export async function run(test) {
       assert.ok(c.interval, c.intervalError || '无区间');
       assert.strictEqual(c.missRate, 0);
     });
+    // 2026-07-28：区间显著性从"两比例检验"换成"置换检验"（见 scanIntervalCore 内部注释）——
+    // 之前的两比例检验直接对 scanIntervalCore 已经从很多候选窗口里挑出来的最优窗口做检验，
+    // 没有为"搜了这么多窗口才挑出这个"做校正（look-elsewhere/winner's curse）。真实种入的
+    // 强信号应该在新实现下依然判显著，防止修复本身把好信号也误伤。
+    test('scanFactorCandidates: 真实种入的强信号字段，区间置换检验应判显著（不是巧合撞出来的）', () => {
+      const c = scan.candidates[0];
+      assert.ok(Number.isFinite(c.interval.pPermutation), 'pPermutation 应该是个有效数值');
+      assert.ok(c.interval.significantAdj, `真实信号应判显著，实际 pAdj=${c.interval.pAdj}`);
+    });
     test('buildFactors: 由扫描结果构建因子并自动配权', () => {
       const { factors, skipped } = buildFactors(planted, scan.candidates, ['x'], T);
       assert.strictEqual(skipped.length, 0);
@@ -253,13 +280,96 @@ export async function run(test) {
       if (Number.isFinite(iv.lo)) assert.strictEqual(scoreRow(makeRow(2, iv.lo - 0.01, false, T), [f]).score, 0);
       if (Number.isFinite(iv.hi)) assert.strictEqual(scoreRow(makeRow(3, iv.hi + 0.01, false, T), [f]).score, 0);
     });
-    test('runOOSBacktest: shape=interval 时训练段因子应是矩形边界', async () => {
+    await testAsync('runOOSBacktest: shape=interval 时训练段因子应是矩形边界', async () => {
       // 复用 planted：时间锚点已按 id 递增
       const oos2 = await runOOSBacktest(planted, ['x'], T, { bootstrapB: 40, shape: 'interval' });
       assert.ok(!oos2.error, oos2.error);
       const f = oos2.trainFactors[0];
       assert.strictEqual(f.lo0, f.lo1);
       assert.strictEqual(f.hi1, f.hi0);
+    });
+  }
+
+  // ---------- 候选粗筛/配权改用 interval.score（区间感知）而不是单调AUC 的回归测试 ----------
+  // 2026-07-28：追查"三个核心问题"时发现的真实逻辑矛盾——scanFieldsAuc 在原始特征值上假设
+  // 方向单调，下游打分（梯形/区间）不假设方向，两者可能给同一个字段相反的结论。构造一个
+  // "驼峰型"字段（中段[40,60]命中率高、两头对称地低，两头互相抵消导致方向性AUC不显著）
+  // 和一个"弱单调"字段（全程小幅单调，AUC显著但信号弥散、区间打分弱）对照，验证新公式/新排序
+  // 键能正确识别出驼峰字段才是更强的信号，不会被 AUC 的方向性假设误伤。
+  {
+    const randH = makeRand(7);
+    const humpRows = [];
+    for (let i = 0; i < 400; i++) {
+      const hump = randH() * 100; // 值域[0,100]均匀；热区[40,60]左右对称，两侧宽度相同(各40)
+      const win = randH() < (hump >= 40 && hump <= 60 ? 0.6 : 0.1);
+      // weakMono：跟 win 有真实但弱的单调关联——两组大范围重叠(各自跨度~90)，只是中心
+      // 略微偏移(±6)，不能像 hump 的[40,60]那样有清晰边界，否则区间挖掘反而会找到一个
+      // 近乎完美的切点，信号会变得比 hump 更强，测不出"AUC显著但区间弱"这个对照
+      const weakMono = 50 + (win ? 6 : -6) + (randH() - 0.5) * 90;
+      humpRows.push(makeRow(i, undefined, win, T, { features: { hump, weakMono } }));
+    }
+    const scanHump = await scanFactorCandidates(humpRows, ['hump', 'weakMono'], { winThreshold: T, bootstrapB: 80 });
+    const humpC = scanHump.candidates.find(c => c.field === 'hump');
+    const weakC = scanHump.candidates.find(c => c.field === 'weakMono');
+
+    test('scanFactorCandidates: 驼峰字段的方向性AUC不显著，但区间打分/lift应明显强于弱单调字段', () => {
+      assert.ok(humpC.interval, humpC.intervalError || '驼峰字段应挖出区间');
+      assert.ok(weakC.interval, weakC.intervalError || '弱单调字段应挖出区间');
+      assert.ok(Math.abs(humpC.auc - 0.5) < Math.abs(weakC.auc - 0.5),
+        `驼峰字段的方向性AUC应比弱单调字段更接近0.5：hump.auc=${humpC.auc} weak.auc=${weakC.auc}`);
+      assert.ok(humpC.interval.score > weakC.interval.score,
+        `驼峰字段的区间分数应更强：hump.score=${humpC.interval.score} weak.score=${weakC.interval.score}`);
+      assert.ok(humpC.interval.significantAdj, '驼峰字段的区间应该是统计显著的（BH校正后）');
+    });
+
+    test('autoWeights: 接入真实扫描结果后，驼峰字段应拿到比弱单调字段更高的权重', () => {
+      const { factors } = buildFactors(humpRows, scanHump.candidates,
+        [{ field: 'hump', camp: 'hero' }, { field: 'weakMono', camp: 'hero' }], T);
+      const humpF = factors.find(f => f.field === 'hump'), weakF = factors.find(f => f.field === 'weakMono');
+      assert.ok(humpF.weight > weakF.weight,
+        `驼峰字段区间信号更强，权重应更高：hump=${humpF.weight} weakMono=${weakF.weight}`);
+    });
+
+    test('recommendFactorPath 的 candLimit 粗筛：按 interval.score 排序时驼峰字段应排在弱单调字段前面（旧的|AUC-0.5|排序会反过来）', () => {
+      const sortedNew = [...scanHump.candidates].sort((a, b) => (b.interval?.score ?? 0) - (a.interval?.score ?? 0));
+      assert.strictEqual(sortedNew[0].field, 'hump', '新排序键下驼峰字段应排第一');
+      const sortedOld = [...scanHump.candidates].sort((a, b) => Math.abs((b.auc ?? 0.5) - 0.5) - Math.abs((a.auc ?? 0.5) - 0.5));
+      assert.strictEqual(sortedOld[0].field, 'weakMono', '反证：旧的AUC排序键下弱单调字段会排第一，说明这个构造确实复现了问题');
+    });
+  }
+
+  // ---------- 区间显著性置换检验：纯噪声字段不该被巧合窗口误判成真信号 ----------
+  // 2026-07-28：修复"区间显著性检验没有为搜索了很多候选窗口这件事做校正"的问题（见
+  // scanIntervalCore 内部注释）。这里构造一个跟输赢完全无关的纯噪声字段，多个随机种子里
+  // 实测过 scanIntervalCore 确实会"运气好"搜到 lift 1.0~1.2 的窗口（不是没窗口，是窗口看起来
+  // 还不错）——这正是旧版两比例检验最容易被骗过的场景，置换检验必须能识破它。
+  {
+    const randN = makeRand(7);
+    const noiseRows = [];
+    for (let i = 0; i < 300; i++) {
+      const win = randN() < 0.15; // 基准命中率~15%，贴近真实项目口径
+      const noise = randN() * 100; // 跟 win 完全无关
+      noiseRows.push(makeRow(i, undefined, win, T, { features: { noise } }));
+    }
+    await testAsync('scanFactorCandidates: 纯噪声字段即使"运气好"搜到 lift>1 的窗口，置换检验也不该判显著', async () => {
+      const scan = await scanFactorCandidates(noiseRows, ['noise'], { winThreshold: T, bootstrapB: 60 });
+      const c = scan.candidates[0];
+      if (c.interval) {
+        assert.ok(!c.interval.significantAdj,
+          `纯噪声字段不该判显著（lift=${c.interval.lift.toFixed(2)}, pAdj=${c.interval.pAdj}）——说明置换检验被这个巧合窗口骗过去了`);
+      }
+      // 没挖出任何达标区间（intervalError）也是可以接受的结果——只要不是"显著"就行
+    });
+
+    // 2026-07-28 试过又撤销：曾经在 recommendFactorPath 里加过"significantAdj===false 就排除"
+    // 的硬过滤，真实数据上发现单字段AUC普遍贴着0.5（这套系统靠很多个体弱信号加权组合，不是
+    // 靠单字段自证清白），硬门槛会把候选池筛空、因子推荐直接变成空的——比偶尔推荐一个不够
+    // 严谨的字段更糟，已撤销。区间显著性现在只在UI候选表当展示参考，不再是 recommendFactorPath
+    // 的硬门槛（recommendFactorPath 自己的 train/test held-out 验证已经足够把关）。
+    test('recommendFactorPath: 区间显著性不显著的候选，只要 held-out 边际贡献够好仍然可以被推荐（不再硬性排除）', () => {
+      const fakeCandidate = { field: 'x', camp: 'hero', auc: 0.9, interval: { lo: 30, hi: 60, significantAdj: false } };
+      const r = recommendFactorPath(planted, [], [fakeCandidate], { threshold: T, missingPolicy: 'zero' });
+      assert.ok(r.path.some(p => p.field === 'x'), '不该因为 significantAdj:false 就被硬性排除在候选池外');
     });
   }
 
@@ -353,14 +463,14 @@ export async function run(test) {
       if (minScore < 0) assert.ok(points[0].cut <= minScore, `points 下界 ${points[0].cut} 应覆盖到最低分 ${minScore}`);
       else assert.strictEqual(points[0].cut, 0, '纯正分场景下界应保持 0（向后兼容）');
     });
-    test('runOOSBacktest: fieldSpecs 支持 {field,camp} 混合写法，训练段各因子 camp 正确', async () => {
+    await testAsync('runOOSBacktest: fieldSpecs 支持 {field,camp} 混合写法，训练段各因子 camp 正确', async () => {
       const oosMixed = await runOOSBacktest(mixedRows, [{ field: 'x', camp: 'hero' }, { field: 'y', camp: 'evil' }], T, { bootstrapB: 40 });
       assert.ok(!oosMixed.error, oosMixed.error);
       const fx = oosMixed.trainFactors.find(f => f.field === 'x'), fy = oosMixed.trainFactors.find(f => f.field === 'y');
       assert.strictEqual(fx.camp, 'hero');
       assert.strictEqual(fy.camp, 'evil');
     });
-    test('runOOSBacktest: 字符串数组写法向后兼容，全部当勇者阵营', async () => {
+    await testAsync('runOOSBacktest: 字符串数组写法向后兼容，全部当勇者阵营', async () => {
       const oosCompat = await runOOSBacktest(planted, ['x'], T, { bootstrapB: 40 });
       assert.ok(!oosCompat.error, oosCompat.error);
       assert.strictEqual(oosCompat.trainFactors[0].camp, 'hero');
@@ -620,7 +730,7 @@ export async function run(test) {
     // 用来验证"信息重叠时边际贡献应趋近 0"（即便它自己单独进池的边际贡献不小）。
     const plantedDup = planted.map(r => ({ ...r, features: { x: r.features.x, xDup: r.features.x } }));
 
-    test('factorMarginalRho: 空因子池时，候选自己进池应给出正的边际贡献（withCandidate=delta）', async () => {
+    await testAsync('factorMarginalRho: 空因子池时，候选自己进池应给出正的边际贡献（withCandidate=delta）', async () => {
       const scan = await scanFactorCandidates(plantedDup, ['x'], { winThreshold: T, bootstrapB: 60 });
       const c = scan.candidates[0];
       assert.ok(c.interval, 'x 应挖出可信区间');
@@ -631,7 +741,7 @@ export async function run(test) {
       assert.strictEqual(res.delta, res.withCandidate);
     });
 
-    test('factorMarginalRho: 候选与已选因子信息完全重叠时，边际贡献应远小于其独立进池的贡献', async () => {
+    await testAsync('factorMarginalRho: 候选与已选因子信息完全重叠时，边际贡献应远小于其独立进池的贡献', async () => {
       const scan = await scanFactorCandidates(plantedDup, ['x', 'xDup'], { winThreshold: T, bootstrapB: 60 });
       const cx = scan.candidates.find(c => c.field === 'x');
       const cDup = scan.candidates.find(c => c.field === 'xDup');
@@ -648,6 +758,21 @@ export async function run(test) {
     test('factorMarginalRho: 无可信区间的候选应报错而不是抛异常', () => {
       const res = factorMarginalRho(plantedDup, [], { field: 'x', interval: null }, 'hero', T);
       assert.ok(res.error);
+    });
+
+    // 残差挖掘：候选的 .interval 是在残差子集（这里用前一半样本模拟）上挖出来的，
+    // opts.buildRows 必须传同一份子集去推梯形边界，ρ 仍在全体（plantedDup）上评估。
+    await testAsync('factorMarginalRho: opts.buildRows 用于推导梯形边界，rows 仍用于评估全局 ρ', async () => {
+      const half = plantedDup.slice(0, 150);
+      const scan = await scanFactorCandidates(half, ['x'], { winThreshold: T, bootstrapB: 60 });
+      const c = scan.candidates[0];
+      assert.ok(c.interval, '子集上 x 应挖出可信区间');
+      const res = factorMarginalRho(plantedDup, [], c, 'hero', T, { buildRows: half });
+      assert.ok(!res.error, res.error);
+      assert.ok(Number.isFinite(res.withCandidate), `withCandidate=${res.withCandidate}`);
+      // 不传 buildRows 时默认退化为用 rows（全体）推导，同样不应报错
+      const resDefault = factorMarginalRho(plantedDup, [], c, 'hero', T);
+      assert.ok(!resDefault.error, resDefault.error);
     });
   }
 
@@ -921,5 +1046,31 @@ return true
     // 打分与种入信号一致：高分段高倍率应显著高于低分段
     const top = bt.deciles[bt.deciles.length - 1], bot = bt.deciles[0];
     assert.ok(top.hiRate > bot.hiRate);
+  });
+
+  // ---------- recommendCutoff ----------
+  test('recommendCutoff: 在种入的高倍信号区间上应挑出 lift 明显>1 且样本充足的档位', () => {
+    const bt = backtestFactors(planted, [{ field: 'x', weight: 100, lo0: 25, lo1: 30, hi1: 60, hi0: 65 }], T);
+    const rec = recommendCutoff(bt.sweep);
+    assert.ok(rec, '样本充足应给出推荐');
+    assert.ok(rec.lift > 1.5, `lift=${rec.lift}`);
+    assert.ok(rec.triggered >= 20, `triggered=${rec.triggered}`);
+    assert.ok(rec.hitRate > bt.base.baseRate, '推荐档位命中率应高于基准命中率');
+  });
+  test('recommendCutoff: 净超额命中数最大的档位应被选中，而不是单纯 lift 或 capture 最大的档位', () => {
+    const sweep = {
+      points: [
+        { cut: 0, triggered: 100, hitRate: 0.2, capture: 1, lift: 1.0 },
+        { cut: 50, triggered: 40, hitRate: 0.5, capture: 0.5, lift: 2.5 }, // 净超额=40*(0.5-0.2)=12，全场最大
+        { cut: 80, triggered: 10, hitRate: 0.9, capture: 0.225, lift: 4.5 }, // lift 最高，但触发数<minN(20)，应被过滤
+      ],
+      base: { n: 100, baseRate: 0.2 },
+    };
+    const rec = recommendCutoff(sweep);
+    assert.strictEqual(rec.cut, 50, `应选净超额命中数最大且样本充足的档位，实际选了 cut=${rec?.cut}`);
+  });
+  test('recommendCutoff: 所有档位触发数都不足 minN 时应返回 null', () => {
+    const sweep = { points: [{ cut: 0, triggered: 5, hitRate: 0.5, capture: 1, lift: 5 }], base: { n: 10, baseRate: 0.1 } };
+    assert.strictEqual(recommendCutoff(sweep), null);
   });
 }

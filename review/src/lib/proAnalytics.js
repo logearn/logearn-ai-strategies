@@ -436,6 +436,46 @@ export function parseFactorCheck(c) {
   };
 }
 
+// 从一条回放结果里取「总分vs收益」散点用的 {score, ret}，语义＝【硬否决通过的样本】：
+//   - 命中（passed=true）
+//   - veto 通过但 score<CUTOFF（"未命中(分低)"）——用户明确要求这批也要画进散点
+//   - 排除 veto 未过（"未命中(否决)"，被硬条件直接拦掉）——不进散点
+// 取分优先级：先读 checks 里的 '总分'（写法规范的策略无条件 push 它，早于任何 return）；
+// checks 里没有时（策略把 '总分' push 写在 return false 之后，未命中样本就吐不出这条——
+// 真实踩过：散点只剩命中侧那一撮 score>=cutoff 的点），回退到日志里的 SCORE= 标记补取，
+// 这样不改策略、对历史策略也生效。返回 null＝该样本不该进散点（veto 未过 / 无分数 / 收益无效）。
+export function extractScoreReturnPair(res, row) {
+  if (!res || res.error) return null;
+  // veto 未过的样本直接排除：日志文案里带 "(否决)" 是硬否决未通过的统一标记
+  //（强势盘/1.5段 都是 '未命中(否决) ...'）。
+  const vetoFailedByLog = Array.isArray(res.logs) &&
+    res.logs.some(l => typeof l.text === 'string' && l.text.includes('(否决)'));
+  if (vetoFailedByLog) return null;
+
+  let score = NaN;
+  const checks = Array.isArray(res.checks) ? res.checks : null;
+  const totalCheck = checks ? checks.find(c => c.name === '总分') : null;
+  if (totalCheck) {
+    // 有 checks 时再兜一层硬否决判断：万一某策略不打 "(否决)" 日志，也能靠硬否决行为 false 排除。
+    // 硬否决行＝非打分因子（parseFactorCheck 认不出）、非总分、且 ok===false。
+    for (const c of checks) {
+      if (c === totalCheck) continue;
+      if (!parseFactorCheck(c) && !c.ok) return null;
+    }
+    score = parseFloat(totalCheck.value);
+  } else {
+    // checks 里没有总分：从日志的 SCORE= 标记回退取分（覆盖"总分 push 在 return 之后"的策略）
+    const logs = Array.isArray(res.logs) ? res.logs : [];
+    for (const l of logs) {
+      const m = typeof l.text === 'string' && l.text.match(/SCORE=(-?[\d.]+)/);
+      if (m) { score = parseFloat(m[1]); break; }
+    }
+  }
+  const ret = Number(row && row.returnMax);
+  if (!Number.isFinite(score) || !Number.isFinite(ret) || ret <= 0) return null;
+  return { score, ret };
+}
+
 export function aggregateScoreStats(results, winThreshold = WIN_THRESHOLD) {
   const rowsData = [];
   for (const r of results) {
@@ -647,6 +687,20 @@ export function aggregateCheckStats(results) {
     const text = errLog.length ? errLog.map(l => l.text).join(' ') : (r.res.passed ? '通过但未产出 checks' : '在 checks 赋值前就 return 了');
     if (noCheckReasons.length < 5) noCheckReasons.push({ symbol: r.row.symbol || '', addr: r.row.tokenAddress || '', ret: r.row.returnMax, reason: text.slice(0, 120) });
   }
+  // 回放报错（res.error）：策略压根没跑完，既算不出分、也进不了散点。跟"跑通但提前退出"
+  // (noChecks) 是两码事，得单独收集原因样例——否则界面只显示一个红色数字，看不出是缺快照
+  // 还是策略抛异常。同一条报错文案往往批量重复（比如 43 条全是同一个 undefined 属性），
+  // 按 reason 去重后各留一条并计数，比铺 5 条同样的更能一眼看出"这批错都一样"。
+  const erroredRows = results.filter(r => r.res && r.res.error);
+  const errCount = new Map();
+  for (const r of erroredRows) {
+    const reason = String(r.res.error).slice(0, 160);
+    const prev = errCount.get(reason);
+    if (prev) prev.count++;
+    else errCount.set(reason, { reason, count: 1, symbol: (r.row && r.row.symbol) || '', addr: (r.row && r.row.tokenAddress) || '' });
+  }
+  const errorReasons = [...errCount.values()].sort((a, b) => b.count - a.count).slice(0, 5);
+
   // 未命中账拆开（只统计有 checks 明细的那部分——提前退出的没有逐条信息）
   let soleBlocked = 0, multiBlocked = 0;
   for (const { res } of valid) {
@@ -661,7 +715,7 @@ export function aggregateCheckStats(results) {
     withChecks: valid.length,              // 有逐条 check 明细的
     noChecks: noChecks.length,             // 跑通但没产出 checks（提前 return）
     noChecksMiss, noCheckReasons,
-    errored: results.filter(r => r.res && r.res.error).length,
+    errored: erroredRows.length, errorReasons,
     hits: hitRets.length, soleBlocked, multiBlocked };
 }
 

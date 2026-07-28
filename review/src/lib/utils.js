@@ -282,15 +282,20 @@ function computeROC(values, labels, direction) {
 // 注意 direction 固定用外面已定好的方向，不在每次重抽样里重新自动检测：否则每次都取
 // max(auc, 1-auc)，AUC 会被系统性地推高到 0.5 以上，区间下界永远够不到 0.5，
 // "是否显著优于随机"这个问题就自动变成"是"了——这正是要避免的偏差。
-function bootstrapAucCI(values, labels, direction, B) {
+// seed：用固定种子的确定性 RNG（mulberry32）代替 Math.random，让"是否显著"每次扫描完全可复现——
+// 否则同一批数据反复扫，边界字段的显著性判定会随 bootstrap 抽样小幅抖动，用户会误以为"ρ/结论在变"
+// （其实变的只是这个抖动的判定标签、进而影响了挑因子）。种子给个常数即可；统计意义不变（依然是合法的
+// bootstrap 重采样），只是从"每次不同的随机序列"变成"固定的随机序列"。改种子可检验结论对抽样的稳健性。
+function bootstrapAucCI(values, labels, direction, B, seed = 0x9E3779B9) {
   const n = values.length;
   if (n < 2) return { lo: NaN, hi: NaN };
+  const rand = mulberry32(seed);
   const aucs = [];
   const sv = new Array(n), sl = new Array(n);
   for (let b = 0; b < B; b++) {
     let pos = 0;
     for (let i = 0; i < n; i++) {
-      const idx = Math.floor(Math.random() * n);
+      const idx = Math.floor(rand() * n);
       sv[i] = values[idx]; sl[i] = labels[idx];
       pos += labels[idx];
     }

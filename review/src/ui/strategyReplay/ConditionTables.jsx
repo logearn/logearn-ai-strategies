@@ -98,9 +98,9 @@ export function HardConditionsTable({ hardConditions }) {
   );
 }
 
-// 因子有效性一键分析表：不管一项现在是硬条件还是打分项，只要它的"实际值"能解析出一个
-// 有限数字，就把它跟 log(收益) 算过单变量相关性（父组件算好传下来），这里只负责展示 +
-// 应用推荐权重 / 删除 两个操作入口。
+// 因子有效性一键分析表：只看已经在打分池里的项（硬条件不参与打分、这里不重复列——想看硬条件
+// 用上面的硬性条件清单表），把它的"实际值"跟 log(收益) 算过单变量相关性（父组件算好传下来，
+// 已做 BH-FDR 多重比较校正），这里只负责展示 + 应用推荐权重 / 删除 两个操作入口。
 export function FactorEffectivenessTable({ factorEffectiveness, recommendedWeights, onApplyRecommendedWeights, onRemoveCheck }) {
   if (!factorEffectiveness.length) return null;
   const recMap = new Map(recommendedWeights.map(f => [f.name, f.recommended]));
@@ -108,46 +108,47 @@ export function FactorEffectivenessTable({ factorEffectiveness, recommendedWeigh
     <>
       <div style={{ marginTop: 16, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <Typography.Text strong style={{ fontSize: 12 }}>
-          因子有效性一键分析（各检查项的原始值 vs log(收益) 单变量相关性，不管现在是硬条件还是打分项）
+          因子有效性一键分析（打分项的原始值 vs log(收益) 单变量相关性，已按 BH-FDR 做多重比较校正）
         </Typography.Text>
         {recommendedWeights.length > 0 ? (
           <Button size="small" type="primary" onClick={onApplyRecommendedWeights}>
             应用推荐权重到代码（{recommendedWeights.length} 项）
           </Button>
         ) : (
-          <span style={{ fontSize: 12, opacity: .55 }} title="推荐权重只对已经在打分池里的字段生效——现在打分池是空的，全是硬条件">
-            当前打分池为空，没有可推荐权重的字段
+          <span style={{ fontSize: 12, opacity: .55 }}
+            title={factorEffectiveness.length
+              ? '这批字段的相关性都没能扛住 BH 多重比较校正——可能是噪声，不建议据此调权重'
+              : '当前打分池是空的，全是硬条件——推荐权重只对打分池里的字段生效'}>
+            {factorEffectiveness.length ? '没有字段校正后仍显著，不推荐调权重' : '当前打分池为空，没有可推荐权重的字段'}
           </span>
         )}
       </div>
       <Table style={{ marginTop: 6 }} size="small" rowKey="name" pagination={false}
         dataSource={factorEffectiveness}
         columns={[
-          { title: '字段', dataIndex: 'name', width: 200,
+          { title: '字段', dataIndex: 'name', width: 220,
             render: v => <span title={describeFactorLabel(v)} style={{ wordBreak: 'break-all' }}>{v}</span> },
-          { title: '当前分类', dataIndex: 'isFactor', width: 90,
-            render: v => v ? <Tag color="blue">打分项</Tag> : <Tag>硬条件</Tag> },
           { title: 'n', dataIndex: 'n', width: 70, align: 'right' },
           { title: 'r', dataIndex: 'r', width: 90, align: 'right',
             defaultSortOrder: 'descend', sorter: (a, b) => Math.abs(a.r) - Math.abs(b.r),
             render: v => v.toFixed(3) },
           { title: 'p', dataIndex: 'p', width: 100, align: 'right',
-            render: v => <span style={{ color: v < 0.05 ? '#30d158' : undefined }}>{v.toExponential(2)}</span> },
-          { title: '', width: 70, render: (_, f) => f.p < 0.05
-            ? <Tag color="success">显著</Tag> : <span style={{ opacity: .5 }}>不显著</span> },
-          { title: <span title="按 |r| 等比例缩放，最强的因子给 10，下限 1；只对已经在打分池的字段有意义">推荐权重</span>,
+            render: v => v.toExponential(2) },
+          { title: <span title="同批检验了多个字段，BH-FDR 校正后的 p 值——比原始 p 更保守，是判断显著性该看的那一列">校正后 p</span>,
+            dataIndex: 'pAdj', width: 100, align: 'right',
+            render: v => Number.isFinite(v) ? <span style={{ color: v < 0.05 ? '#30d158' : undefined }}>{v.toExponential(2)}</span> : '-' },
+          { title: '', width: 90, render: (_, f) => Number.isFinite(f.pAdj) && f.pAdj < 0.05
+            ? <Tag color="success">校正后显著</Tag> : <span style={{ opacity: .5 }}>不显著</span> },
+          { title: <span title="按 |r| 等比例缩放，最强的因子给 10，下限 1">推荐权重</span>,
             width: 90, align: 'right',
-            render: (_, f) => recMap.has(f.name)
-              ? <b>{recMap.get(f.name)}</b>
-              : <span style={{ opacity: .4 }} title="硬条件不参与打分，改权重不生效——想让这项按数值给分，得先把它从 VETO_NAMES 里删掉">-</span> },
+            render: (_, f) => recMap.has(f.name) ? <b>{recMap.get(f.name)}</b> : '-' },
           { title: '操作', width: 70, render: (_, f) => (
             <Button size="small" danger onClick={() => onRemoveCheck(f)}>删除</Button>
           ) },
         ]} />
       <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: 6 }}>
-        这里的 r 是在【当前整批数据】上算的单变量相关性，没做样本外验证——只用来初筛"哪些字段
-        可能有信号、值得挪进打分池"。"应用推荐权重"只改已经在打分池里的字段的权重数字，
-        不会自动把硬条件挪进打分组（那是判断题，工具不替你做），也不动区间形状。
+        这里的 r 是在【当前整批数据】上算的单变量相关性，没做样本外验证——只用来初筛"哪些打分项
+        权重该调大/调小"。"应用推荐权重"只改权重数字，不动区间形状。
         应用之后记得重新点"在当前数据源回放"，再看一眼上面"总分 vs 收益"的样本外验证有没有变好。
       </Typography.Paragraph>
     </>

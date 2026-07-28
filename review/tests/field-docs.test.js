@@ -39,6 +39,21 @@ export function run(test) {
     assert.deepStrictEqual(g.gmgnOther, ['gmgn.liquidity']);
   });
 
+  test('computeFieldGroups: 人工标记的"无用分组"字段优先级压过 dev/stat/chip 判定', () => {
+    const g = computeFieldGroups([
+      'gmgn.stat.bot_degen_count', 'gmgn.stat.creator_token_balance',
+      'chip_analysis.price_to_peak_ratio', 'chip_analysis.price_concentration_hhi',
+      'chip_analysis.above_below_ratio',
+      'gmgn.stat.top_rat_trader_percentage', // 对照组：白名单内 stat 字段不受影响
+    ]);
+    assert.deepStrictEqual(g.useless.sort(), [
+      'chip_analysis.above_below_ratio', 'chip_analysis.price_concentration_hhi',
+      'chip_analysis.price_to_peak_ratio', 'gmgn.stat.bot_degen_count', 'gmgn.stat.creator_token_balance',
+    ]);
+    assert.deepStrictEqual(g.stat, ['gmgn.stat.top_rat_trader_percentage']);
+    assert.strictEqual(g.chip.length, 0);
+  });
+
   test('computeFieldGroups: 每个字段只能落进一个组', () => {
     const g = computeFieldGroups(['holder_bot_ratio', 'smart_volume', 'kline_max_rise_pct']);
     const all = GROUP_ORDER.flatMap(k => g[k]);

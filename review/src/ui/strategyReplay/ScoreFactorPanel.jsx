@@ -1,5 +1,5 @@
-import React from 'react';
-import { Typography, Table, Tag, Alert, Modal, Button, Popconfirm } from 'antd';
+import React, { useMemo, useState } from 'react';
+import { Typography, Table, Tag, Alert, Modal, Button, Popconfirm, Input } from 'antd';
 import PlotlyChart from '../PlotlyChart.jsx';
 import { logearnUrl } from '../../lib/utils.js';
 import { describeFactorLabel } from '../../lib/dictionary.js';
@@ -14,6 +14,20 @@ export default function ScoreFactorPanel({
   onApplyWeightSuggestion, onApplyAllWeightSuggestions, crossDayOf,
   removedFactors, onRestoreFactor,
 }) {
+  // 逐样本明细表搜 CA：支持逗号/空格/换行分隔粘一批，命中 CA 或 symbol 任一即算（子串匹配，不用填全）。
+  // 两个 hook 必须放在 `if (!scoreAgg) return null` 之前——否则 scoreAgg 从 null 变有值时
+  // hooks 调用顺序会变，违反 Hooks 规则。
+  const [sampleSearch, setSampleSearch] = useState('');
+  const filteredSampleRows = useMemo(() => {
+    const terms = sampleSearch.split(/[\s,，、;；]+/).map(s => s.trim().toLowerCase()).filter(Boolean);
+    if (!terms.length) return sampleRows;
+    return (sampleRows || []).filter(r => {
+      const addr = String(r.addr || '').toLowerCase();
+      const symbol = String(r.symbol || '').toLowerCase();
+      return terms.some(t => addr.includes(t) || symbol.includes(t));
+    });
+  }, [sampleRows, sampleSearch]);
+
   if (!scoreAgg) return null;
 
   // 建议判定走跨天累计（crossDayOf）：连续 N 天同向才可执行，防单日噪声把因子来回调权/误删。
@@ -172,11 +186,16 @@ export default function ScoreFactorPanel({
         </>
       )}
 
-      <Typography.Text strong style={{ fontSize: 12, display: 'block', marginTop: 16 }}>
-        逐样本打分明细（{sampleRows.length} 条，点击一行看该样本的因子加减分条形图）
-      </Typography.Text>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 16, flexWrap: 'wrap' }}>
+        <Typography.Text strong style={{ fontSize: 12 }}>
+          逐样本打分明细（{filteredSampleRows.length}{sampleSearch ? `/${sampleRows.length}` : ''} 条，点击一行看该样本的因子加减分条形图）
+        </Typography.Text>
+        <Input allowClear size="small" style={{ width: 260 }} value={sampleSearch}
+          onChange={e => setSampleSearch(e.target.value)}
+          placeholder="搜 CA 或 symbol（可粘多个，逗号/空格分隔）" />
+      </div>
       <Table style={{ marginTop: 6 }} size="small" rowKey="id" pagination={{ pageSize: 20, size: 'small' }}
-        dataSource={sampleRows}
+        dataSource={filteredSampleRows}
         rowClassName={r => (!r.vetoOk ? 'row-hurts' : '')}
         onRow={record => ({ onClick: () => setDrillDown(record), style: { cursor: 'pointer' } })}
         columns={[

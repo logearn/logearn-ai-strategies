@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Card, Button, Table, Tag, Tooltip, Typography, Space, Segmented, Alert,
-         InputNumber, Slider, Input, Statistic, Row, Col, App as AntApp, Checkbox } from 'antd';
+         InputNumber, Slider, Input, Statistic, Row, Col, App as AntApp } from 'antd';
 import PlotlyChart from './PlotlyChart.jsx';
 import { getFieldDesc } from '../lib/dictionary.js';
 import { formatNumberSmart } from '../lib/utils.js';
@@ -8,8 +8,8 @@ import { plotColors } from '../theme.js';
 import { compileStrategy, runStrategyOnRow, parseFactorCheck } from '../lib/proAnalytics.js';
 import {
   FACTOR_WIN_THRESHOLDS, DEFAULT_FACTOR_WIN_THRESHOLD,
-  autoWeights, optimizeWeightsForRho, optimizeWeightsForTierGain, baseStats, backtestFactors, runOOSBacktest, compareWithHardGate,
-  classifyFieldOrigin, factorCorrelations, recommendCutoff,
+  autoWeights, optimizeWeightsForBucketRho, baseStats, backtestFactors, runOOSBacktest, compareWithHardGate,
+  classifyFieldOrigin, factorCorrelations, recommendCutoff, computeRankBuckets,
   missingRate,
 } from '../lib/factorLab.js';
 import { replaceScoreRowsInAllChecks } from '../lib/campLibrary.js';
@@ -52,7 +52,8 @@ function makeScanColumns(camp, onExclude, getMarginal) {
       render: v => (v === 'high' ? '值大更好' : '值小更好') });
   }
   cols.push({
-    title: <Tooltip title="把该字段临时并入当前已选因子池（自动配权）后，score↔returnMax 的 Spearman ρ 相比不加它的变化。挑因子看的是这个边际ρ，不是单字段 AUC——两者可能不一致（如信息与已选因子重叠，边际贡献会趋近 0）。筛垃圾类策略配权时改看分层增益，但候选粗筛仍用这个边际ρ（衡量排序信息量，跟用哪种配权口径无关）。">边际ρ贡献</Tooltip>,
+    title: <Tooltip title='把该字段临时并入当前已选因子池（自动配权）后，分层秩相关（自适应粗粒度分档、档内看命中率、不吃cutoff）相比不加它的变化——挑因子固定看这个，不再区分策略用途。'>
+      边际分层秩相关贡献</Tooltip>,
     width: 100, align: 'right',
     sorter: (a, b) => {
       const ma = getMarginal(a.field), mb = getMarginal(b.field);
@@ -64,7 +65,7 @@ function makeScanColumns(camp, onExclude, getMarginal) {
       if (m.error) return <Tooltip title={m.error}><Typography.Text type="secondary" style={{ fontSize: 11 }}>-</Typography.Text></Tooltip>;
       if (!Number.isFinite(m.delta)) return <Typography.Text type="secondary" style={{ fontSize: 11 }}>-</Typography.Text>;
       const sign = m.delta > 0 ? '+' : '';
-      return <Tooltip title={`池外ρ=${Number.isFinite(m.baseline) ? m.baseline.toFixed(3) : '-'} → 池内ρ=${m.withCandidate.toFixed(3)}`}>
+      return <Tooltip title={`池外分层秩相关=${Number.isFinite(m.baseline) ? m.baseline.toFixed(3) : '-'} → 池内分层秩相关=${m.withCandidate.toFixed(3)}`}>
         <span style={{ color: m.delta > 0 ? '#30d158' : m.delta < 0 ? '#ff453a' : undefined, fontSize: 11 }}>
           {sign}{m.delta.toFixed(3)}
         </span>
@@ -82,6 +83,15 @@ function makeScanColumns(camp, onExclude, getMarginal) {
     { title: isEvil ? '输家捕获率' : '捕获率', width: 80, align: 'right',
       render: (_, r) => r.interval ? fmtPct(r.interval.coverage) : '-' },
     { title: '区间n', width: 70, align: 'right', render: (_, r) => r.interval ? r.interval.n : '-' },
+    { title: '区间判定', width: 110,
+      render: (_, r) => {
+        if (!r.interval) return <Typography.Text type="secondary" style={{ fontSize: 11 }}>-</Typography.Text>;
+        return r.interval.significantAdj
+          ? <Tooltip title={`置换检验p=${r.interval.pPermutation?.toFixed(3) ?? '-'}，BH校正后p=${r.interval.pAdj?.toFixed(3) ?? '-'}`}>
+              <Tag color="success">校正后显著</Tag></Tooltip>
+          : <Tooltip title="置换检验(为搜索了很多候选窗口这件事做了校正)认为这个区间的判别力可能只是巧合——单看这个字段不够稳，但不代表它组合进打分池就没用（这套系统本来就靠很多弱信号加权组合），仅供参考，不影响候选粗筛/因子推荐">
+              <Tag>不显著</Tag></Tooltip>;
+      } },
     { title: '缺失率', width: 80, align: 'right', sorter: (a, b) => a.missRate - b.missRate,
       render: (_, r) => fmtPct(r.missRate) },
     { title: '', width: 70, render: (_, r) => (
@@ -115,15 +125,15 @@ export default function FactorLab({ rows, fields, light, strategyCode, onStrateg
   const [cutoff, setCutoff] = useState(persisted?.cutoff ?? 60);
   const [oos, setOos] = useState(null);
   const [oosBusy, setOosBusy] = useState(false);
-  const [rhoOpt, setRhoOpt] = useState(null);   // ρ 驱动配权的前后结果（含 train/test ρ）
-  const [rhoOptBusy, setRhoOptBusy] = useState(false);
-  // 分层增益配权（筛垃圾类策略的北极星例外：过线/未过线两层台阶，见 optimizeWeightsForTierGain）
-  const [tierGainOpt, setTierGainOpt] = useState(null);
-  const [tierGainOptBusy, setTierGainOptBusy] = useState(false);
-  // 推荐类策略要少而精的候选名单，默认的"触发数×台阶差"会为了做大触发数把权重往"谁都容易
-  // 触发"的方向偏（实测过：过滤能力形同虚设）。勾选后配权改用 volumeWeighted:false，去掉触发数
-  // 乘数，只优化台阶差本身的方向性——见 factorLab.js scorePoolTierGain 内部注释。
-  const [tierGainSelective, setTierGainSelective] = useState(false);
+  // 2026-07-28 再订正：配权固定用分层秩相关（不吃 cutoff，自适应粗粒度分档、不要求逐点单调），
+  // 不再提供"ρ最优"/"分层增益"两个可选口径——之前的设计是按策略用途在三者间选（默认ρ最优、
+  // 筛垃圾用分层增益、推荐用分层秩相关），用户决定不再需要这层区分，统一只用分层秩相关。
+  // 历史上"围绕cutoff判定"这个方向本身就有问题——该先按整体排序质量（粗粒度分层，不要求逐点
+  // 单调）配好权重，cutoff 是排序定下来之后从结果里读出来的一个点（用下面「推荐阈值」），不该
+  // 反过来先猜 cutoff 去配权，这也是分层秩相关（而不是绑定cutoff的分层增益）更适合作为唯一
+  // 口径的原因之一。
+  const [bucketRhoOpt, setBucketRhoOpt] = useState(null);
+  const [bucketRhoOptBusy, setBucketRhoOptBusy] = useState(false);
   // 策略源码由 App 提升管理（跟「策略」tab 共用同一份 state + 持久化），这里不再自己 useState/
   // 读 localStorage——避免两个 tab 常驻挂载时各自缓存一份旧值、编辑了却互相看不见的问题。
   const strategySrc = strategyCode;
@@ -204,8 +214,7 @@ export default function FactorLab({ rows, fields, light, strategyCode, onStrateg
       factors: factors.map(f => ({ field: f.field, camp: f.camp, weight: f.weight,
         lo0: f.lo0, lo1: f.lo1, hi1: f.hi1, hi0: f.hi0, auc: f.auc, missRate: missingRate(rows, f.field) })),
       corr: factorCorr,
-      rhoOpt,
-      tierGainOpt,
+      bucketRhoOpt,
       current: { triggered: p.triggered, hitRate: p.hitRate, capture: p.capture, lift: p.lift },
       sweep: backtest.sweep.points.map(x => ({ cut: x.cut, triggered: x.triggered, hitRate: x.hitRate, capture: x.capture, lift: x.lift })),
       deciles: backtest.deciles,
@@ -215,6 +224,37 @@ export default function FactorLab({ rows, fields, light, strategyCode, onStrateg
     try { await navigator.clipboard.writeText(report); message.success('回测报告已复制（markdown），直接粘给 AI 即可'); }
     catch { message.error('复制失败'); }
   }
+  // 导出"精简样本"+当前因子池/候选/配置成一份 JSON——不是给人看的报告，是给"直接在 Node 里
+  // import factorLab.js 重放同一套函数"用的数据快照。只挑 scoreRows/recommendFactorPath/
+  // computeRankBuckets 等打分函数实际会读的字段（id/symbol/tokenAddress/swapBeginTime/
+  // returnMax/features），跳过 arrays/rawCtx/rawSignal/rawCall/categorical 这些大头——
+  // 那些是给策略回放/快照查看器用的完整原始快照，体积是 features 的几十倍以上，
+  // 数学模型验证根本用不到，带上只会把导出文件撑到几百 MB。
+  function exportRawDataJson() {
+    if (!rows.length) { message.warning('还没有数据可导出'); return; }
+    const slimRows = rows.map(r => ({
+      id: r.id, symbol: r.symbol, tokenAddress: r.tokenAddress,
+      swapBeginTime: r.swapBeginTime, returnMax: r.returnMax, features: r.features,
+    }));
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      config: { threshold, cutoff, missingPolicy, scoreShape, fieldScope },
+      rows: slimRows,
+      factors,
+      candidates: {
+        hero: scan.visibleHeroCandidates || [],
+        evil: scan.visibleEvilCandidates || [],
+      },
+    };
+    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `factorlab_raw_${rows.length}行_${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+    message.success(`已导出 ${rows.length} 行精简数据（仅 id/symbol/tokenAddress/swapBeginTime/returnMax/features + 因子池/候选），可直接喂给 Node 脚本用 factorLab.js 原函数在内存中验证`);
+  }
+
   const hasEvil = factors.some(f => f.camp === 'evil');
   const cutoffMin = hasEvil ? -100 : 0;
   // 推荐触发阈值：净超额命中数最大的档位（见 factorLab.js 里 recommendCutoff 的注释）
@@ -293,41 +333,22 @@ export default function FactorLab({ rows, fields, light, strategyCode, onStrateg
     invalidateDownstream();
   }
 
-  // ρ 驱动配权：直接优化北极星默认口径（全程强单调，train 拟合、test 验证），把新权重写回因子表。
-  async function runRhoOptimize() {
-    setRhoOptBusy(true);
-    await new Promise(r => setTimeout(r, 0));   // 让按钮 loading 画出来
-    try {
-      const res = optimizeWeightsForRho(rows, factors, { missingPolicy });
-      if (res.error) { message.warning(res.error); setRhoOpt(null); return; }
-      setFactors(res.factors);
-      invalidateDownstream();   // 先清 oos/gen（权重变了），再落 rhoOpt——否则读数会被这里清掉
-      setRhoOpt(res);
-      const overfit = Number.isFinite(res.rhoTestAfter) && Number.isFinite(res.rhoTestBefore)
-        && res.rhoTestAfter <= res.rhoTestBefore;
-      if (overfit) message.warning('train ρ 提升了，但 held-out test ρ 没涨——可能过拟合，谨慎采用（可点「全部重置为自动」还原）');
-      else message.success('已按 ρ 最优写回权重，train / test ρ 均见提升');
-    } finally { setRhoOptBusy(false); }
-  }
-
-  // 分层增益配权：北极星例外口径——策略以"筛垃圾"为第一目标时，不追全程精细单调，
-  // 只要求过线组高倍率显著高于未过线组这一道台阶。目标函数见 scorePoolTierGain
-  // （触发数×(命中率_过线−命中率_未过线)），train 拟合、test 验证，同一套坐标上升框架。
-  async function runTierGainOptimize() {
-    setTierGainOptBusy(true);
+  // 分层秩相关配权：唯一的配权口径，不吃 cutoff——只按整体排序质量（自适应粗粒度分档，
+  // 不要求逐点单调）配权。配完之后 cutoff 该用下面「推荐阈值」单独去定，不在这一步定。
+  async function runBucketRhoOptimize() {
+    setBucketRhoOptBusy(true);
     await new Promise(r => setTimeout(r, 0));
     try {
-      const res = optimizeWeightsForTierGain(rows, factors, cutoff,
-        { missingPolicy, winThreshold: threshold, volumeWeighted: !tierGainSelective });
-      if (res.error) { message.warning(res.error); setTierGainOpt(null); return; }
+      const res = optimizeWeightsForBucketRho(rows, factors, { missingPolicy, winThreshold: threshold });
+      if (res.error) { message.warning(res.error); setBucketRhoOpt(null); return; }
       setFactors(res.factors);
       invalidateDownstream();
-      setTierGainOpt({ ...res, selective: tierGainSelective });
+      setBucketRhoOpt(res);
       const overfit = Number.isFinite(res.rhoTestAfter) && Number.isFinite(res.rhoTestBefore)
         && res.rhoTestAfter <= res.rhoTestBefore;
-      if (overfit) message.warning('train 分层增益提升了，但 held-out test 没涨——可能过拟合，谨慎采用（可点「全部重置为自动」还原）');
-      else message.success('已按分层增益写回权重，train / test 均见提升');
-    } finally { setTierGainOptBusy(false); }
+      if (overfit) message.warning('train 分层秩相关提升了，但 held-out test 没涨——可能过拟合，谨慎采用（可点「全部重置为自动」还原）');
+      else message.success('已按分层秩相关写回权重，train / test 均见提升——现在可以点「推荐阈值」单独定 cutoff');
+    } finally { setBucketRhoOptBusy(false); }
   }
 
   async function runOOS() {
@@ -513,11 +534,29 @@ export default function FactorLab({ rows, fields, light, strategyCode, onStrateg
       { x: win.map(s => s.score), y: win.map(s => s.row.returnMax), name: `高倍（>${threshold}x）`,
         type: 'scatter', mode: 'markers', marker: { color: '#ff9f0a', size: 7, opacity: 0.85 } },
     ];
+    // 分层秩相关吃的就是这些档：档命中率（不是中位数——中位数对右偏的倍数分布不敏感，一大坨
+    // 低倍盘会把中位数钉死在差不多的位置，尾部涨多猛都感受不到，命中率才是"阈值右侧赚率"这个
+    // 真实目标的直接体现）连成折线画在右轴上，是不是整体爬升、哪几档在打架（命中率比前一档还低），
+    // 一眼就能看出，比只看一个 rho 数字直观。
+    const rankBuckets = computeRankBuckets(pts.map(s => ({ score: s.score, ret: s.row.returnMax })), threshold);
+    if (rankBuckets) {
+      const bx = [], by = [];
+      rankBuckets.buckets.forEach(b => {
+        const mid = (b.loScore + b.hiScore) / 2;
+        bx.push(mid); by.push(b.hitRate * 100);
+      });
+      traces.push({
+        x: bx, y: by, name: `档命中率%（${rankBuckets.buckets.length} 档，分层秩相关用这个）`,
+        type: 'scatter', mode: 'lines+markers', yaxis: 'y2',
+        line: { color: '#bf5af2', width: 2 }, marker: { color: '#bf5af2', size: 6 },
+      });
+    }
     const layout = {
-      height: 380, margin: { l: 56, r: 24, t: 24, b: 40 },
+      height: 380, margin: { l: 56, r: 56, t: 24, b: 40 },
       paper_bgcolor: c.paperBg, plot_bgcolor: c.paperBg, font: { color: c.textColor, size: 12 },
       xaxis: { title: { text: '总分' }, ...c.axis },
       yaxis: { title: { text: '倍数（returnMax，对数轴）' }, type: 'log', ...c.axis },
+      yaxis2: { title: { text: `档命中率%（>${threshold}x）` }, overlaying: 'y', side: 'right', rangemode: 'tozero', ...c.axis },
       shapes: [
         { type: 'line', x0: cutoff, x1: cutoff, y0: 0, y1: 1, yref: 'paper',
           line: { color: '#ff453a', width: 1.5, dash: 'dash' } },
@@ -594,9 +633,9 @@ export default function FactorLab({ rows, fields, light, strategyCode, onStrateg
             onClick={scan.runScan}>
             扫描 {scopedFields.length} 个{fieldScope === 'original' ? '原' : '组装'}字段（两阵营{scan.residualMode ? '·残差' : ''}）
           </Button>
-          <Tooltip title="逐个把候选字段临时并入当前因子池，看 score↔returnMax 的 Spearman ρ 变化——比单字段 AUC 更贴近排序信息量（不管你的策略最终按 ρ 最优还是分层增益配权，这个粗筛口径通用）">
+          <Tooltip title='逐个把候选字段临时并入当前因子池，看分层秩相关（自适应粗粒度分档、档内看命中率，不吃cutoff）的变化——挑因子固定用这个口径，不再区分策略用途。'>
             <Button loading={scan.marginalBusy} disabled={!scan.scanHero && !scan.scanEvil}
-              onClick={scan.runMarginalRho}>计算候选边际ρ贡献</Button>
+              onClick={scan.runMarginalRho}>计算候选分层秩相关贡献</Button>
           </Tooltip>
         </Space>}>
         <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 12 }}>
@@ -653,8 +692,8 @@ export default function FactorLab({ rows, fields, light, strategyCode, onStrateg
             <Space size={4}><span style={{ fontSize: 12 }}>AUC 偏离 ≥</span>
               <InputNumber size="small" min={0} max={0.5} step={0.01} style={{ width: 70 }}
                 value={candFilter.minAuc} onChange={v => setCandFilter(f => ({ ...f, minAuc: v || 0 }))} /></Space>
-            <Tooltip title={!scan.marginalRho ? '先点「计算候选边际ρ贡献」才能按这个筛' : '只保留边际ρ贡献 ≥ 该值的候选（正贡献=加进池子能提升排序信息量ρ）。负贡献会被挡掉，哪怕绝对值大。设 0 = 显示全部（含负贡献）'}>
-              <Space size={4}><span style={{ fontSize: 12 }}>边际ρ贡献 ≥</span>
+            <Tooltip title={!scan.marginalRho ? '先点「计算候选分层秩相关贡献」才能按这个筛' : '只保留边际贡献 ≥ 该值的候选（正贡献=加进池子能提升排序信息量）。负贡献会被挡掉，哪怕绝对值大。设 0 = 显示全部（含负贡献）'}>
+              <Space size={4}><span style={{ fontSize: 12 }}>边际分层秩相关贡献 ≥</span>
                 <InputNumber size="small" min={0} max={1} step={0.005} style={{ width: 70 }} disabled={!scan.marginalRho}
                   value={candFilter.minMarginal} onChange={v => setCandFilter(f => ({ ...f, minMarginal: v || 0 }))} /></Space>
             </Tooltip>
@@ -775,19 +814,10 @@ export default function FactorLab({ rows, fields, light, strategyCode, onStrateg
             <Segmented size="small" value={missingPolicy}
               options={[{ label: '缺失记0分', value: 'zero' }, { label: '缺失重归一', value: 'renorm' }]}
               onChange={v => { setMissingPolicy(v); invalidateDownstream(); }} />
-            <Tooltip title="直接优化北极星默认口径（全程强单调）：搜非负权重让 总分↔returnMax 的 Spearman ρ 最大（前 70% 时间拟合、后 30% 验证）。比 |AUC−0.5| 自动配权更贴目标；会把对 ρ 无贡献/有害的因子权重压到 0。适合大多数策略；若你的策略第一目标是筛垃圾，改用右边「按分层增益配权」。">
-              <Button size="small" type="primary" ghost loading={rhoOptBusy}
+            <Tooltip title='唯一的配权口径——不吃 cutoff，只要求自适应粗粒度分档递增（不要求逐点单调；档大小固定至少15，命中率低时按期望命中数≥3自适应放大，避免小分桶下命中率方差太大；档内统计量用命中率而不是中位数——中位数对右偏的倍数分布不敏感，尾部涨得再猛也感受不到）。目标值 = 「档序号 vs 档命中率」的 spearman × (1−饱和度惩罚，防桶间排对/桶内一锅粥) × (1−锯齿惩罚，防桶间大体排对/局部反复倒挂——就是散点图紫线看着一路跳水那种)。搜非负权重让这个目标值最大（前 70% 拟合、后 30% 验证），会把对分档排序无贡献/有害的因子权重压到 0。配完权重后，点右边「推荐阈值」单独定 cutoff，不要先猜 cutoff 再配权。'>
+              <Button size="small" type="primary" ghost loading={bucketRhoOptBusy}
                 disabled={factors.length < 2 || !rows.length}
-                onClick={runRhoOptimize}>🎯 按 ρ 最优配权</Button>
-            </Tooltip>
-            <Tooltip title={`北极星例外口径：策略以"筛垃圾"为第一目标时，不追全程精细单调，只要求过线（当前 cutoff=${cutoff}）组高倍率显著高于未过线组这一道台阶。搜非负权重让 触发数×(命中率_过线−命中率_未过线) 最大（前 70% 拟合、后 30% 验证）。垃圾/高倍标签口径跟"找因子"体系一致，直接用 returnMax > 阈值。`}>
-              <Button size="small" type="primary" ghost loading={tierGainOptBusy}
-                disabled={factors.length < 2 || !rows.length}
-                onClick={runTierGainOptimize}>🎯 按分层增益配权</Button>
-            </Tooltip>
-            <Tooltip title='勾选后去掉"触发数"这个规模乘数，只优化台阶差本身的方向性——默认的"触发数×台阶差"是给"筛垃圾"策略设计的（尽量多留好币，触发越多越好），推荐类策略（想要少而精的候选名单）用默认口径配权会被"放量"牵着走，实测过滤能力可能形同虚设（触发率飙到 90%+）。适合"推荐"场景勾选。'>
-              <Checkbox checked={tierGainSelective} onChange={e => setTierGainSelective(e.target.checked)}
-                style={{ fontSize: 12 }}>推荐场景（不奖励触发量）</Checkbox>
+                onClick={runBucketRhoOptimize}>🎯 按分层秩相关配权</Button>
             </Tooltip>
             <Button size="small" onClick={() => (scan.scanHero || scan.scanEvil) && scan.rebuildFactors(scan.scanHero, scan.scanEvil, scan.selectedHero, scan.selectedEvil, [])}>全部重置为自动</Button>
             <Tooltip title="把当前因子池整体替换到「策略」tab 的打分段（保留硬否决段、CUTOFF 同步当前触发阈值），然后跳到策略 tab。前提：策略里有 ALL_CHECKS+VETO_NAMES 基础策略。">
@@ -804,49 +834,28 @@ export default function FactorLab({ rows, fields, light, strategyCode, onStrateg
               ? '字段缺失记 0（不加不减，惩罚数据不全的盘，保守）。'
               : '字段缺失时该因子不参与，按在场因子权重重归一；在场权重不足 50% 判 0 分。'}
             总分 = Σ(±权重×命中度)/权重合计×100，纯勇者阵营时落在 0~100，含邪恶阵营命中时可能为负。
-            权重自动按 |AUC−0.5| 分配，可手工调整；点「🎯 按 ρ 最优配权」改用北极星默认口径（全程强单调）直接优化，
-            若策略第一目标是筛垃圾，改点「🎯 按分层增益配权」（北极星例外口径：过线/未过线两层台阶）。切换打分方式会按新方式重新推导边界（手工编辑会被重置）。
+            权重自动按区间打分（Wilson下界×√coverage，区间感知，不假设方向单调）分配，可手工调整；
+            点「🎯 按分层秩相关配权」直接优化排序质量（不吃 cutoff，配完权重后用「推荐阈值」单独定 cutoff——先排序、再从排序里读 cutoff，不要反过来）。
+            切换打分方式会按新方式重新推导边界（手工编辑会被重置）。
           </Typography.Paragraph>
-          {rhoOpt && (() => {
+          {bucketRhoOpt && (() => {
             const fmt = v => (Number.isFinite(v) ? v.toFixed(3) : '—');
-            const dTrain = rhoOpt.rhoTrainAfter - rhoOpt.rhoTrainBefore;
-            const dTest = rhoOpt.rhoTestAfter - rhoOpt.rhoTestBefore;
+            const dTrain = bucketRhoOpt.rhoTrainAfter - bucketRhoOpt.rhoTrainBefore;
+            const dTest = bucketRhoOpt.rhoTestAfter - bucketRhoOpt.rhoTestBefore;
             const testUp = Number.isFinite(dTest) && dTest > 0;
             return (
               <Alert style={{ marginBottom: 12 }} type={testUp ? 'success' : 'warning'} showIcon
                 message={<span style={{ fontSize: 12 }}>
-                  🎯 ρ 最优配权结果（北极星默认口径 = 总分↔returnMax 的 Spearman ρ，全程强单调）：
-                  <b> train</b> {fmt(rhoOpt.rhoTrainBefore)} → {fmt(rhoOpt.rhoTrainAfter)}（{dTrain >= 0 ? '+' : ''}{fmt(dTrain)}），
-                  <b> held-out test</b> {fmt(rhoOpt.rhoTestBefore)} → {fmt(rhoOpt.rhoTestAfter)}（{dTest >= 0 ? '+' : ''}{fmt(dTest)}）
-                  <Typography.Text type="secondary">　train {rhoOpt.nTrain} / test {rhoOpt.nTest} 条</Typography.Text>
+                  🎯 分层秩相关配权结果（北极星例外口径②(推荐) = 档序号↔档命中率的 Spearman，不吃 cutoff）：
+                  <b> train</b> {fmt(bucketRhoOpt.rhoTrainBefore)} → {fmt(bucketRhoOpt.rhoTrainAfter)}（{dTrain >= 0 ? '+' : ''}{fmt(dTrain)}），
+                  <b> held-out test</b> {fmt(bucketRhoOpt.rhoTestBefore)} → {fmt(bucketRhoOpt.rhoTestAfter)}（{dTest >= 0 ? '+' : ''}{fmt(dTest)}）
+                  <Typography.Text type="secondary">　train {bucketRhoOpt.nTrain} / test {bucketRhoOpt.nTest} 条</Typography.Text>
                 </span>}
                 description={<span style={{ fontSize: 12 }}>
                   {testUp
-                    ? 'test 也涨 = 真实贴近了目标，可放心采用。'
-                    : '⚠️ 只有 train 涨、held-out test 没涨 —— 大概率过拟合（因子太多/样本太少/相关因子扎堆）。别急着用，考虑减因子或点「全部重置为自动」还原。'}
-                  {rhoOpt.zeroedFields.length > 0 && <>　被压到 0（对 ρ 无贡献或有害，建议删）：{rhoOpt.zeroedFields.map(f => <code key={f} style={{ fontSize: 11, marginLeft: 4 }}>{f}</code>)}</>}
-                </span>} />
-            );
-          })()}
-          {tierGainOpt && (() => {
-            const fmt = v => (Number.isFinite(v) ? v.toFixed(2) : '—');
-            const dTrain = tierGainOpt.rhoTrainAfter - tierGainOpt.rhoTrainBefore;
-            const dTest = tierGainOpt.rhoTestAfter - tierGainOpt.rhoTestBefore;
-            const testUp = Number.isFinite(dTest) && dTest > 0;
-            return (
-              <Alert style={{ marginBottom: 12 }} type={testUp ? 'success' : 'warning'} showIcon
-                message={<span style={{ fontSize: 12 }}>
-                  🎯 分层增益配权结果（北极星例外口径 = {tierGainOpt.selective ? '' : '触发数×'}(命中率_过线−命中率_未过线)，
-                  cutoff={cutoff}{tierGainOpt.selective ? '，不奖励触发量' : ''}）：
-                  <b> train</b> {fmt(tierGainOpt.rhoTrainBefore)} → {fmt(tierGainOpt.rhoTrainAfter)}（{dTrain >= 0 ? '+' : ''}{fmt(dTrain)}），
-                  <b> held-out test</b> {fmt(tierGainOpt.rhoTestBefore)} → {fmt(tierGainOpt.rhoTestAfter)}（{dTest >= 0 ? '+' : ''}{fmt(dTest)}）
-                  <Typography.Text type="secondary">　train {tierGainOpt.nTrain} / test {tierGainOpt.nTest} 条</Typography.Text>
-                </span>}
-                description={<span style={{ fontSize: 12 }}>
-                  {testUp
-                    ? 'test 也涨 = 台阶差真实存在，可放心采用。'
+                    ? 'test 也涨 = 排序质量真实提升，可放心采用——接下来点右上角「推荐阈值」单独定 cutoff，不要用旧 cutoff。'
                     : '⚠️ 只有 train 涨、held-out test 没涨 —— 大概率过拟合。别急着用，考虑减因子或点「全部重置为自动」还原。'}
-                  {tierGainOpt.zeroedFields.length > 0 && <>　被压到 0（对台阶差无贡献或有害，建议删）：{tierGainOpt.zeroedFields.map(f => <code key={f} style={{ fontSize: 11, marginLeft: 4 }}>{f}</code>)}</>}
+                  {bucketRhoOpt.zeroedFields.length > 0 && <>　被压到 0（对分档排序无贡献或有害，建议删）：{bucketRhoOpt.zeroedFields.map(f => <code key={f} style={{ fontSize: 11, marginLeft: 4 }}>{f}</code>)}</>}
                 </span>} />
             );
           })()}
@@ -900,6 +909,9 @@ export default function FactorLab({ rows, fields, light, strategyCode, onStrateg
             <Tooltip title="把配置/因子池/去冗余/北极星ρ最优配权结果/当前回测/cutoff扫描/分段表/时间外推/漏网之鱼 + 诊断清单，拼成一份 markdown 复制到剪贴板，直接粘给 AI 让它诊断调试。">
               <Button size="small" type="primary" ghost onClick={exportBacktestReport}>📋 导出报告（喂 AI）</Button>
             </Tooltip>
+            <Tooltip title="导出原始样本数据 JSON（rows + 当前因子池 + 候选 + 配置），跟 buildRows() 产出的形状完全一致——可以直接在 Node 里 import factorLab.js 重放 scoreRows/recommendFactorPath/computeRankBuckets 等原函数，在内存中验证方案，不用等实现完再回测。">
+              <Button size="small" onClick={exportRawDataJson}>💾 导出原始数据（供内存验证）</Button>
+            </Tooltip>
           </Space>}>
           {hasEvil && <Alert style={{ marginBottom: 12 }} type="info" showIcon
             message="已包含邪恶阵营因子，总分可能为负——阈值滑块下限已相应放宽到 -100。" />}
@@ -913,8 +925,10 @@ export default function FactorLab({ rows, fields, light, strategyCode, onStrateg
           {sweepFigure && <PlotlyChart traces={sweepFigure.traces} layout={sweepFigure.layout} height={340} />}
           {scoreScatterFigure && (<>
             <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 12 }}>
-              分数 vs 倍数散点（Y 轴对数）：橙=高倍（{'>'}{threshold}x），灰=普通；红竖线=当前 cutoff，绿虚横线=高倍阈值。
-              高倍点是否靠右堆、有没有大量橙点落在竖线左侧（漏网），一眼可看。
+              分数 vs 倍数散点（Y 轴对数）：橙=高倍（{'>'}{threshold}x），灰=普通；红竖线=当前 cutoff，绿虚横线=高倍阈值；
+              紫线（右轴，%）=分层秩相关实际用的档命中率（每档≥15条、且按整体命中率自适应放大保证期望命中数≥3，同分不跨档；
+              命中率比中位数更贴近"高倍捕获"这个真实目标——中位数会被一大坨普通盘钉死，涨得再猛也感受不到）。
+              紫线整体爬升=分层单调，某几档比前一档还低=打架（分层秩相关会因此打折）。高倍点是否靠右堆、有没有大量橙点落在竖线左侧（漏网），一眼可看。
             </Typography.Text>
             <PlotlyChart traces={scoreScatterFigure.traces} layout={scoreScatterFigure.layout} height={380} />
           </>)}

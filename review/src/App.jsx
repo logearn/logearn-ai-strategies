@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { ConfigProvider, Layout, Tabs, Space, Switch, Typography, Tag, Empty, App as AntApp } from 'antd';
+import { ConfigProvider, Layout, Tabs, Space, Switch, Typography, Tag, Empty, Button, App as AntApp } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import { makeTheme } from './theme.js';
 import DataLoader from './ui/DataLoader.jsx';
@@ -10,7 +10,7 @@ import LabelPanel from './ui/LabelPanel.jsx';
 import ErrorBoundary from './ui/ErrorBoundary.jsx';
 import { loadLabels, saveLabels, setLabel, applyLabels } from './lib/labels.js';
 import { loadExcludedTokens, saveExcludedTokens, excludeToken, unexcludeToken, filterExcludedTokens } from './lib/excludedTokens.js';
-import { loadCampLibrary, saveCampLibrary, addCampEntry, removeCampEntry,
+import { loadCampLibrary, saveCampLibrary, addCampEntry, removeCampEntry, removeCampEntries,
          loadCampActiveGroup, saveCampActiveGroup, renameCampGroup, moveCampEntriesToGroup,
          groupCampEntries, DEFAULT_CAMP_GROUP, applyCampEntryInterval,
          loadCampGroupThresholds, saveCampGroupThresholds, setCampGroupThreshold } from './lib/campLibrary.js';
@@ -20,13 +20,44 @@ import BinBarCard from './ui/BinBarCard.jsx';
 import AucPanel from './ui/AucPanel.jsx';
 import FieldHealth from './ui/FieldHealth.jsx';
 import StrategyReplay from './ui/StrategyReplay.jsx';
+import BacktestReports from './ui/strategyReplay/BacktestReports.jsx';
 import CustomFields from './ui/CustomFields.jsx';
 import FieldBrowser from './ui/FieldBrowser.jsx';
 import ScatterBoard from './ui/ScatterBoard.jsx';
 import FactorLab from './ui/FactorLab.jsx';
 import { isNonAnalyticField, getFeature, ROW_LEVEL_FIELDS } from './lib/data.js';
+import { compileStrategy, runStrategyOnRow, parseFactorCheck } from './lib/proAnalytics.js';
 
 const { Header, Content } = Layout;
+
+// 策略源码：原来「找因子」（FactorLab）和「策略」（StrategyReplay）两个 tab 各自 useState 一份、
+// 只在挂载时读一次 localStorage——两边常驻挂载（destroyInactiveTabPane=false）时，在一边编辑后
+// 切到另一边，读到的都是各自挂载时的旧值，不会互相同步。提升到这里做唯一数据源，两边都改成消费
+// 同一份 state + 同一个持久化 setter，彻底避免"改了白改/导入到旧代码"这类问题。
+const STRATEGY_CODE_KEY = 'chart_strategy_diag_code_react';
+function loadStrategyCode() {
+  try { return localStorage.getItem(STRATEGY_CODE_KEY) || ''; } catch { return ''; }
+}
+
+// 「找因子」tab 合并了 FactorLab 内部好几张卡片 + 散点/相关性/AUC/字段体检/分箱共 9 张卡片，
+// 纵向堆叠很长，靠滚轮翻找成本高。给一条吸顶的锚点导航条，点了平滑滚动到对应卡片——
+// 目标 id 有的在 FactorLab 内部（因子池为空/未回测时那几个 id 不存在于 DOM），
+// 找不到就静默不跳，不报错。
+function ScrollNav({ items }) {
+  const scrollTo = id => {
+    const el = document.getElementById(id);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+  return (
+    <Space wrap size={4} style={{ position: 'sticky', top: 0, zIndex: 5, padding: '6px 8px',
+      background: 'var(--surface-1,#141414)', borderRadius: 6, marginBottom: 4 }}>
+      <Typography.Text type="secondary" style={{ fontSize: 12, marginRight: 4 }}>跳转：</Typography.Text>
+      {items.map(it => (
+        <Button key={it.id} size="small" type="text" onClick={() => scrollTo(it.id)}>{it.label}</Button>
+      ))}
+    </Space>
+  );
+}
 
 // 候选字段：从行数据现算，并复用 data.js 的剔除规则（内部标记/元数据/绝对时间戳）
 function useFieldOptions(rows, customVersion = 0) {
@@ -94,6 +125,15 @@ export default function App() {
   const [campGroupThresholds, setCampGroupThresholds] = useState(loadCampGroupThresholds);
   const [activeTabKey, setActiveTabKey] = useState('data');
   const [pendingStrategyLines, setPendingStrategyLines] = useState([]);
+  const [strategyCode, setStrategyCodeState] = useState(loadStrategyCode);
+  // "存报告"这个动作就地留在"策略"tab（StrategyReplay 自己算好 agg/scoreAgg 等顶层指标后直接
+  // 存档），"报告"tab（BacktestReports）只负责查看/对比/导出已存的报告——reportsVersion 是两边
+  // 之间唯一需要的信号：存了新报告 +1，"报告"tab 据此重新读一次存档列表。
+  const [reportsVersion, setReportsVersion] = useState(0);
+  const setStrategyCode = next => {
+    setStrategyCodeState(next);
+    try { localStorage.setItem(STRATEGY_CODE_KEY, next); } catch { /* 隐私模式 */ }
+  };
   const setCampActiveGroup = name => {
     const g = name && String(name).trim() ? String(name).trim() : DEFAULT_CAMP_GROUP;
     setCampActiveGroupState(g); saveCampActiveGroup(g);
@@ -103,8 +143,36 @@ export default function App() {
     const next = addCampEntry(campLibrary, { ...entry, group: entry.group || campActiveGroup });
     setCampLibrary(next); saveCampLibrary(next);
   };
+  // 收藏前判断是不是已经在库里——决定弹出的提示文案是"已收藏"还是"已更新"
+  const isCampFieldExisting = (field, camp) =>
+    campLibrary.some(x => x.field === field && (x.camp === 'evil' ? 'evil' : 'hero') === (camp === 'evil' ? 'evil' : 'hero'));
+  // 当前「策略」tab 那份代码里，已经实际在打分的字段集合——散点图标题上标一下"当前已作为因子"，
+  // 跟阵营库的收藏状态（isCampFieldExisting）不是一回事：阵营库是暂存候选，这里是已经在线上
+  // 判定逻辑里生效的。只需要一条能跑通的样本取 checks 结构（权重/字段名对全部样本是常量）。
+  const activeStrategyFactorFields = useMemo(() => {
+    const set = new Set();
+    if (!strategyCode || !strategyCode.trim() || !activeRows.length) return set;
+    const compiled = compileStrategy(strategyCode);
+    if (compiled.error) return set;
+    for (const row of activeRows) {
+      if (!row.rawCtx) continue;
+      const res = runStrategyOnRow(compiled, row);
+      if (res.error || !Array.isArray(res.checks)) continue;
+      for (const c of res.checks) {
+        const parsed = parseFactorCheck(c);
+        if (parsed) set.add(parsed.name);
+      }
+      break;
+    }
+    return set;
+  }, [strategyCode, activeRows]);
+  const isStrategyFactorField = field => activeStrategyFactorFields.has(field);
   const removeCampLibraryEntry = id => {
     const next = removeCampEntry(campLibrary, id);
+    setCampLibrary(next); saveCampLibrary(next);
+  };
+  const removeCampLibraryEntries = ids => {
+    const next = removeCampEntries(campLibrary, ids);
     setCampLibrary(next); saveCampLibrary(next);
   };
   const renameCampLibraryGroup = (from, to) => {
@@ -143,6 +211,7 @@ export default function App() {
       children: (
         <Space direction="vertical" size={16} style={{ width: '100%' }}>
           <DataLoader onRows={r => { setRows(r); setActiveRows(filterExcludedTokens(applyLabels(r, labels), excludedTokens)); setFiltered(false); }} />
+          {hasData && <ErrorBoundary title="快照速查渲染出错" resetKey={rows.length}><SnapshotInspector rows={workingRows} labels={labels} onLabel={setOneLabel} light={!dark} /></ErrorBoundary>}
           {hasData && <FilterPanel rows={workingRows} fields={fields}
             onActiveRows={(r, isF) => { setActiveRows(r); setFiltered(isF); }} />}
           {hasData && <SummaryPanel activeRows={activeRows} allRows={workingRows}
@@ -157,23 +226,42 @@ export default function App() {
       key: 'findFactor', label: '找因子', disabled: !hasData,
       children: (
         <Space direction="vertical" size={16} style={{ width: '100%' }}>
+          <ScrollNav items={[
+            { id: 'fl-threshold', label: '阈值总览' },
+            { id: 'fl-import', label: '导入策略' },
+            { id: 'fl-discover', label: '因子发现' },
+            { id: 'fl-weights', label: '因子权重' },
+            { id: 'fl-backtest', label: '回测' },
+            { id: 'fl-generate', label: '生成代码' },
+            { id: 'section-scatter', label: '散点图' },
+            { id: 'section-corr', label: '相关性' },
+            { id: 'section-auc', label: 'AUC/体检/分箱' },
+          ]} />
           <ErrorBoundary title="回测·因子面板渲染出错" resetKey={activeRows.length}>
-            <FactorLab rows={activeRows} fields={fields} light={!dark} />
+            <FactorLab rows={activeRows} fields={fields} light={!dark}
+              strategyCode={strategyCode} onStrategyCodeChange={setStrategyCode}
+              onGoToStrategy={() => setActiveTabKey('strategy')} />
           </ErrorBoundary>
-          <ScatterBoard rows={activeRows} fields={fields} light={!dark} onAddToCampLibrary={addToCampLibrary}
-            campGroups={groupCampEntries(campLibrary, [campActiveGroup]).map(g => g.group)}
-            campActiveGroup={campActiveGroup} onCampActiveGroupChange={setCampActiveGroup} />
-          <CorrTable rows={activeRows} />
-          <AucPanel rows={activeRows} fields={fields} />
-          <FieldHealth rows={activeRows} fields={fields} />
-          <BinBarCard rows={activeRows} fields={fields} light={!dark} />
+          <div id="section-scatter">
+            <ScatterBoard rows={activeRows} fields={fields} light={!dark} onAddToCampLibrary={addToCampLibrary}
+              campGroups={groupCampEntries(campLibrary, [campActiveGroup]).map(g => g.group)}
+              campActiveGroup={campActiveGroup} onCampActiveGroupChange={setCampActiveGroup}
+              isCampFieldExisting={isCampFieldExisting} isStrategyFactorField={isStrategyFactorField} />
+          </div>
+          <div id="section-corr"><CorrTable rows={activeRows} /></div>
+          <div id="section-auc" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <AucPanel rows={activeRows} fields={fields} />
+            <FieldHealth rows={activeRows} fields={fields} />
+            <BinBarCard rows={activeRows} fields={fields} light={!dark} />
+          </div>
         </Space>
       ),
     },
     {
       key: 'campLibrary', label: '阵营库',
       children: (
-        <CampLibrary library={campLibrary} rows={activeRows} onRemove={removeCampLibraryEntry} onSendToStrategy={sendCampEntryToStrategy}
+        <CampLibrary library={campLibrary} rows={activeRows} onRemove={removeCampLibraryEntry}
+          onRemoveMany={removeCampLibraryEntries} onSendToStrategy={sendCampEntryToStrategy}
           activeGroup={campActiveGroup} onActiveGroupChange={setCampActiveGroup}
           onRenameGroup={renameCampLibraryGroup} onMoveEntries={moveCampLibraryEntries}
           groupThresholds={campGroupThresholds} onSetGroupThreshold={setCampGroupThresholdValue}
@@ -187,9 +275,17 @@ export default function App() {
           <StrategyReplay rows={activeRows} fields={fields} light={!dark} onLabel={setOneLabel}
             onExclude={excludeOneToken}
             pendingLines={pendingStrategyLines}
-            onConsumePendingLines={() => setPendingStrategyLines([])} />
+            onConsumePendingLines={() => setPendingStrategyLines([])}
+            strategyCode={strategyCode} onStrategyCodeChange={setStrategyCode}
+            reportsVersion={reportsVersion} onReportsChange={() => setReportsVersion(v => v + 1)} />
         </Space>
       ),
+    },
+    {
+      // 报告的查看/对比/导出独立成一个 tab；"存为今天报告"这个动作留在"策略"tab 里就地完成
+      // （见 StrategyReplay.jsx），这里只读 reportsVersion 感知新存的报告，不需要接收顶层指标。
+      key: 'reports', label: '报告', disabled: !hasData,
+      children: <BacktestReports light={!dark} reportsVersion={reportsVersion} />,
     },
     {
       key: 'fields', label: '字段', disabled: !hasData,
@@ -198,7 +294,6 @@ export default function App() {
           <CustomFields rows={workingRows} fields={fields}
             onApplied={() => { setCustomVersion(v => v + 1); setActiveRows(a => [...a]); }} />
           <FieldBrowser fields={fields} />
-          {hasData && <ErrorBoundary title="快照速查渲染出错" resetKey={rows.length}><SnapshotInspector rows={workingRows} labels={labels} onLabel={setOneLabel} light={!dark} /></ErrorBoundary>}
           <LabelPanel rows={labeledRows} labels={labels} onLabel={setOneLabel}
             onClearAll={() => { setLabels({}); saveLabels({}); }}
             excludedTokens={excludedTokens} onUnexclude={unexcludeOneToken} />

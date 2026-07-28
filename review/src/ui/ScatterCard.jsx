@@ -1,5 +1,5 @@
 import React, { useMemo, useRef, useState } from 'react';
-import { Card, Space, Checkbox, Button, InputNumber, Alert, Typography, Tooltip, Popover, Select, Segmented, message } from 'antd';
+import { Card, Space, Checkbox, Button, InputNumber, Alert, Typography, Tooltip, Popover, Select, Segmented, message, Tag } from 'antd';
 import { SwapOutlined, PictureOutlined, DeleteOutlined, StarOutlined } from '@ant-design/icons';
 import PlotlyChart from './PlotlyChart.jsx';
 import { buildScatterFigure } from '../lib/scatterFigure.js';
@@ -22,10 +22,12 @@ const DEFAULTS = { logX: false, logY: false, clipOutliers: false, showConfBand: 
   showBinned: false, showMarginal: true, showVLine: false, vLineValue: 2 };
 
 export default function ScatterCard({ rows, xField, yField, colorField, light, onRemove, onAddToCampLibrary,
-  campGroups = [], campActiveGroup, onCampActiveGroupChange, highlightCAs }) {
+  campGroups = [], campActiveGroup, onCampActiveGroupChange, highlightCAs, isCampFieldExisting, isStrategyFactorField }) {
   // 每张图各自独立的设置。旧版存在模块级 Map 里，加一个开关要同步改 6 处，漏一处就是静默失效。
   const [settings, setSettings] = useState(DEFAULTS);
-  const [swapped, setSwapped] = useState(false);
+  // 默认 X 轴=returnMax（收益），Y 轴=选的字段——比"字段在X、收益在Y"更符合看图习惯
+  // （收益天然是被解释的"果"，放 X 轴上横向对比更直观）。true=交换显示。
+  const [swapped, setSwapped] = useState(true);
   const [lightExport, setLightExport] = useState(false);
   const plotRef = useRef(null);
   const set = (k, v) => setSettings(s => ({ ...s, [k]: v }));
@@ -58,6 +60,20 @@ export default function ScatterCard({ rows, xField, yField, colorField, light, o
     setCampRangeMode('range');
     setCampOpen(true);
   };
+  // 区间内/外样本数：拖区间时实时反馈这段边界圈住了多少样本，省得盲选完全靠眼睛看散点疏密。
+  // 只在弹层开着时算（不用每次渲染都跑一遍全量样本），下限/上限为空视为那一侧不设边界。
+  const campIntervalStat = useMemo(() => {
+    if (!campOpen) return null;
+    const vals = rows.map(r => Number(getFeature(r, xField))).filter(Number.isFinite);
+    const lo = campRangeMode === 'lte' ? null : campLo;
+    const hi = campRangeMode === 'gte' ? null : campHi;
+    let inCount = 0;
+    for (const v of vals) {
+      if ((!Number.isFinite(lo) || v >= lo) && (!Number.isFinite(hi) || v <= hi)) inCount++;
+    }
+    return { total: vals.length, inCount, outCount: vals.length - inCount };
+  }, [campOpen, campLo, campHi, campRangeMode, rows, xField]);
+
   const confirmCampCapture = () => {
     const lo = campRangeMode === 'lte' ? null : campLo;
     const hi = campRangeMode === 'gte' ? null : campHi;
@@ -67,8 +83,11 @@ export default function ScatterCard({ rows, xField, yField, colorField, light, o
     }
     if (campRangeMode === 'gte' && !Number.isFinite(lo)) { message.warning('下限没填对'); return; }
     if (campRangeMode === 'lte' && !Number.isFinite(hi)) { message.warning('上限没填对'); return; }
+    const isUpdate = isCampFieldExisting?.(xField, campSide);
     onAddToCampLibrary?.({ field: xField, camp: campSide, lo, hi, group: campActiveGroup });
-    message.success(`已收藏「${xField}」到阵营库${campActiveGroup ? `「${campActiveGroup}」组` : ''}（${campSide === 'evil' ? '邪恶' : '勇者'}阵营）`);
+    message.success(isUpdate
+      ? `已更新阵营库里「${xField}」（${campSide === 'evil' ? '邪恶' : '勇者'}阵营）的区间，没有新增重复项`
+      : `已收藏「${xField}」到阵营库${campActiveGroup ? `「${campActiveGroup}」组` : ''}（${campSide === 'evil' ? '邪恶' : '勇者'}阵营）`);
     setCampOpen(false);
   };
 
@@ -77,7 +96,8 @@ export default function ScatterCard({ rows, xField, yField, colorField, light, o
       <FieldNameWithDesc field={xf} />
       <span style={{ opacity: .45 }}>vs</span>
       <FieldNameWithDesc field={yf} />
-      <Typography.Text type="secondary" style={{ fontSize: 12, fontWeight: 400 }}>{fig.stats.statsText}</Typography.Text></Space>}
+      <Typography.Text type="secondary" style={{ fontSize: 12, fontWeight: 400 }}>{fig.stats.statsText}</Typography.Text>
+      {isStrategyFactorField?.(xField) && <Tag color="orange">当前已经作为因子</Tag>}</Space>}
       extra={<Space>
         <Button size="small" icon={<SwapOutlined />} onClick={() => setSwapped(s => !s)}>交换 X/Y</Button>
         <Button size="small" icon={<PictureOutlined />}
@@ -126,6 +146,12 @@ export default function ScatterCard({ rows, xField, yField, colorField, light, o
                     <InputNumber size="small" value={campHi} onChange={setCampHi} style={{ width: 100 }} placeholder="上限" />
                   )}
                 </Space>
+                {campIntervalStat && (
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    当前区间命中 <strong>{campIntervalStat.inCount}</strong> 条，区间外 <strong>{campIntervalStat.outCount}</strong> 条
+                    （共 {campIntervalStat.total} 条有效样本）
+                  </Typography.Text>
+                )}
                 <Button size="small" type="primary" block onClick={confirmCampCapture}>加入阵营库</Button>
               </Space>
             }>

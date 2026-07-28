@@ -8,6 +8,7 @@ import { getFeature, resolveNativeDecimals } from '../lib/data.js';
 import { themeColors } from '../lib/scatterFigure.js';
 import { useGroupedFieldOptions, renderFieldOption, fieldFilterOption } from './fieldOptions.jsx';
 import { getLabel } from '../lib/labels.js';
+import { dayOf } from '../lib/dataSlices.js';
 
 // 快照数据速查：输入 CA 直接看这条样本的原始 JSON。
 // 用途——分析里看到某个字段值奇怪时，回原始数据核对是"算错了"还是"数据本来就这样"。
@@ -52,9 +53,9 @@ export default function SnapshotInspector({ rows, labels = {}, onLabel, light })
     return fieldRows;
   }, [fieldRows, coverFilter]);
 
-  const options = useMemo(() => rows.map(r => ({
+  const options = useMemo(() => rows.map((r, i) => ({
     value: r.tokenAddress,
-    label: `${r.symbol || '(无symbol)'} · ${r.tokenAddress}`,
+    label: `${i + 1}. ${r.symbol || '(无symbol)'} · ${r.tokenAddress}`,
     row: r,
   })).filter(o => o.value), [rows]);
 
@@ -246,6 +247,9 @@ export default function SnapshotInspector({ rows, labels = {}, onLabel, light })
               { key: 'n', label: '策略', children: row.strategyName || '-' },
               { key: 'm', label: '初始市值', children: Number(row.initialMcap).toFixed(0) },
               { key: 'x', label: '最高市值', children: Number(row.maxMcap).toFixed(0) },
+              { key: 'd', label: '日期（买入时刻，本地时区）',
+                children: dayOf(row.buyTimestamp)
+                  ? new Date(Number(row.buyTimestamp) * 1000).toLocaleString() : '-' },
               { key: 'c', label: 'CA', span: 2,
                 children: <a href={logearnUrl(row.tokenAddress)} target="_blank" rel="noopener noreferrer">
                   <code style={{ fontSize: 11 }}>{row.tokenAddress}</code></a> },

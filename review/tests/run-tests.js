@@ -42,6 +42,17 @@ import { run as runDataArchive } from './data-archive.test.js';
 import { run as runStrategySpec } from './strategy-spec.test.js';
 import { run as runDataSlices } from './data-slices.test.js';
 import { run as runTableHiddenFields } from './table-hidden-fields.test.js';
+import { run as runDataHelpers } from './data-helpers.test.js';
+import { run as runDataFolders } from './data-folders.test.js';
+import { run as runFactorPoolStore } from './factor-pool-store.test.js';
+import { run as runOnlineExport } from './online-export.test.js';
+import { run as runFactorScanExport } from './factor-scan-export.test.js';
+import { run as runRhoOptimize } from './rho-optimize.test.js';
+import { run as runTierGainOptimize } from './tier-gain-optimize.test.js';
+import { run as runBucketRhoOptimize } from './bucket-rho-optimize.test.js';
+import { run as runBacktestReport } from './backtest-report-export.test.js';
+import { run as runFactorRecommend } from './factor-recommend.test.js';
+import { run as runFactorRecommendWorker } from './factor-recommend-worker.test.js';
 
 // 旧测试全部写成 sandbox.foo(...)，这里把四个模块的导出合并成同名对象，
 // 这样 1400 行测试正文一个字都不用改。
@@ -61,7 +72,10 @@ function ctxEval(name) {
 let passed = 0, failed = 0;
 function test(name, fn) {
   try {
-    fn();
+    const result = fn();
+    if (result && typeof result.then === 'function') {
+      throw new Error('测试体是 async/返回 Promise，必须用 testAsync 注册（否则断言不会被等待，会被误判为通过）');
+    }
     passed++;
     console.log(`✓ ${name}`);
   } catch (e) {
@@ -1502,6 +1516,25 @@ test('computeCorrelations: 合并行扫描后仍应对每个目标（含 log 目
   assert.ok(Math.abs(logRm.r - 1) < 1e-9);
 });
 
+// 回归：p 必须对应加★的主指标 Spearman ρ，不能是线性 r 的 p（曾经的真实 bug——界面上 ρ 是
+// 主排序列，p 若还按 r 算，会出现"ρ 很强却显示不显著"这种跟星标指标脱节的情况）。
+// 用 y=x^5（单调但强非线性）制造 r 明显弱于 rho=1 的场景来暴露这个差异。
+test('computeCorrelations: p 应对应 Spearman ρ 而不是线性 r（星标主指标口径一致）', () => {
+  const rows = [];
+  for (let x = 1; x <= 30; x++) rows.push({ returnMax: Math.pow(x, 5), features: { x }, categorical: {} });
+  const list = sandbox.computeCorrelations(rows);
+  const rm = list.find(c => c.target === 'returnMax' && c.feature === 'x');
+  assert.ok(rm, '应有 x 的相关性结果');
+  assert.ok(Math.abs(rm.rho - 1) < 1e-9, `单调关系 rho 应为 1，实际 ${rm.rho}`);
+  assert.ok(rm.r < 0.95, `r 应明显弱于 rho（强非线性），实际 r=${rm.r}`);
+  const expectedFromRho = sandbox.pearsonPValue(rm.rho, rm.n);
+  const expectedFromR = sandbox.pearsonPValue(rm.r, rm.n);
+  assert.ok(Math.abs(rm.p - expectedFromRho) < 1e-9, `p 应按 rho 算，实际 p=${rm.p} 期望=${expectedFromRho}`);
+  assert.ok(Math.abs(rm.p - expectedFromR) > 1e-9, 'p 不应等于按 r 算出来的值（否则就是回归到旧 bug）');
+  // 旧算法（按 r 算 p）没有被删掉，只是改挂在 'pr' 字段下，供需要参考 r 显著性的场景使用
+  assert.ok(Math.abs(rm.pr - expectedFromR) < 1e-9, `pr 应保留按 r 算的 p，实际 pr=${rm.pr}`);
+});
+
 // ---------- #9 锁定切分（mulberry32 / splitTrainTest） ----------
 test('mulberry32: 同一个种子应产生完全相同的随机序列', () => {
   const seq1 = [], seq2 = [];
@@ -1603,10 +1636,28 @@ runDataArchive(test);
 runStrategySpec(test);
 runDataSlices(test);
 runTableHiddenFields(test);
+runDataHelpers(test);
+runDataFolders(test);
+runFactorPoolStore(test);
+runOnlineExport(test);
+runFactorScanExport(test);
+runRhoOptimize(test);
+runTierGainOptimize(test);
+runBucketRhoOptimize(test);
+runBacktestReport(test);
+runFactorRecommend(test);
+// 2026-07-28 修复：这里必须 await + 用 testAsync（跟上面几百个 buildRows 测试同一个模式）——
+// factor-recommend-worker.test.js 的 run() 内部 test(name, async fn) 是异步的，之前用同步
+// test() 调用只会走到第一个 await 就同步返回，断言失败会变成脚本已经打印完总数之后才触发的
+// "未处理 promise rejection"，完全不计入通过/失败统计。这正是当时没测出 evaluateCandidatesWithNodeWorkers
+// 那个参数错位 bug 的原因——不是测试没写对，是测试压根没被真正跑完就已经被记成"通过"。
+await runFactorRecommendWorker(testAsync);
 
 main().then(async () => {
-  // factorlab 的 run 是 async（内部有 OOS 回测等异步计算），必须 await 完才能打总结
-  await runFactorLab(test);
+  // factorlab 的 run 是 async（内部有 OOS 回测等异步计算），必须 await 完才能打总结；
+  // 内部混了同步/异步用例，跟 summary.test.js/parity.test.js 一样传两个函数——
+  // 同步用例走 test，异步用例走 testAsync（之前误传成 test，async 用例的断言从未被等待过）
+  await runFactorLab(test, testAsync);
   console.log(`\n共 ${passed + failed} 个测试，通过 ${passed} 个，失败 ${failed} 个。`);
   process.exit(failed ? 1 : 0);
 });

@@ -10,7 +10,20 @@ import { isHoldingField, isDevField, isStatField, isChipField, isHolderField, is
 const RE_GMGN_PRICE = /^gmgn\.price\./;
 const RE_GMGN_ANY = /^gmgn\./;
 
+// 人工标记为"没用"的字段：跟 isNonAnalyticField（data.js，彻底剔出分析候选池）不是一回事——
+// 这些字段仍会照常参与分析计算，只是浏览时不想再在 dev/stat/chip 等主题组里反复看到它们，
+// 单独归进"无用分组"眼不见心不烦。判定放在所有分组判定之前，优先级最高。
+const USELESS_FIELDS = new Set([
+  'gmgn.stat.bot_degen_count',
+  'gmgn.stat.creator_token_balance',
+  'chip_analysis.price_to_peak_ratio',
+  'chip_analysis.price_concentration_hhi',
+  'chip_analysis.above_below_ratio',
+  'gmgn.dev.dexscr_boost_fee',
+]);
+
 export const GROUP_LABELS = {
+  useless: '无用分组（人工标记，不用重点看）',
   holding: '持仓指标（各类钱包持仓占比）',
   assembled: '比率/差值衍生 + 自定义字段',
   signal: '信号字段（从六类信号列表提取）',
@@ -23,16 +36,18 @@ export const GROUP_LABELS = {
   gmgnOther: '其他 gmgn 字段（未列入 dev/stat 白名单）',
   ungrouped: '未归入主题分组的字段',
 };
-export const GROUP_ORDER = ['holding', 'assembled', 'signal', 'volume', 'dev', 'stat',
+export const GROUP_ORDER = ['useless', 'holding', 'assembled', 'signal', 'volume', 'dev', 'stat',
   'chip', 'holder', 'price', 'gmgnOther', 'ungrouped'];
 
 export function computeFieldGroups(fields) {
   const g = Object.fromEntries(GROUP_ORDER.map(k => [k, []]));
   for (const f of fields) {
     if (isNonAnalyticField(f)) continue;
-    // 判定顺序有意义：持仓指标最先（用户最常用的核心筛选字段），
+    // 判定顺序有意义：无用分组最先（人工指定，优先级压过其他主题组），
+    // 然后是持仓指标（用户最常用的核心筛选字段），
     // 未命中任何主题谓词的原始白名单字段落到 ungrouped，不能静默丢弃。
-    if (isHoldingField(f)) g.holding.push(f);
+    if (USELESS_FIELDS.has(f)) g.useless.push(f);
+    else if (isHoldingField(f)) g.holding.push(f);
     else if (isDevField(f)) g.dev.push(f);
     else if (isStatField(f)) g.stat.push(f);
     else if (isChipField(f)) g.chip.push(f);

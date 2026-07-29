@@ -36,12 +36,24 @@ export async function scanCandidatesWithWorkers(rows, heroFields, evilFields, op
   }
 
   let taskId = 1, bi = 0, completed = 0;
-  await new Promise((resolve) => {
-    let active = 0;
+  await new Promise((resolve, reject) => {
+    let active = 0, dead = 0, doneBatches = 0, settled = false;
+    // 收尾：所有 worker 都退出了才走到这里。
+    // 若是【全部异常退出】且还有批次没回包，必须 reject —— 上层 runScan 的 catch 会回退主线程串行；
+    // 直接 resolve 会静默返回一份缺了大半字段的候选表，比报错难排查得多。
+    // 判据用「实际回包的批次数」而不是派发游标 bi：bi 在派发那一刻就已经加过了，
+    // 用它判会把"派发出去、worker 当场炸了"误判成"跑完了"。
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (dead >= workers.length && doneBatches < batches.length) {
+        reject(new Error(`扫描 worker 全部异常退出（${dead}/${workers.length}），回退主线程`));
+      } else resolve();
+    };
     function next(worker) {
       if ((signal && signal.aborted) || bi >= batches.length) {
         try { worker.terminate(); } catch (e) {}
-        if (--active <= 0) resolve();
+        if (--active <= 0) finish();
         return;
       }
       const batch = batches[bi++];
@@ -57,11 +69,25 @@ export async function scanCandidatesWithWorkers(rows, heroFields, evilFields, op
           // 某批失败：raw 缺这些字段，assembleCampScan 会把它们当"没扫到"处理，不至于整体崩。
           console.warn('scanWorker error', msg.error);
         }
+        doneBatches++;   // 回包了就算这批有结论（成功/该批报错都算），见 finish() 的判据
         worker.removeEventListener('message', onmsg);
         next(worker);
       };
       worker.addEventListener('message', onmsg);
       worker.postMessage({ type: 'scan', taskId: id, fields: batch.fields, opts: scanOpts, camp: batch.camp });
+    }
+    // worker 级错误（模块加载失败、OOM、postMessage 结构化克隆抛错）不会走 message 回包——
+    // 少了这条监听，onmsg 永不触发 → next() 永不推进 → 这个 Promise 永不 resolve，
+    // UI 表现是「扫描中…」永远转圈，而且上层那个"回退主线程"的 catch 也永远进不去（不是 reject，是 hang）。
+    // 单个 worker 死掉不影响整体：它手上那批字段丢失（assembleCampScan 当"没扫到"处理），
+    // 剩下的批次由其它 worker 继续领——批次队列 bi 是共享的。
+    for (const w of workers) {
+      w.addEventListener('error', (e) => {
+        console.warn('scanWorker 异常退出', (e && (e.message || e)) || '');
+        dead++;
+        try { w.terminate(); } catch (_) {}
+        if (--active <= 0) finish();
+      });
     }
     active = workers.length;
     for (const w of workers) next(w);
@@ -109,18 +135,28 @@ export async function evaluateCandidatesWithWorkers(rows, currentFactors, candid
   let bi = 0;
   let completed = 0;
 
-  await new Promise((resolve) => {
-    let active = 0;
+  await new Promise((resolve, reject) => {
+    let active = 0, dead = 0, doneBatches = 0, settled = false;
+    // 与 scanCandidatesWithWorkers 同一套收尾：全部 worker 异常退出且还有批次没回包 → reject，
+    // 让 runMarginalRho 的 catch 回退主线程逐候选串行；否则返回半份结果，界面上看不出少了谁。
+    // 判据同样用「实际回包的批次数」而不是派发游标 bi（理由见 scanCandidatesWithWorkers）。
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (dead >= workers.length && doneBatches < batches.length) {
+        reject(new Error(`边际ρ worker 全部异常退出（${dead}/${workers.length}），回退主线程`));
+      } else resolve();
+    };
     function next(worker) {
       if (signal && signal.aborted) {
         try { worker.terminate(); } catch (e) {}
-        if (--active <= 0) resolve();
+        if (--active <= 0) finish();
         return;
       }
       if (bi >= batches.length) {
         // no more tasks for this worker
         worker.terminate();
-        if (--active <= 0) resolve();
+        if (--active <= 0) finish();
         return;
       }
       const batch = batches[bi++];
@@ -137,10 +173,12 @@ export async function evaluateCandidatesWithWorkers(rows, currentFactors, candid
           const processed = (msg.results || []).length;
           completed += processed;
           if (typeof onProgress === 'function') onProgress({ completed, total: candidates.length });
+          doneBatches++;
           worker.removeEventListener('message', onmsg);
           next(worker);
         } else if (msg.type === 'error') {
           errors.push(msg.error);
+          doneBatches++;   // 该批有结论（虽然是错的），见 finish() 的判据
           worker.removeEventListener('message', onmsg);
           next(worker);
         }
@@ -155,6 +193,15 @@ export async function evaluateCandidatesWithWorkers(rows, currentFactors, candid
       }
     }
 
+    // worker 级错误监听，理由同 scanCandidatesWithWorkers（少了它 = 永久 hang + worker 泄漏）
+    for (const w of workers) {
+      w.addEventListener('error', (e) => {
+        errors.push(String((e && (e.message || e)) || 'worker error'));
+        dead++;
+        try { w.terminate(); } catch (_) {}
+        if (--active <= 0) finish();
+      });
+    }
     // start workers
     active = workers.length;
     for (const w of workers) next(w);

@@ -1,6 +1,12 @@
 // 1.5段策略 v30
 // 【依赖 kline_and_indicators 与 chip_analysis 与 gmgn，单币深度分析场景，非实时流批量场景】
 //
+// 2026-07-29 修正（不改判定口径，只堵漏）：
+// v30 新增的四道 gmgn 风控闸门原来用 `?? 0` 兜底，而判定是 `< LIMIT` —— 缺失即放行。
+// gmgn 数据约四成缺失（见 CLAUDE.md），等于这四道限制对四成的币根本没生效。
+// 已改成缺失/非数值一律取 999（必然拦截），与本文件其它字段（shit_volume ?? 999 等）的保守口径对齐。
+// 同时把四条 expect 文案改成引用常量——「创建者持仓」原来写死 '<1'，实际 LIMIT 是 0.5。
+//
 // 本版改动（相对 v29）：
 // 新增"前10持有占比"限制：gmgn.stat.top_10_holder_rate（原始0-1小数×100转%）< 30。
 // 新增"创建者持仓"限制：gmgn.stat.creator_hold_rate（原始0-1小数×100转%）< 0.5。
@@ -71,13 +77,31 @@ try {
   const shitOk = shitVolume < 7
 
  
-  const top10HolderRatePct = (gmgnStat.top_10_holder_rate ?? 0) * 100
+  // gmgn 风控四闸门：缺失一律按"最坏值"处理，即必然拦截。
+  //
+  // 【2026-07-29 修正】原来写的是 `(gmgnStat.top_10_holder_rate ?? 0) * 100`，四个字段全用 `?? 0`，
+  // 而判定又都是 `< LIMIT` —— 缺失 → 0 → 必然通过。CLAUDE.md 写明 gmgn 数据约四成缺失，
+  // 也就是说约四成的币这四道风控是静默全部放行的，回测里还看不出来（放行样本混在通过池里）。
+  // 同文件其它字段本来就是保守口径（shit_volume ?? 999、new_volume ?? 999、
+  // avg_price_deviation_pct ?? -999，缺失即拦截），这四个是后加的，漏了对齐。
+  //
+  // 三层兜底缺一不可（每一层都堵一个真实会发生的输入）：
+  //   ① `?? 999` 只挡 undefined/null，挡不住空字符串（`'' ?? 999` 得到的是 `''`）；
+  //   ② `Number('')` 和 `Number(null)` 都等于 **0**，光靠 Number+isFinite 一样会被判成"0% 持仓"放行；
+  //   ③ gmgn 的这几个字段有时是字符串数字（'0.154'），所以又不能直接 typeof 判 number。
+  // 所以先显式判空、再 Number、再 isFinite —— 跟 auc.js 的 collectAucSamples 是同一套口径。
+  const gmgnPct = v => {
+    if (v === undefined || v === null || v === '') return 999
+    const n = Number(v)
+    return Number.isFinite(n) ? n * 100 : 999
+  }
+  const top10HolderRatePct = gmgnPct(gmgnStat.top_10_holder_rate)
   const top10HolderRateOk = top10HolderRatePct < TOP10_HOLDER_RATE_LIMIT
-  const creatorHoldRatePct = (gmgnStat.creator_hold_rate ?? 0) * 100
+  const creatorHoldRatePct = gmgnPct(gmgnStat.creator_hold_rate)
   const creatorHoldRateOk = creatorHoldRatePct < CREATOR_HOLD_RATE_LIMIT
-  const topRatTraderPercentagePct = (gmgnStat.top_rat_trader_percentage ?? 0) * 100
+  const topRatTraderPercentagePct = gmgnPct(gmgnStat.top_rat_trader_percentage)
   const topRatTraderPercentageOk = topRatTraderPercentagePct < TOP_RAT_TRADER_PERCENTAGE_LIMIT
-  const devTeamHoldRatePct = (gmgnStat.dev_team_hold_rate ?? 0) * 100
+  const devTeamHoldRatePct = gmgnPct(gmgnStat.dev_team_hold_rate)
   const devTeamHoldRateOk = devTeamHoldRatePct < DEV_TEAM_HOLD_RATE_LIMIT
 
   // 关注地址集合 + 关注地址持仓占比
@@ -183,10 +207,13 @@ try {
     ['筹码下大于上', chipBelowAboveOk, `below=${belowPercent.toFixed(1)}/above=${abovePercent.toFixed(1)}`, '下>上'],
     ['成本线上', deviationOk, avgPriceDeviationPct, '>0'],
     ['垃圾盘', shitOk, shitVolume, '<7'],
-    ['前10持有占比', top10HolderRateOk, top10HolderRatePct.toFixed(1), '<30'],
-    ['创建者持仓', creatorHoldRateOk, creatorHoldRatePct.toFixed(2), '<1'],
-    ['top_rat_trader占比', topRatTraderPercentageOk, topRatTraderPercentagePct.toFixed(2), '<1'],
-    ['dev团队持仓', devTeamHoldRateOk, devTeamHoldRatePct.toFixed(2), '<1'],
+    // expect 文案直接引用常量，不再手写数字——「创建者持仓」这条原来写死 '<1'，
+    // 而 CREATOR_HOLD_RATE_LIMIT 早已改成 0.5，两者已经飘了一版。
+    // expect 不是注释：review 侧的硬条件表 / 方向推断 / 因子边界导入都读它，写错会得出相反结论。
+    ['前10持有占比', top10HolderRateOk, top10HolderRatePct.toFixed(1), `<${TOP10_HOLDER_RATE_LIMIT}`],
+    ['创建者持仓', creatorHoldRateOk, creatorHoldRatePct.toFixed(2), `<${CREATOR_HOLD_RATE_LIMIT}`],
+    ['top_rat_trader占比', topRatTraderPercentageOk, topRatTraderPercentagePct.toFixed(2), `<${TOP_RAT_TRADER_PERCENTAGE_LIMIT}`],
+    ['dev团队持仓', devTeamHoldRateOk, devTeamHoldRatePct.toFixed(2), `<${DEV_TEAM_HOLD_RATE_LIMIT}`],
     ['新钱包', newOk, `${newVolumeAdj.toFixed(1)}(原${newVolumeRaw}-关注${followedHoldPercent.toFixed(1)})`, '<70'],
     ['单地址持仓', holdOk, maxHold.toFixed(1), '<10'],
     ['单地址转账', transferOk, maxTransferIn.toFixed(1), '<10'],

@@ -37,6 +37,31 @@ export function run(test) {
     const r = aucForField(rows, 'a', { bootstrapB: 100 });
     assert.strictEqual(r.direction, 'low');
     assert.ok(r.auc > 0.9, `实际 ${r.auc}`);
+    // ↓ 这三条是 2026-07-29 的回归防线（bug：rankAuc 只认 'lower'，auc.js 传的是 'low'）。
+    // 当时点估计按方向翻转了、bootstrap CI 没翻转，两者永远差一次关于 0.5 的镜像。
+    // 原来这条用例只断言 direction/auc，一个字没碰 ci，所以整整一版都没被发现。
+    assert.ok(r.ci.lo > 0.5, `low 方向的 CI 应整体在 0.5 以上，实际 [${r.ci.lo}, ${r.ci.hi}]`);
+    assert.ok(r.auc >= r.ci.lo - 1e-9 && r.auc <= r.ci.hi + 1e-9,
+      `点估计 ${r.auc} 必须落在自己的 CI [${r.ci.lo}, ${r.ci.hi}] 内`);
+  });
+
+  test('aucForField: 弱 low 方向信号的点估计也必须落在自己的置信区间内', () => {
+    // 上面那条是"完美可分"（CI 会被挤到 [1,1] 附近，镜像后是 [0,0]，差异极端好认）。
+    // 这条造一个贴近真实候选强度的弱信号（小值区胜率高、但两边都有输赢），
+    // 镜像 bug 在这个强度下表现为"CI 落在 0.5 下方、点估计在区间外"，是真实数据里的典型形态。
+    let s = 7;
+    const rnd = () => (s = (s * 1103515245 + 12345) % 2147483648) / 2147483648;
+    const rows = mk(300, () => {
+      const x = rnd() * 100;
+      const winP = x < 30 ? 0.55 : 0.10;   // 值越小越容易赢
+      return { features: { a: x }, returnMax: rnd() < winP ? 8 : 1 };
+    });
+    const r = aucForField(rows, 'a', { bootstrapB: 200 });
+    assert.strictEqual(r.direction, 'low');
+    assert.ok(r.auc > 0.6, `应识别出可观的区分度，实际 ${r.auc}`);
+    assert.ok(r.auc >= r.ci.lo - 1e-9 && r.auc <= r.ci.hi + 1e-9,
+      `点估计 ${r.auc} 必须落在自己的 CI [${r.ci.lo}, ${r.ci.hi}] 内`);
+    assert.ok(r.ci.lo > 0.5, `真实有效的 low 方向字段，CI 下界应在 0.5 以上（镜像 bug 会让它掉到 0.5 以下），实际 ${r.ci.lo}`);
   });
 
   test('aucForField: 点估计必须落在自己的置信区间内', () => {

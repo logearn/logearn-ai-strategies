@@ -1,17 +1,21 @@
 import assert from 'node:assert';
 import { buildCandidateExportTsv, CANDIDATE_EXPORT_COLUMNS } from '../src/lib/factorScanExport.js';
 
-// 造一条勇者候选 + 一条邪恶候选
+// 造一条勇者候选 + 一条邪恶候选。
+// ci 必须写成 **{lo, hi} 对象**——这是生产里的真实形状（bootstrapAucCI 的返回值，
+// 经 assembleCampScan 原样透传）。这个 fixture 原来写成数组 [0.61, 0.67]，而导出代码里判的是
+// Array.isArray(c.ci)，于是"测试里为真、生产里恒假"，把「CI下/CI上」两列恒为 '-' 这个 bug
+// 完整掩盖了一版（2026-07-29 修）。fixture 的形状必须跟生产一致，否则测的是另一个程序。
 function heroCand() {
   return {
-    field: 'buy_sell_count_ratio', n: 500, pos: 120, auc: 0.642, ci: [0.61, 0.67],
+    field: 'buy_sell_count_ratio', n: 500, pos: 120, auc: 0.642, ci: { lo: 0.61, hi: 0.67 },
     direction: 'high', significant: true, significantAdj: true, pAdj: 0.0001,
     interval: { lo: 2, hi: Infinity, n: 180, lift: 1.8, coverage: 0.42 }, missRate: 0.05,
   };
 }
 function evilCand() {
   return {
-    field: 'gmgn.stat.fresh_wallet_rate', n: 480, pos: 60, auc: 0.38, ci: [0.34, 0.42],
+    field: 'gmgn.stat.fresh_wallet_rate', n: 480, pos: 60, auc: 0.38, ci: { lo: 0.34, hi: 0.42 },
     direction: 'low', significant: false, significantAdj: false, pAdj: 0.2,
     interval: null, intervalError: '无推荐区间', missRate: 0.12,
   };
@@ -34,6 +38,31 @@ export function run(test) {
     assert.strictEqual(lines[0], CANDIDATE_EXPORT_COLUMNS.join('\t'));
     assert.ok(lines[1].startsWith('勇者\tbuy_sell_count_ratio\t含义X\t值大更好\t0.642\t'));
     assert.ok(lines[2].startsWith('邪恶\tgmgn.stat.fresh_wallet_rate\t含义X\t值小更好\t0.380\t'));
+  });
+
+  // ↓ 这条是 2026-07-29 补的回归防线：原来只断言表头里有 'CI下'/'CI上' 两个列名，
+  // 从没有一条检查过这两格里到底有没有值——列在、值恒为 '-'，测试照样全绿。
+  test('buildCandidateExportTsv: CI 两列必须真的填上 bootstrap 区间的上下界', () => {
+    const { text } = buildCandidateExportTsv([{ camp: 'hero', list: [heroCand()] }], {});
+    const cells = text.split('\n')[1].split('\t');
+    assert.strictEqual(cells[CANDIDATE_EXPORT_COLUMNS.indexOf('CI下')], '0.61');
+    assert.strictEqual(cells[CANDIDATE_EXPORT_COLUMNS.indexOf('CI上')], '0.67');
+  });
+
+  test('buildCandidateExportTsv: ci 写成 [lo, hi] 数组的老数据也要能导出（向后兼容）', () => {
+    const legacy = { ...heroCand(), ci: [0.55, 0.71] };
+    const { text } = buildCandidateExportTsv([{ camp: 'hero', list: [legacy] }], {});
+    const cells = text.split('\n')[1].split('\t');
+    assert.strictEqual(cells[CANDIDATE_EXPORT_COLUMNS.indexOf('CI下')], '0.55');
+    assert.strictEqual(cells[CANDIDATE_EXPORT_COLUMNS.indexOf('CI上')], '0.71');
+  });
+
+  test('buildCandidateExportTsv: 没有 CI 的候选（样本不足/AUC 无定义）两列落成占位，不抛错', () => {
+    const noCi = { ...heroCand(), ci: null };
+    const { text } = buildCandidateExportTsv([{ camp: 'hero', list: [noCi] }], {});
+    const cells = text.split('\n')[1].split('\t');
+    assert.strictEqual(cells[CANDIDATE_EXPORT_COLUMNS.indexOf('CI下')], '-');
+    assert.strictEqual(cells[CANDIDATE_EXPORT_COLUMNS.indexOf('CI上')], '-');
   });
 
   test('buildCandidateExportTsv: 无区间候选的区间/lift/coverage 应落成占位，不抛错', () => {

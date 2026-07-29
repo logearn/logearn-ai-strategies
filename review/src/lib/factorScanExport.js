@@ -11,6 +11,16 @@ function formatNum(v) {
   return String(Math.round(v * 1e4) / 1e4);
 }
 const fmtInterval = iv => (iv ? `[${fmtBound(iv.lo)}, ${fmtBound(iv.hi)})` : '无');
+// AUC 的 bootstrap 置信区间：bootstrapAucCI 返回的是 **{lo, hi} 对象**（不是数组），
+// 候选一路从 assembleCampScan 原样透传过来。这里原本写的是 Array.isArray(c.ci) ? c.ci[0] : '-'，
+// 对象永远不是数组 → 「CI下/CI上」两列自打有这个导出起就恒为 '-'（2026-07-29 修）。
+// 而这个导出存在的全部理由就是补齐 UI 表格里省掉的 方向/coverage/**CI** 三列。
+// 兼容数组写法：老版本导出/手写 fixture 里有 [lo, hi] 这种形态，不值得为此让导出报错。
+const ciBounds = ci => {
+  if (Array.isArray(ci)) return [ci[0], ci[1]];
+  if (ci && typeof ci === 'object') return [ci.lo, ci.hi];
+  return [undefined, undefined];
+};
 const fmtPct = v => (Number.isFinite(v) ? (v * 100).toFixed(1) + '%' : '-');
 const verdictText = c => (c.significantAdj ? '校正后显著' : c.significant ? '仅未校正显著' : '不显著');
 const directionText = d => (d === 'high' ? '值大更好' : d === 'low' ? '值小更好' : '-');
@@ -31,14 +41,15 @@ function candidateRow(c, camp, { getDesc, getMarginal }) {
   const marginalTest = fmtDelta(m?.deltaTest);
   const marginalTrain = fmtDelta(m?.deltaTrain);
   const iv = c.interval;
+  const [ciLo, ciHi] = ciBounds(c.ci);
   return [
     camp === 'evil' ? '邪恶' : '勇者',
     c.field,
     (getDesc ? getDesc(c.field) : '') || '',
     directionText(c.direction),
     Number.isFinite(c.auc) ? c.auc.toFixed(3) : '-',
-    Array.isArray(c.ci) ? fmtBound(c.ci[0]) : '-',
-    Array.isArray(c.ci) ? fmtBound(c.ci[1]) : '-',
+    fmtBound(ciLo),
+    fmtBound(ciHi),
     verdictText(c),
     Number.isFinite(c.pAdj) ? c.pAdj.toExponential(2) : '-',
     marginalTest,

@@ -74,7 +74,9 @@ const checks = [
   ['年龄(秒)', launchTime > 0 && ageSec >= 60, ageSec, '>= 60'],
   ['年龄(分)', launchTime > 0 && ageMin <= 500, Number.isFinite(ageMin) ? ageMin.toFixed(1) : 'NA', '<= 500'],
   ['市值', effMcap > 0 && effMcap < 120000, effMcap.toFixed(0), '>0 且 < 120000'],
-  ['Top10持仓%', top10Pct > 15 && top10Pct < 30, top10Pct.toFixed(1), '20~30'],
+  // expect 原来写 '20~30'，实际下界是 15（2026-07-29 订正为与代码一致）。
+  // expect 不是注释：review 侧硬条件表/方向推断/因子边界导入都读它。
+  ['Top10持仓%', top10Pct > 15 && top10Pct < 30, top10Pct.toFixed(1), '15~30'],
   
   ['创建者发币数', creatorOpenCount < 80, creatorOpenCount, '< 80'],
   ['推特改名次数', twitterNameChangeCount < 20, twitterNameChangeCount, '< 20'],
@@ -82,7 +84,9 @@ const checks = [
   ['内鬼%', ratPct < 10, ratPct.toFixed(1), '< 10'],
   ['新钱包率%', freshPct > 4, freshPct.toFixed(2), '> 4'],
   ['垃圾钱包%', num(logearn.shit_volume) < 5, num(logearn.shit_volume).toFixed(1), '< 5'],
-  ['捆绑买入率%', bundlerPct < 60, bundlerPct.toFixed(1), '> 60'],
+  // expect 原来写 '> 60'，方向跟判定条件完全相反（2026-07-29 订正）——
+  // 回放面板照着它读会得出跟代码相反的结论。
+  ['捆绑买入率%', bundlerPct < 60, bundlerPct.toFixed(1), '< 60'],
   ['机器人degen率%', botDegenPct > 30, botDegenPct.toFixed(1), '> 30'],
   ['高频钱包%', freqVol > 5, freqVol.toFixed(1), '> 5'],
   ['新钱包%', newVol > 20 && newVol < 65, newVol.toFixed(1), '20~65'],

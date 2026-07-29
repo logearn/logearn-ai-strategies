@@ -58,6 +58,7 @@ import { run as runBacktestReport } from './backtest-report-export.test.js';
 import { run as runFactorRecommend } from './factor-recommend.test.js';
 import { run as runFactorLabFixes } from './factorlab-fixes.test.js';
 import { run as runFactorRecommendWorker } from './factor-recommend-worker.test.js';
+import { run as runWorkerPool } from './worker-pool.test.js';
 
 // 旧测试全部写成 sandbox.foo(...)，这里把四个模块的导出合并成同名对象，
 // 这样 1400 行测试正文一个字都不用改。
@@ -1664,6 +1665,8 @@ runFactorLabFixes(test);
 // "未处理 promise rejection"，完全不计入通过/失败统计。这正是当时没测出 evaluateCandidatesWithNodeWorkers
 // 那个参数错位 bug 的原因——不是测试没写对，是测试压根没被真正跑完就已经被记成"通过"。
 await runFactorRecommendWorker(testAsync);
+// 同上，全是 async 用例，必须 await + testAsync（worker 池的失败路径本来就要等事件循环）
+await runWorkerPool(testAsync);
 
 main().then(async () => {
   // factorlab 的 run 是 async（内部有 OOS 回测等异步计算），必须 await 完才能打总结；

@@ -221,8 +221,21 @@ function downsampleQuantiles(values, maxPoints) {
   return [...new Set(result)];
 }
 
-// ROC 曲线 + AUC：direction='higher' 表示"字段值 >= 阈值"判定为预测阳性（更可能盈利），
-// 'lower' 表示"字段值 <= 阈值"判定为预测阳性。AUC 用梯形法则对曲线下面积做数值积分；
+// 方向词汇归一：本项目里同时存在两套写法——utils 内部（含 js/pro-analytics.js 旧版）用
+// 'higher'/'lower'，而 auc.js 产出、UI 展示、持久化进因子池的是 'high'/'low'。两边都要认。
+//
+// 【2026-07-29 修复的真实 bug】rankAuc 原来只判 `direction === 'lower'`，auc.js 传进来的
+// 'low' 落进 else 按正向算 —— 而 auc.js 的点估计已经翻转成 1-aucHigh 了。结果是
+// 「点估计翻转了、CI 没翻转」，所有"值小更好"的字段（＝整个邪恶阵营）的置信区间被整体镜像到
+// 0.5 以下，proAnalytics 的 aucVerdict 把真正有效的因子标成"反向有效"，文案意思完全相反。
+// 实测：auc=0.7984 而 ci=[0.144, 0.269]，点估计落在自己的 CI 之外。
+//
+// 为什么在这里归一、而不是把 auc.js 改成 'lower'：direction 会随因子池存进 localStorage，
+// 改词汇会让存量数据的方向反转。归一函数只认这两个词，其余一律按 higher（与原行为一致）。
+const isLowerDirection = d => d === 'lower' || d === 'low';
+
+// ROC 曲线 + AUC：direction='higher'/'high' 表示"字段值 >= 阈值"判定为预测阳性（更可能盈利），
+// 'lower'/'low' 表示"字段值 <= 阈值"判定为预测阳性。AUC 用梯形法则对曲线下面积做数值积分；
 // Youden's J（TPR - FPR 最大化）对应的切点作为"综合来看最优"的推荐阈值，只在真实候选阈值里找（不含人工补的端点）。
 function computeROC(values, labels, direction) {
   const n = values.length;
@@ -232,7 +245,7 @@ function computeROC(values, labels, direction) {
   const rocPoints = thresholds.map(th => {
     let tp = 0, fp = 0;
     for (let i = 0; i < n; i++) {
-      const predPos = direction === 'higher' ? values[i] >= th : values[i] <= th;
+      const predPos = isLowerDirection(direction) ? values[i] <= th : values[i] >= th;
       if (predPos) { if (labels[i] === 1) tp++; else fp++; }
     }
     const tpr = positives > 0 ? tp / positives : 0;
@@ -302,8 +315,9 @@ function rankAuc(values, labels, direction) {
   const n = values.length;
   const idx = new Array(n);
   for (let i = 0; i < n; i++) idx[i] = i;
-  // direction='lower'（越小越可能盈利）等价于把值取反后按 'higher' 算
-  const sign = direction === 'lower' ? -1 : 1;
+  // direction='lower'/'low'（越小越可能盈利）等价于把值取反后按 'higher' 算。
+  // 两套词汇都要认，理由见 isLowerDirection 的注释（原来只认 'lower' 是一个真实 bug）。
+  const sign = isLowerDirection(direction) ? -1 : 1;
   idx.sort((a, b) => sign * (values[a] - values[b]));
   const rank = new Array(n);
   let i = 0;

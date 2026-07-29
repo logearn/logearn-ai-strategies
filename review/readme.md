@@ -771,3 +771,31 @@ preview={preview} onCancel={...} onConfirm={confirmPreview} />`）不变。原�
 原生文件选择框"是同一类限制），这次没有在浏览器里实际触发弹窗做像素级核对——改动是纯粹的
 文件搬移（组件体一字未改，只换了导入路径），风险集中在"漏删/漏搬 import"这一类问题上，已经
 用 grep 逐个确认，且 build/lint 层面的 unused-import 不会静默通过。
+
+## 18. 拆"上帝组件"第二步：FactorLab.jsx 抽出 BaselineVsTrainCard（2026-07-29）
+
+### 18.1 改法
+
+延续第17节的节奏，从 `FactorLab.jsx` 里挑第二处改动面小、边界清楚的目标：「基线库 vs 训练集
+(按天) 对比」卡片（原第1412~1474行，约65行 JSX）。这处推导逻辑（`strategyOptions`/
+`baselineVsTrain` 两个 `useMemo`，依赖 `archiveAllRows`/`archiveSliceCats`）留在 `FactorLab.jsx`
+不动，只把纯展示部分搬到新的 `ui/factorLab/BaselineVsTrainCard.jsx`，走跟已拆出去的
+`MissedRowsCard`/`CompareHardGateCard` 一样的模式——子组件只接收算好的数据当 props，不接触
+上层状态。`fmtPct` 这个格式化小函数在 `FactorLab.jsx` 里还有十几处别的用途要留着，新组件里
+按 `MissedRowsCard` 的先例本地拷贝一份同样的小函数，不额外抽公共 util（一行的格式化函数，
+抽出去引入的 import 成本比复制这一行更高）。
+
+顺带清理：`factors.length > 0` 这层判断按已有惯例挪到调用点（`{factors.length > 0 &&
+<BaselineVsTrainCard .../>}`），组件本身不重复判断；`FactorLab.jsx` 顶部 antd 具名导入的
+`Select` 随这块搬走后失去了唯一使用点，一并删除。`FactorLab.jsx` 从 1503 行降到约 1443 行。
+
+### 18.2 验证
+
+`node tests/run-tests.js` 595/595 通过；`npx vite build` 通过。dev server 重新加载时控制台报了
+一次 `[vite] SyntaxError: Identifier 'WeightSuggestionPreview' has already been declared` /
+`Failed to reload /src/ui/StrategyReplay.jsx`——这是第17节那次改动遗留的 HMR 模块图状态过期
+（同一类"长期运行的 dev server 没重启、还留着旧模块图"的已知现象，第13.4节记录过一次同款），
+跟这次改的 `BaselineVsTrainCard` 无关；`npx vite build`（全新进程从头构建）没有任何报错，
+`grep` 确认 `WeightSuggestionPreview` 在源码里只声明了一次（新文件里 `export default function`
+一处 + `StrategyReplay.jsx` 里 `import` 一处），重启 dev server 这条提示会消失。因数据加载依赖
+原生文件选择框（跟前几节同样的环境限制），未在浏览器里对真实数据触发这张卡片做像素级核对。

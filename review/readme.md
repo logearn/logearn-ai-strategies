@@ -735,3 +735,39 @@ excludedTokens.js 一个路子"——即已经意识到在重复，但没有收�
 是既有噪声，跟这次改动无关）。导出/复制类按钮大多要求先通过原生文件选择框加载真实数据才能
 触发（跟前几节记录的限制一样），这次没能在浏览器里逐个点击实测下载/复制成功——改动本身是
 纯函数级别的行为等价替换（每处调用点逐个核对过参数/mimeType 跟原写法一致），风险可控。
+
+## 17. 拆"上帝组件"第一步：StrategyReplay.jsx 抽出 WeightSuggestionPreview（2026-07-29）
+
+### 17.1 背景
+
+`ui/FactorLab.jsx`（1506行）/`ui/DataLoader.jsx`（806行）/`ui/StrategyReplay.jsx`（949行）
+三个文件长期偏"上帝组件"：主文件里混了不该属于它的内联子组件、纯 I/O 逻辑、多件独立职责的
+状态管理。用户要求按已有拆分惯例（`ui/strategyReplay/ScoreReturnPanel.jsx` 等已拆出去的卡片、
+`ui/factorLab/useFactorScan.js` 的 hook 抽取模式）挨个拆，但风险比前两批重构（第13~16节，纯
+删除/纯工具抽取）更高——这次要动的是"从一个大文件里搬出一段有状态、有渲染逻辑的代码"，容易在
+搬运途中改漏 prop、漏 import、或者引入渲染时机差异。所以先挑`StrategyReplay.jsx`里"内嵌了一个
+完整独立组件 `WeightSuggestionPreview`（约120行）"这一项动手——三处目标里改动面最小、边界最
+清楚的一处：组件已经是纯 props 驱动（`preview`/`onCancel`/`onConfirm`），不读任何外层闭包变量，
+机械搬移风险最低，适合验证"这套拆分节奏在这一批文件上是否可行"，改完再决定要不要接着拆
+`FactorLab.jsx`/`DataLoader.jsx`。
+
+### 17.2 改法
+
+新增 `ui/strategyReplay/WeightSuggestionPreview.jsx`，把原 `StrategyReplay.jsx` 第822~949行的
+`WeightSuggestionPreview` 函数原样搬过去（调权建议试算弹窗：改动前后指标对比表 + 单调性ρ判定
+文案 + 样本外闸门校验），逻辑一字未改。`StrategyReplay.jsx` 改为 `import WeightSuggestionPreview
+from './strategyReplay/WeightSuggestionPreview.jsx'`，调用点（`<WeightSuggestionPreview
+preview={preview} onCancel={...} onConfirm={confirmPreview} />`）不变。原文件顶部 antd 具名导入
+里的 `Table`/`Modal`/`Checkbox` 三个——逐一 grep 确认在删除的这段之外全项目内该文件再无其它
+使用点——随组件搬走一并从 `StrategyReplay.jsx` 的 import 列表里删除，避免留下死 import。
+`StrategyReplay.jsx` 从 949 行降到 822 行。
+
+### 17.3 验证
+
+`node tests/run-tests.js` 595/595 通过（纯移动重构，无测试覆盖此组件的渲染逻辑，测试数不变）；
+`npx vite build` 通过；dev server 里重新加载页面，控制台无新增报错、无 `Failed to reload` 之类
+的模块解析问题（原有 antd `Space.direction` 过时警告是既有噪声）。`WeightSuggestionPreview` 弹窗
+本身要先加载真实数据、跑一次回放、点"调权建议"才会弹出（跟前几节记录的"导出/复制类按钮依赖
+原生文件选择框"是同一类限制），这次没有在浏览器里实际触发弹窗做像素级核对——改动是纯粹的
+文件搬移（组件体一字未改，只换了导入路径），风险集中在"漏删/漏搬 import"这一类问题上，已经
+用 grep 逐个确认，且 build/lint 层面的 unused-import 不会静默通过。

@@ -25,6 +25,18 @@ export function unexcludeFactor(list, { camp, field }) {
   return list.filter(x => !(x.camp === camp && x.field === field));
 }
 
+// 一键恢复：清空某个阵营的全部排除记录，不影响另一阵营——排除多了之后逐个点×太慢。
+export function restoreAllExcluded(list, camp) {
+  return list.filter(x => x.camp !== camp);
+}
+
+// 按排除时间【新→旧】排序（最近排除的排最前，方便找到刚手滑排除的字段）。不依赖调用方
+// 传入的数组本身已经是时间序——excludeFactor 目前确实追加到末尾，但排序显式做更可靠，
+// 不用假设"数组存储顺序=时间顺序"这个隐含约定以后不会被别的写入路径打破。
+export function sortExclusionsByRecency(list) {
+  return [...list].sort((a, b) => (b.excludedAt ?? 0) - (a.excludedAt ?? 0));
+}
+
 export function isFactorExcluded(list, camp, field) {
   return list.some(x => x.camp === camp && x.field === field);
 }

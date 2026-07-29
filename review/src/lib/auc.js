@@ -45,10 +45,16 @@ export function aucForField(rows, field, { winThreshold = WIN_THRESHOLD, bootstr
 // 放在逻辑层而不是调用方过滤——算 AUC 的模块本来就知道目标是谁，靠调用方记得排除迟早会漏。
 export const AUC_TARGET_FIELDS = new Set(['returnMax', 'logReturnMax', 'currentMcap', 'maxMcap', 'initialMcap']);
 
-export function scanFieldsAuc(rows, fields, opts = {}) {
-  const scanned = fields.filter(f => !AUC_TARGET_FIELDS.has(f));
-  const results = scanned.map(f => aucForField(rows, f, opts));
-  const usable = results.filter(r => Number.isFinite(r.auc) && r.ci);
+// 判据：aucForField 的结果里，点估计有限且拿到了 bootstrap CI 才算"可用"（能进候选、能算区间）。
+// 单列出来，是为了让"逐字段并行算 AUC"的 worker 用【完全相同】的判据决定要不要顺带算区间，
+// 跟这里 finalizeAucScan 挑 usable 的口径对齐——不然并行路径挑出的 usable 会跟串行不一致。
+export const isUsableAuc = r => Number.isFinite(r.auc) && !!r.ci;
+
+// 把一批 aucForField 结果做多重比较校正 + 排序，得到 { results, usable }。
+// 从 scanFieldsAuc 里抽出来，好让"worker 并行逐字段算 AUC、主线程统一做 BH"这条路径复用同一套
+// BH/排序逻辑——BH 依赖字段总数，必须在【全量 results 汇齐后】在主线程做一次，不能分批各做各的。
+export function finalizeAucScan(results) {
+  const usable = results.filter(isUsableAuc);
   // 用 CI 反推一个近似 p 值做 BH 校正：CI 离 0.5 越远越显著。
   // 这里不假装它是精确 p——命名成 pApprox，避免被当成正式检验结果。
   const pApprox = usable.map(r => {

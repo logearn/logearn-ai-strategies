@@ -1,6 +1,5 @@
 import assert from 'node:assert';
 import { collinearityReport } from '../src/lib/proAnalytics.js';
-import { scanFieldsForPeaks } from '../src/lib/analytics.js';
 
 const mk = (n, fn) => Array.from({ length: n }, (_, i) => fn(i));
 
@@ -31,19 +30,5 @@ export function run(test) {
     const r = collinearityReport(rows, ['a', 'b']);
     assert.ok(r.error && /完整个案/.test(r.error));
     assert.strictEqual(r.n, 0);
-  });
-
-  test('scanFieldsForPeaks: 应找出真实的"甜蜜区间"，噪声字段不显著', () => {
-    let s = 3;
-    const rnd = () => (s = (s * 1103515245 + 12345) % 2147483648) / 2147483648;
-    // g 落在 0.5~0.75 区间时收益高——这是一个真实存在的中段波峰
-    const rows = mk(250, () => { const g = rnd();
-      return { returnMax: (g > 0.5 && g < 0.75) ? (2 + rnd() * 10) : (0.3 + rnd() * 1.8),
-               features: { sweet: g * 100, noise: rnd() * 100 } }; });
-    const r = scanFieldsForPeaks(rows, ['sweet', 'noise'], 'returnMax', 200, 2);
-    const by = Object.fromEntries(r.rows.map(x => [x.field, x]));
-    assert.ok(by.sweet.adjP < 0.05, `真实波峰应显著，实际 adjP=${by.sweet.adjP}`);
-    assert.ok(by.noise.adjP > 0.5, `噪声不应显著，实际 adjP=${by.noise.adjP}`);
-    assert.ok(by.sweet.seg, '应给出波峰所在区间');
   });
 }

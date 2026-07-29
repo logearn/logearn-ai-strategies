@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { aucForField, collectAucSamples, scanFieldsAuc } from '../src/lib/auc.js';
+import { aucForField, collectAucSamples, finalizeAucScan } from '../src/lib/auc.js';
 
 const mk = (n, fn) => Array.from({ length: n }, (_, i) => fn(i));
 
@@ -65,7 +65,12 @@ export function run(test) {
     assert.ok(/仅 5 条/.test(r.reason));
   });
 
-  test('scanFieldsAuc: 纯噪声字段批量扫描后不应有 BH 校正显著的', () => {
+  // 2026-07-29：scanFieldsAuc（批量扫描的便捷包装，只服务已删除的"AUC 批量检测"面板）已删——
+  // 它内部就是"逐字段 aucForField + finalizeAucScan"，这两步仍是候选扫描（assembleCampScan，
+  // factorlab.test.js 覆盖）的核心，下面两条测试直接对着 finalizeAucScan 走，不因为面板删了
+  // 就丢失这层回归覆盖；目标变量排除（AUC_TARGET_FIELDS）在候选扫描入口单独测过
+  // （tests/factorlab.test.js），不用在这里重复。
+  test('finalizeAucScan: 纯噪声字段批量扫描后不应有 BH 校正显著的', () => {
     let s = 99;
     const rnd = () => (s = (s * 1103515245 + 12345) % 2147483648) / 2147483648;
     const rows = mk(150, () => {
@@ -73,24 +78,16 @@ export function run(test) {
       for (let k = 0; k < 12; k++) f['n' + k] = rnd();
       return { features: f, returnMax: rnd() > 0.6 ? 5 : 1 };
     });
-    const { usable } = scanFieldsAuc(rows, Array.from({ length: 12 }, (_, k) => 'n' + k), { bootstrapB: 150 });
+    const fields = Array.from({ length: 12 }, (_, k) => 'n' + k);
+    const { usable } = finalizeAucScan(fields.map(f => aucForField(rows, f, { bootstrapB: 150 })));
     assert.strictEqual(usable.length, 12);
     const sig = usable.filter(r => r.significantAdj);
     assert.strictEqual(sig.length, 0, `纯噪声不该有校正后显著的，实际 ${sig.map(r => r.field)}`);
   });
 
-  test('scanFieldsAuc: 必须排除目标变量，否则会出现 AUC=1 的自我预测', () => {
-    const rows = mk(60, i => ({ features: { a: i }, returnMax: i < 30 ? 1 : 5 }));
-    const { usable, results } = scanFieldsAuc(rows, ['returnMax', 'logReturnMax', 'a'], { bootstrapB: 80 });
-    assert.ok(!usable.some(r => r.field === 'returnMax'), 'returnMax 不应参与');
-    assert.ok(!usable.some(r => r.field === 'logReturnMax'), 'logReturnMax 不应参与');
-    assert.ok(!results.some(r => r.field === 'returnMax'), '连"未参与"列表都不该出现，它根本不是候选');
-    assert.strictEqual(usable.length, 1);
-  });
-
-  test('scanFieldsAuc: 结果应按区分度（|AUC-0.5|）降序', () => {
+  test('finalizeAucScan: 结果应按区分度（|AUC-0.5|）降序', () => {
     const rows = mk(80, i => ({ features: { good: i, noise: (i * 37) % 11 }, returnMax: i < 40 ? 1 : 5 }));
-    const { usable } = scanFieldsAuc(rows, ['noise', 'good'], { bootstrapB: 100 });
+    const { usable } = finalizeAucScan(['noise', 'good'].map(f => aucForField(rows, f, { bootstrapB: 100 })));
     assert.strictEqual(usable[0].field, 'good', '强字段应排前面');
   });
 }

@@ -1,18 +1,17 @@
 import React, { useState } from 'react';
-import { Card, Button, Table, Tag, Tooltip, Typography, Space, Alert } from 'antd';
-import { scanFieldsForPeaks, requiredPermN } from '../lib/analytics.js';
+import { Card, Button, Table, Tag, Typography, Space, Alert } from 'antd';
 import { collinearityReport } from '../lib/proAnalytics.js';
-import { getFieldDesc } from '../lib/dictionary.js';
 import { loadHiddenFields, saveHiddenFields, addHidden, removeHidden, filterHidden } from '../lib/tableHiddenFields.js';
 import HiddenFieldsBar from './HiddenFieldsBar.jsx';
 
-// 字段体检：一次回答两个问题——
-//   1) 哪些字段存在真实的"甜蜜区间"（非单调关系，相关系数看不出来）
-//   2) 哪些字段其实是彼此的复制品（共线性），留着只会稀释多重比较校正
+// 字段体检：哪些字段其实是彼此的复制品（共线性），留着只会稀释多重比较校正。
+// 2026-07-29：原来还有一半"波峰扫描"（scanFieldsForPeaks，找非单调"甜蜜区间"），跟 FactorLab
+// 自己的 findHotInterval 回答同一个问题——后者统计量更严谨（wilson下界×√coverage，直接喂进
+// 打分因子），前者是纯只读发现工具、结果不接回任何后续步骤，删掉了（连同 lib/analytics.js 里
+// 只服务它的 scanFieldsForPeaks/permutationPeakTest/longestAboveRun/requiredPermN 一并删除）。
 export default function FieldHealth({ rows, fields }) {
-  const [peaks, setPeaks] = useState(null);
   const [vif, setVif] = useState(null);
-  const [busy, setBusy] = useState('');
+  const [busy, setBusy] = useState(false);
   const [hidden, setHidden] = useState(() => loadHiddenFields('health'));
   const hide = f => { const n = addHidden(hidden, f); setHidden(n); saveHiddenFields('health', n); };
   const restore = f => { const n = removeHidden(hidden, f); setHidden(n); saveHiddenFields('health', n); };
@@ -22,43 +21,14 @@ export default function FieldHealth({ rows, fields }) {
       title="从字段体检移除该字段（只在本面板隐藏，可在表头「恢复」里加回来）"
       onClick={() => hide(r.field)}>移除</Button>) };
 
-  async function runPeaks() {
-    setBusy('peaks'); await new Promise(r => setTimeout(r, 0));
-    try {
-      // 置换次数必须随字段数放大：m 个字段做 BH 校正需要 p 取到 <0.05/m，
-      // 而置换 p 的下限是 1/(permN+1)。固定 200 次时 43 个字段就已数学上不可能显著。
-      setPeaks(scanFieldsForPeaks(rows, fields, 'returnMax', Math.max(200, requiredPermN(fields.length)), 2));
-    } finally { setBusy(''); }
-  }
   async function runVif() {
-    setBusy('vif'); await new Promise(r => setTimeout(r, 0));
+    setBusy(true); await new Promise(r => setTimeout(r, 0));
     try {
       // returnMax 与 logReturnMax 互为单调变换，VIF 必然偏高，但那是定义决定的不是字段冗余
       const T = new Set(['returnMax', 'logReturnMax']);
       setVif(collinearityReport(rows, fields.filter(f => !T.has(f)).slice(0, 25)));
-    } finally { setBusy(''); }
+    } finally { setBusy(false); }
   }
-
-  const peakCols = [
-    { title: '字段', dataIndex: 'field', width: 220, fixed: 'left', render: v => <code style={{ fontSize: 11 }}>{v}</code> },
-    { title: '含义', width: 220, ellipsis: true,
-      render: (_, r) => <Tooltip title={getFieldDesc(r.field)}><span style={{ opacity: .65 }}>{getFieldDesc(r.field)}</span></Tooltip> },
-    { title: '波峰区间', width: 190, render: (_, r) => Array.isArray(r.seg)
-      ? <code style={{ fontSize: 11 }}>{Number(r.seg[0]).toPrecision(4)} ~ {Number(r.seg[1]).toPrecision(4)}</code> : '-' },
-    { title: <Tooltip title="该区间里连续高于整体胜率的滑窗长度（样本数），越长说明优势越成片而不是零星">连续优势</Tooltip>,
-      dataIndex: 'obs', width: 100, align: 'right', render: v => (Number.isFinite(v) ? `${v} 条` : '-') },
-    { title: <Tooltip title="把标签打散后同样能凑出的长度的 95 分位——观测值要明显超过它才算数">随机基线</Tooltip>,
-      dataIndex: 'perm95', width: 100, align: 'right', render: v => (Number.isFinite(v) ? v.toFixed(1) + ' 条' : '-') },
-    { title: '整体胜率', dataIndex: 'base', width: 90, align: 'right',
-      render: v => (Number.isFinite(v) ? (v * 100).toFixed(1) + '%' : '-') },
-    { title: '校正后 p', dataIndex: 'adjP', width: 100, align: 'right',
-      defaultSortOrder: 'ascend', sorter: (a, b) => (a.adjP ?? 1) - (b.adjP ?? 1),
-      render: v => (Number.isFinite(v) ? v.toFixed(3) : '-') },
-    { title: '判定', width: 130, render: (_, r) => r.adjP < 0.05
-      ? <Tag color="success">校正后显著</Tag>
-      : r.p < 0.05 ? <Tooltip title="未经多重比较校正"><Tag color="warning">仅未校正显著</Tag></Tooltip> : null },
-    removeCol,
-  ];
 
   const vifCols = [
     { title: '字段', dataIndex: 'field', render: v => <code style={{ fontSize: 11 }}>{v}</code> },
@@ -71,26 +41,11 @@ export default function FieldHealth({ rows, fields }) {
   ];
 
   return (
-    <Card size="small" title="字段体检"
+    <Card size="small" title="字段体检（共线性诊断 VIF）"
       extra={<Space>
         <HiddenFieldsBar hidden={hidden} onRestore={restore} onRestoreAll={restoreAll} />
-        <Button type="primary" loading={busy === 'peaks'} onClick={runPeaks} disabled={!!busy || !rows.length}>
-          波峰扫描（{fields.length} 个字段）</Button>
-        <Button loading={busy === 'vif'} onClick={runVif} disabled={!!busy || !rows.length}>共线性诊断（VIF）</Button>
+        <Button type="primary" loading={busy} onClick={runVif} disabled={busy || !rows.length}>共线性诊断（VIF）</Button>
       </Space>}>
-      {peaks && (
-        <>
-          <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
-            找的是"某个区间胜率明显高于整体"这种<b>非单调</b>关系——相关系数对这种形态基本失灵。
-            衡量方式是<b>连续优势长度</b>：滑窗胜率高于整体基准的最长连续段有多少条样本。
-            光看长度会被噪声骗（滑窗自带自相关，纯噪声也能凑出约一个窗口宽的连续段），所以要和打散标签后的随机基线比。
-            本次扫了 {peaks.scanned} 个字段、每个 {peaks.effPermN} 次置换。
-            <br />注：这是<b>发现/显著性</b>工具，回答"有没有甜蜜区间"；打分因子实际用的"高倍落点区间"由「回测·因子」和「阵营库·高倍落点校验」统一用 findHotInterval 给出，两者口径不同、各司其职，不要混用。
-          </Typography.Paragraph>
-          <Table size="small" rowKey="field" columns={peakCols} dataSource={filterHidden(peaks.rows, hidden)}
-            scroll={{ x: 1150, y: 340 }} pagination={{ pageSize: 30, size: 'small' }} />
-        </>
-      )}
       {vif && (vif.error
         ? <Alert style={{ marginTop: 12 }} type="warning" showIcon message={vif.error} />
         : <>

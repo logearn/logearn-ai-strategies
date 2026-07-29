@@ -11,9 +11,10 @@
 //     这里若用 >= 会在阈值恰好落在样本值上时与 AUC 面板对不上。
 //   - 缺失值（字段值为 null/undefined/空串/非数值）一律记 0 分，不做均值填充——
 //     生成的策略代码必须复刻同一语义（见 generateStrategyCode 里的 V()）。
-import { percentile, wilsonInterval, spearman, splitTrainTest, median, WIN_THRESHOLD, benjaminiHochbergAdjust, mulberry32 } from './utils.js';
-import { collectAucSamples, scanFieldsAuc } from './auc.js';
+import { percentile, wilsonInterval, spearman, splitTrainTest, median, WIN_THRESHOLD, benjaminiHochbergAdjust, mulberry32, twoProportionTestP } from './utils.js';
+import { collectAucSamples, aucForField, finalizeAucScan, isUsableAuc, AUC_TARGET_FIELDS } from './auc.js';
 import { getFeature, isAssembledField, isKlineVolumeField, PERCENT_FRACTION_FIELDS } from './data.js';
+import { fieldMcapRho } from './fieldAudit.js';
 
 export const FACTOR_WIN_THRESHOLDS = [2, 3, 5, 10];
 export const DEFAULT_FACTOR_WIN_THRESHOLD = 5;
@@ -152,8 +153,15 @@ export function findColdInterval(rows, field, opts = {}) {
 export function trapScore(x, lo0, lo1, hi1, hi0) {
   const v = Number(x);
   if (!Number.isFinite(v)) return 0;
+  // 上界【先】判、且取右开（v >= hi0 → 0）：挖区间/算 lift 的口径是 [lo, hi)（见 scanIntervalCore
+  // 的 inWin），shape='interval' 退化成矩形时 hi1===hi0===hi，若还按 v<=hi1 判满分，落在右端点上的
+  // 样本就会"统计上不算命中、打分却给满分"。连续字段几乎看不出来，但离散字段（布尔 0/1、计数、
+  // 被截断的比例）大量样本恰好压在端点上，差异是成片的。
+  // 梯形形状不受影响：lo0<lo1<hi1<hi0 时 v>=hi0 本来就该是 0。
+  // 下界仍留在核心判定【之后】：矩形时 lo0===lo1===lo，左端点属于区间内（左闭），不能提前判 0。
+  if (v >= hi0) return 0;
   if (v >= lo1 && v <= hi1) return 1;
-  if (v <= lo0 || v >= hi0) return 0;
+  if (v <= lo0) return 0;
   if (v < lo1) {
     const w = lo1 - lo0;
     return Number.isFinite(w) && w > 0 ? (v - lo0) / w : 0;
@@ -210,30 +218,48 @@ export function missingRate(rows, field) {
 }
 
 // ---------- 因子发现（全字段扫描） ----------
-// AUC 部分直接复用 scanFieldsAuc（含 BH 校正、目标变量排除），再逐字段附加区间。
 // camp='hero'（勇者阵营，默认）挖高倍盘集中区，用来加分；camp='evil'（邪恶阵营）挖输家
 // 集中区，用来减分。两个阵营各自独立扫描（同一批字段可以分别喂两次，各自选出自己的候选池），
 // 每个候选对象都带上 camp 标记，供 buildFactors/打分阶段区分正负号。
-// 异步分块：区间挖掘本身很快（前缀和），但 100+ 字段 × bootstrap 的 AUC 已经先卡一下了，
-// 区间这步每 20 个字段让一次事件循环，避免叠加成长冻结。
-export async function scanFactorCandidates(rows, fields, opts = {}) {
+// 拆成三层复用：computeFieldRaw（逐字段纯计算，可并行）→ assembleCampScan（全量汇齐后统一做 BH）
+// → scanFactorCandidates（主线程串行版，把两者串起来）。worker 并行路径（ui/factorLab/scanWorker.js
+// + workerPool.js）跳过中间的串行循环，直接 computeFieldRaw 分批并行、再 assembleCampScan，
+// 结果与串行版逐字段一致（factorlab.test.js 的既有用例守着这份等价性）。
+// 单字段原始扫描（一个阵营）：算 AUC（含 bootstrap CI）+ 仅对"可用"字段顺带挖区间/算缺失率。
+// 纯计算、无 BH、无跨字段依赖——所以能安全丢进 worker 逐字段并行跑（见 ui/factorLab/scanWorker.js）。
+// 不可用字段（样本太少/全同类）不挖区间，跟旧版 scanFactorCandidates 里"只对 usable 循环挖区间"一致。
+// AUC_TARGET_FIELDS（returnMax 及其变换）由调用方在派发前过滤掉，这里不再重复判断。
+export function computeFieldRaw(rows, field, opts = {}) {
   const { winThreshold = WIN_THRESHOLD, bootstrapB = 200, minCoverage = 0.3, camp = 'hero' } = opts;
-  const { results, usable } = scanFieldsAuc(rows, fields, { winThreshold, bootstrapB });
+  const auc = aucForField(rows, field, { winThreshold, bootstrapB });
+  if (!isUsableAuc(auc)) return { field, auc, interval: null, missRate: undefined };
   const findInterval = camp === 'evil' ? findColdInterval : findHotInterval;
-  const out = [];
-  for (let i = 0; i < usable.length; i++) {
-    if (i % 20 === 19) await new Promise(r => setTimeout(r, 0));
-    const a = usable[i];
-    const interval = findInterval(rows, a.field, { winThreshold, minCoverage });
-    out.push({
+  const interval = findInterval(rows, field, { winThreshold, minCoverage });
+  // 与进场市值的秩相关跟着扫描一起算（O(n log n)，相对 AUC bootstrap + 区间置换检验可以忽略），
+  // 这样候选表一出来就带着"是不是进场市值的影子"这个判据，不用再点一次按钮。
+  return { field, auc, interval, missRate: missingRate(rows, field),
+           mcapRho: fieldMcapRho(rows, field) };
+}
+
+// 把一批 computeFieldRaw 的结果（某个阵营的全部非目标字段）组装成 { candidates, skipped }——
+// AUC 的 BH 校正/排序（finalizeAucScan）和区间的 BH 校正都在这里、在【全量汇齐后】做一次，
+// 保证不管上游是主线程串行还是 worker 分批并行算出来的 raw，最终口径完全一致。
+export function assembleCampScan(rawList, camp = 'hero') {
+  const { results, usable } = finalizeAucScan(rawList.map(r => r.auc));
+  const rawByField = new Map(rawList.map(r => [r.field, r]));
+  const out = usable.map(a => {
+    const raw = rawByField.get(a.field);
+    const interval = raw ? raw.interval : null;
+    return {
       field: a.field, n: a.n, pos: a.pos, auc: a.auc, ci: a.ci, direction: a.direction,
       significant: a.significant, significantAdj: a.significantAdj, pAdj: a.pAdj,
-      interval: interval.error ? null : interval,
-      intervalError: interval.error || null,
-      missRate: missingRate(rows, a.field),
+      interval: interval && !interval.error ? interval : null,
+      intervalError: (interval && interval.error) || null,
+      missRate: raw ? raw.missRate : undefined,
+      mcapRho: raw ? raw.mcapRho : undefined,
       camp,
-    });
-  }
+    };
+  });
   // 区间显著性：pPermutation（scanIntervalCore 内部置换检验算出的，已经为"从很多候选窗口里
   // 挑最优"这件事做了校正，不是简单的两比例检验）+ BH 多重比较校正——跟上面 AUC 的
   // significant/significantAdj 同一套纪律，只是检验对象换成区间（区间是判据实际吃的
@@ -251,6 +277,17 @@ export async function scanFactorCandidates(rows, fields, opts = {}) {
   return { candidates: out, skipped };
 }
 
+export async function scanFactorCandidates(rows, fields, opts = {}) {
+  const { winThreshold = WIN_THRESHOLD, bootstrapB = 200, minCoverage = 0.3, camp = 'hero' } = opts;
+  const scanned = fields.filter(f => !AUC_TARGET_FIELDS.has(f));
+  const rawList = [];
+  for (let i = 0; i < scanned.length; i++) {
+    if (i % 20 === 19) await new Promise(r => setTimeout(r, 0)); // 让出一帧，避免长任务卡死主线程
+    rawList.push(computeFieldRaw(rows, scanned[i], { winThreshold, bootstrapB, minCoverage, camp }));
+  }
+  return assembleCampScan(rawList, camp);
+}
+
 // 从扫描结果构建可编辑的因子集（区间→打分形状，含权重与阵营）。fieldSpecs 里推导失败的进 skipped。
 // candidates 可以是勇者阵营和邪恶阵营两次扫描结果的合并数组——每个候选自带 camp，
 // 这里按各自的 camp 选用对应的区间/梯形推导（hero 走高倍盘密集核，evil 走输家密集核）。
@@ -264,13 +301,15 @@ export async function scanFactorCandidates(rows, fields, opts = {}) {
 //
 // OOS 验证也走这条路（用训练段 rows），保证"自动推导"在两处口径完全一致。
 //
-// shape 两种打分形状：
-//   'trap'（默认）——梯形：目标类密集核满分，向硬界线性衰减，区间边缘拿部分分；
-//   'interval'——区间命中：值落在挖出的可信区间就拿满该因子权重，区间外 0 分。
-//     实现上就是把梯形退化成矩形（lo0=lo1=lo, hi1=hi0=hi），trapScore 及下游
-//     回测/OOS/代码生成不需要任何特殊分支。
+// 打分形状只有梯形（trap）：目标类密集核满分，向硬界线性衰减，区间边缘拿部分分。
+//
+// 2026-07-29 删除了 shape:'interval'（区间命中＝把梯形退化成矩形 lo0=lo1=lo, hi1=hi0=hi）。
+// 梯形是它的超集：区间边界本来就是从 O(边界数²) 个窗口里搜出来的最优窗口，边缘那段线性衰减
+// 正是对"边界不可能刚好卡准"的软化；退回硬矩形只会让边界附近的样本被非黑即白地判定。
+// 注意 **矩形因子本身仍然合法**——从策略导入时 checks 文案只编码了核心区 [lo1,hi1]，就是按
+// lo0=lo1/hi1=hi0 近似导入的，trapScore 对矩形的处理（见其右端点注释）不能删。
+// 删的只是"扫描完按矩形建因子"这个选项，opts.shape 参数保留但当前唯一取值是 'trap'。
 export function buildFactors(rows, candidates, fieldSpecs, winThreshold = WIN_THRESHOLD, opts = {}) {
-  const { shape = 'trap' } = opts;
   const specs = fieldSpecs.map(s => (typeof s === 'string' ? { field: s, camp: 'hero' } : s));
   const campKey = c => (c.camp === 'evil' ? 'evil' : 'hero') + ':' + c.field;
   const byKey = new Map(candidates.map(c => [campKey(c), c]));
@@ -281,15 +320,10 @@ export function buildFactors(rows, candidates, fieldSpecs, winThreshold = WIN_TH
     const c = byKey.get(camp + ':' + field);
     if (!c) { skipped.push({ field, reason: `不在${camp === 'evil' ? '邪恶' : '勇者'}阵营的扫描结果中` }); continue; }
     if (!c.interval) { skipped.push({ field, reason: c.intervalError || '无推荐区间' }); continue; }
-    let bounds;
-    if (shape === 'interval') {
-      bounds = { lo0: c.interval.lo, lo1: c.interval.lo, hi1: c.interval.hi, hi0: c.interval.hi };
-    } else {
-      bounds = camp === 'evil'
-        ? deriveColdTrapezoid(rows, field, c.interval, winThreshold)
-        : deriveTrapezoid(rows, field, c.interval, winThreshold);
-      if (bounds.error) { skipped.push({ field, reason: bounds.error }); continue; }
-    }
+    const bounds = camp === 'evil'
+      ? deriveColdTrapezoid(rows, field, c.interval, winThreshold)
+      : deriveTrapezoid(rows, field, c.interval, winThreshold);
+    if (bounds.error) { skipped.push({ field, reason: bounds.error }); continue; }
     factors.push({ field, camp, auc: c.auc, direction: c.direction, interval: c.interval,
                    missRate: c.missRate, weight: 0, ...bounds });
   }
@@ -301,9 +335,8 @@ export function buildFactors(rows, candidates, fieldSpecs, winThreshold = WIN_TH
 // 字段（比如中段区间命中率最高、两头都低）在AUC上会显得没区分度，但区间打分可能很强，两者
 // 会给出相反结论，改用interval.score才能跟下游打分（也是区间/梯形，不假设方向）口径一致。
 // 全部为 0（理论上不会进到这）时退化为均分。
-export function autoWeights(factors) {
-  if (!factors.length) return factors;
-  const raw = factors.map(f => Number(f.interval?.score) || 0);
+// 把一组非负 raw 归一成"总和恰为 100、保留 1 位小数"的权重（最大余数法修尾差）。
+function normalizeTo100(factors, raw) {
   const sum = raw.reduce((a, b) => a + b, 0);
   const shares = sum > 0 ? raw.map(x => x / sum * 100) : raw.map(() => 100 / factors.length);
   const floored = shares.map(x => Math.floor(x * 10) / 10);
@@ -312,6 +345,37 @@ export function autoWeights(factors) {
   const weights = floored.slice();
   for (let k = 0; remain > 0; k = (k + 1) % order.length, remain--) weights[order[k][1]] += 0.1;
   return factors.map((f, i) => ({ ...f, weight: Math.round(weights[i] * 10) / 10 }));
+}
+
+export function autoWeights(factors) {
+  if (!factors.length) return factors;
+  const scored = factors.map(f => Number(f.interval?.score) || 0);
+  const hasScore = scored.map(s => s > 0);
+
+  // 一个因子都没有区间分数：典型是"从策略代码导入的因子池"（importFromStrategy 造出来的因子
+  // interval=null）或全手工建的池。这时没有任何自动配权的依据——有现成权重就按现成权重的相对
+  // 比例归一（导入策略里的权重是真实信息，抹成均分等于把用户的策略改了），全都没权重才退化成均分
+  // （保持旧行为：新建/占位因子）。
+  if (!hasScore.some(Boolean)) {
+    const ws = factors.map(f => Math.max(0, Number(f.weight) || 0));
+    return normalizeTo100(factors, ws.some(w => w > 0) ? ws : factors.map(() => 1));
+  }
+
+  // 混合池（一部分有区间分数、一部分没有——比如导入池之后又扫出新因子，或跨字段范围保留下来的
+  // 老因子）：无分数的那批按【它们现有权重的相对比例】参与分配，规模对齐到有分数那批的平均分。
+  // 不能直接拿 weight 当 raw：权重是 0~100 量纲、interval.score 通常在 0.5~2，混在一起归一会让
+  // 无分数的因子吃掉几乎全部权重。也不能像原来那样记 0——那会把导入/手工因子的权重静默清零
+  // （真实事故：导入策略后随便点一次扫描或删一个因子，导入的因子就全变 0 权重了）。
+  const scoreVals = scored.filter((s, i) => hasScore[i]);
+  const avgScore = scoreVals.reduce((a, b) => a + b, 0) / scoreVals.length;
+  const noScoreW = factors.filter((f, i) => !hasScore[i]).map(f => Math.max(0, Number(f.weight) || 0));
+  const avgNoScoreW = noScoreW.length ? noScoreW.reduce((a, b) => a + b, 0) / noScoreW.length : 0;
+  const raw = factors.map((f, i) => {
+    if (hasScore[i]) return scored[i];
+    const w = Math.max(0, Number(f.weight) || 0);
+    return avgNoScoreW > 0 ? (w / avgNoScoreW) * avgScore : avgScore;
+  });
+  return normalizeTo100(factors, raw);
 }
 
 // ---------- 已选因子的两两相关性 ----------
@@ -355,91 +419,26 @@ function scorePoolRho(rows, factorSet, missingPolicy) {
   return pairs.length >= 8 ? spearman(pairs) : NaN;
 }
 
-// 分层增益：以"筛垃圾"为第一目标的策略，北极星从"全程 ρ 单调"降为"分段台阶"
-// （见项目北极星笔记的例外条款）。最早版本只拿 cutoff 二分的台阶差(above.length×Δ命中率)当
-// 目标函数——这是纯"计数阈值"函数，不是像 ρ 那样看全排序的平滑目标，坐标上升会找到"角点解"：
-// 哪个因子单独对这一刀最敏感就把权重全堆过去、其它因子推到 0（实测复现：2 因子池退化成
-// 100/0）。这不是"配权"，是"挑单一分界因子"。
-// 用户订正："应该先排序，然后再分层，只是不需要要求每个粒度单调"——即分段台阶该看的是
-// "先按 score 排序、切成粗粒度的若干档，档位越高命中率越高这个粗趋势"，不要求 decile 级细粒度
-// 处处爬升。于是改成两部分加权（"秩相关 + cutoff 主台阶"）：
-//   ① 主台阶 tierGap（权重 0.7）：仍是 cutoff 天然切出的"过线/未过线"两层命中率差，∈[-1,1]——
-//      这是笔记里的核心判据，权重给高，保证 cutoff 处的台阶差仍是主导信号；
-//   ② 粗粒度秩相关 tierRho（权重 0.3）：仿 computeScoreBuckets 的做法——按 score 排序切
-//      K=3~5 档（样本不够多就少切，同分样本绝不跨档），算 spearman(档序号, 档命中率)，∈[-1,1]。
-//      它是"多点约束"：因子必须在好几个档位上都排得对才能拿到高分，单一因子很难同时喂饱
-//      cutoff 这一刀 + 好几个档位的排序，逼着坐标上升保留多个因子而不是清零到只剩一个。
-// 触发数(above.length)默认仍作规模因子——同样的台阶差，覆盖更多触发样本更有价值（呼应
-// recommendCutoff 的"净超额命中数"思路），这贴合"筛垃圾"策略（尽量多留好币、只踢真垃圾）。
-// 但"推荐"类策略（想要少而精的候选名单）用同一个乘数会反向起作用：坐标上升会为了拉高
-// above.length 而把权重往"谁都容易触发"的方向偏，实测过（2026-07-28）：同一因子池，ρ最优配权
-// 在 cutoff 下触发率79%，分层增益（带该乘数）配权触发率飙到92%，过滤能力形同虚设。
-// opts.volumeWeighted=false 时去掉这个乘数，
-// 只留台阶差+粗粒度秩相关的方向性分数（不奖励触发量大小），配权时不会再被"放量"牵着走。
-// 但这样也去掉了它的一个副作用——above.length 越小、乘出来的分数天然越小，客观上在惩罚
-// "过线组样本太少、统计上不可信"的情况。实测过（2026-07-28）：去掉乘数后，held-out test 台阶差
-// 直接翻车（train 涨、test 从正变负），比默认版更容易过拟合——因为坐标上升不再需要顾忌"过线组
-// 够不够大"，会在 train 上找一个"过线组恰好差异很大"的权重组合，哪怕这个组在 train 上样本很少、
-// 纯属抽样运气。minGroupN（默认 20，呼应 computeScoreBuckets"每桶~20条才有统计意义"的口径）就是
-// 补回这层保护：不管 volumeWeighted 开不开，过线/未过线两层都必须达到这个样本量才评估台阶差，
-// 逼着搜索只能在统计上站得住脚的分组上找权重，不能靠小样本噪声投机取巧。
-// 垃圾/高倍标签口径跟"找因子"体系一致：直接用 returnMax > winThreshold，不引入独立的垃圾标签字段。
+// 按 score 排序后切成粗粒度分档：给已排好分数的 pairs 按分位数切 K 档（同分绝不跨档，
+// 仿 computeScoreBuckets），供散点图画"档边界/档命中率"，以及 bucketZigzag 数锯齿。
 //
-// 共享核心：给已排好分数的 pairs 按分位数切 K 档（同分不跨档，仿 computeScoreBuckets），
-// 算"档序号 vs 档统计量"的 spearman——cutoff-free，是 scorePoolTierGain 的"②粗粒度秩相关"
-// 和下面 scorePoolBucketRho（"推荐"场景独立北极星）共用的逻辑，不写两遍。
+// 下面这几条参数选择都是真实数据上踩出来的，改之前先读（2026-07-28 那一串订正的结论浓缩版；
+// 当时它还给一个叫 bucketRankRho 的目标函数供数，那条线 2026-07-29 已整体删除，见 readme 第 11 节，
+// 但这些关于"怎么切档才不会切出假信号"的教训对现在的诊断用途一样成立）：
 //
-// 2026-07-28 订正（用户订正："K=3~5 不可以，相当于原本要几百个桶直接变成3~5个"）：
-// 最早版本 K 固定 3~5、档内统计量用命中率，实测直接踩坑——真实数据里 frequent_volume 单独一个
-// 因子就跑出 Δ=+1.000（理论最大值），贪心只推一步就停。根因：K=3~5 时秩相关只有 3~5 个点参与
-// 计算，"这几个粗糙数字凑巧排对顺序"的概率远高于全局ρ（几百个点）"整条序列都排对"的概率，是
-// 离散网格效应/统计巧合，不是真信号——全局ρ与分层秩相关的核心区别就是参与计算的点数差两个
-// 数量级，这直接决定了两者对巧合的抵抗力天差地别。
-// 第一版改法（按"每档期望命中数≥3"算档大小=max(15,ceil(3/baseWinRate))）上线后，真实数据里
-// 又在另一处撞出同样的 +1.000（这次是 followed_tx_analysis.sell_amount，held-out涨到顶格但
-// 样本内只有+0.200）——回查发现：test 段样本量小、局部命中率一旦比全局基准更低（抽样波动，
-// 完全正常），ceil(3/baseWinRate)会把档点数顶得很大，K 又被压回3（数值上"没跌破K<3的检查"，
-// 但K=3本身就是最初那个问题的原始网格，检查形同虚设）。根子问题：档内统计量早就换成了中位数
-// （连续值，不需要"够3个命中"才稳），"按命中数定档大小"这条逻辑从改中位数那一刻起就已经是
-// 过时的历史包袱，没必要再跟着命中率走——这次直接删掉，档大小固定用中位数稳定所需的点数
-// （15），不再随局部命中率的抽样波动而忽大忽小。同时把"K太小就拒绝评估"的门槛从3提到5——
-// K=3~4 时数值网格依然粗糙（比如n=5时spearman网格步长才0.1，n=3~4时明显更粗），涨到5起步，
-// 网格才算真正跳出"随手一凑就顶格"的危险区。
-//
-// 2026-07-28 再订正（用户诊断："推荐时少算了一个维度，把一个维度算到了极致，导致高度集中在一起——
-// 目标其实是低倍率尽量分散在低分值、高倍率在高分值，这样阈值右侧赚率才高"）：上面这些订正堵住的
-// 是"点数太少导致巧合顶格"，但还有一条完全不同的路能制造出虚高分数——秩相关只看"桶与桶之间"
-// 中位数排得对不对，完全不管"桶内部"混杂成什么样。真实撞过：单独用 max_up_duration 推出的梯形
-// 下界形同虚设（几乎所有样本不管好坏都落在满分区），散点图上score=100那一竖排从1x到200x全挤在
-// 一起——桶间中位数排序看着还行（+0.964），但顶格那个桶把大部分样本饱和堆在同一个分数上，桶内部
-// 完全没有区分度，对实盘"cutoff右侧赚率"这个真实目标没有意义，贪心却因为桶间排序过关就停手，
-// 不会再找下一个因子去把这坨样本摊开。
-// 加一层"饱和度惩罚"：算出最大单桶样本占比 maxBucketFrac，最终值 = 秩相关 × (1 − maxBucketFrac)。
-// 分布均匀时（K个桶均分，各桶占比≈1/K）几乎不打折；出现某个桶吃掉大半样本这种饱和情况时，
-// 狠狠打折——逼着贪心/配权继续找能把饱和样本摊开的因子，而不是满足于"桶间排序对、桶内一锅粥"
-// 的解。scorePoolTierGain 的"②粗粒度秩相关"分量共用这条逻辑，同样受益（筛垃圾也不该允许
-// 大部分样本堆在同一个分数上）。
-// 2026-07-28 三订正（用户诊断："中位数对右偏分布不敏感——倍数分布是一大坨1~3x的普通盘+一小撮
-// 10~200x的尾部，不管总分高低，中位数都被这一大坨普通盘钉死在差不多的位置，尾部涨得再猛中位数
-// 感受不到；Spearman又只看顺序对不对，于是曲线视觉上像噪声带、案例中位数线基本走平，但秩相关
-// 却能算出0.5~0.7——这是数值上技术性满足单调，不是真信号"）：档内统计量从中位数换成命中率
-// （命中率 = 该档 returnMax > winThreshold 的比例），这才是跟十分位表"高倍率5.5%→20.0%一路爬升"
-// 同一个口径的东西，也是用户真正在意的"阈值右侧赚率"。
-// 代价（同样是用户指出的）：命中率在小分桶下方差更大——bucketSize固定15、真实命中率~15%时
-// 每档期望只有2~3个命中，噪声会比中位数明显。防护手段是 bucketSize 按命中率自适应放大：
-// max(15, ceil(minHitCount/rate))，rate 用当前这份 pairs 自己的整体命中率估计（不是历史上踩过坑的
-// "跨 train/test 用不同局部估计"，这里只在这一次调用内部自洽），确保每档期望命中数不至于太可怜。
-// 注意：不能反过来按"某档实际命中数<3就剔除该档"过滤——这是试过又踩的坑：一个 n=65 的大档
-// 实际命中数=0，恰恰是"该档命中率确信地很低（大概率在0~5%附近，样本量摆在那）"，是真信号的一部分，
-// 不是噪声；按绝对命中数剔除会把两端本该确信为低/高命中率的大档一起滤掉，破坏序列完整性，
-// 反而更容易在真实数据上把好因子的分层秩相关判成 NaN。噪声只能靠"分档时保证期望命中数"这层
-// 事前防护来控制，不能靠"看到命中数少就事后剔除"来滤——那等于是拿实现结果去筛统计假设。
-// winThreshold 不是 finite（老调用点没传）时退回旧的中位数口径，保证向后兼容。
-//
-// 按分位数切档的共享核心，拆出来单独导出——bucketRankRho 算 rho 用得到，UI 也想把"档边界/档命中率"
-// 画到散点图上给用户肉眼判断分层是否单调，两边不该各写一份切档逻辑。
-// 返回 null（档数不足，网格太粗不可信）或
-// { buckets: [{loScore,hiScore,medianRet,hitRate,hitCount,n}], maxBucketFrac }。
+// · **K 不能小（minK=5）**：最早 K 固定 3~5，秩相关只有 3~5 个点参与计算，"凑巧排对顺序"的概率
+//   远高于全局 ρ（几百个点）"整条序列都排对"。真实数据里 frequent_volume 单独一个因子就跑出过
+//   Δ=+1.000 的顶格值——那是离散网格效应，不是真信号。
+// · **档大小固定下限 15，不按命中率反推**：曾按"每档期望命中数≥3"算档大小，test 段样本少、
+//   局部命中率一低，ceil(3/rate) 会把档点数顶得很大、K 又被压回 3，等于绕回最初那个坑。
+// · **档内统计量用命中率不用中位数**：倍数分布是一大坨 1~3x 普通盘 + 一小撮尾部，中位数被普通盘
+//   钉死，尾部涨多猛都感受不到；命中率才跟十分位表"高倍率一路爬升"同一个口径。
+//   代价是小分桶下方差更大，靠 bucketSize 自适应放大（max(15, ceil(minHitCount/rate))）兜。
+// · **不能"某档实际命中数<3 就剔除该档"**：试过又踩的坑——一个 n=65 的大档实际命中数=0，恰恰是
+//   "该档命中率确信地很低"这个真信号的一部分；按绝对命中数剔除会把两端本该确信的大档一起滤掉，
+//   破坏序列完整性。噪声只能靠分档时的事前防护控制，不能拿实现结果去筛统计假设。
+// winThreshold 不是 finite 时退回中位数口径，保证向后兼容。
+// 返回 null（档数不足，网格太粗不可信）或 { buckets: [{loScore,hiScore,medianRet,hitRate,hitCount,n}] }。
 export function computeRankBuckets(pairs, winThreshold) {
   const n = pairs.length;
   if (n < 10) return null;
@@ -476,12 +475,16 @@ export function computeRankBuckets(pairs, winThreshold) {
     maxBucketSize = Math.max(maxBucketSize, chunk.length);
   }
   if (buckets.length < minK) return null;   // 同分合并（"别在同分处切开"）可能把实际档数压得比 K 少，这里按实际档数再查一次
-  return { buckets, maxBucketFrac: maxBucketSize / n };
+  return { buckets };
 }
 
 // 诊断用：从一组档（computeRankBuckets 的输出）里挑出"打架"（命中率比前一档还低）的位置，
 // 不用把所有档摊开来人工目测——inversions 数组每项标出具体是哪两档、命中率差多少、
 // 那个分数区间在哪，方便直接定位"贪心这一步加的因子，是不是把哪一段分数区间的排序搅乱了"。
+// 锯齿诊断：spearman 只看整条序列"大体上"排没排对，一条整体爬升但中间反复倒挂的曲线照样能
+// 换出不算差的秩相关。这个函数数相邻档命中率倒挂的次数与幅度，接在 recommendFactorPath 每一步的
+// 导出诊断上（UI 路径标签的 🌀N）。它曾被接进一个目标函数当惩罚项（bucketRankRho），那条线已删除
+// ——它现在纯粹是给人看的诊断，不参与任何优化，这样也更合适：锯齿该由人判断严不严重。
 export function bucketZigzag(buckets) {
   if (!buckets || buckets.length < 2) return { inversionCount: 0, worstDrop: 0, inversions: [] };
   const inversions = [];
@@ -498,131 +501,121 @@ export function bucketZigzag(buckets) {
   return { inversionCount: inversions.length, worstDrop, inversions };
 }
 
-// 2026-07-28 四订正（用户看回测图发现："紫线（档命中率）锯齿很重，这个锯齿程度应该是参数里
-// 重要的衡量指标"）：饱和度惩罚堵住了"桶间排对、桶内一锅粥"，但没堵住另一种虚高——spearman
-// 只看整条序列"大体上"排没排对，一条整体爬升但中间反复倒挂（比如第40档比第39档命中率还低）的
-// 曲线，照样能换出一个不算差的秩相关。`bucketZigzag` 这个诊断函数早就写好了（数相邻档倒挂的
-// 次数/幅度），但之前只在 recommendFactorPath 贪心路径的导出诊断里用，从没接进任何目标函数——
-// 配权时优化器对锯齿完全"失明"。
-// 第一版（用"总跨度"range 归一）在真实数据上直接踩坑：真实数据 K 常有 40+ 档（n=679 时
-// bucketSize 固定至少15，K=floor(679/15)≈45），倒挂次数只要有十几次，totalDrop 累加起来就
-// 轻松超过 range 这个固定值——导致几乎所有候选的锯齿惩罚都封顶在1，边际贡献列几乎全部塌成
-// 0.000、因子推荐只挑得出1个字段。根子问题：totalDrop 是"累加量"，会随档数增多线性变大，
-// 但 range 是跟档数无关的固定常数，两者除出来的比值天然会随档数增多而发散，不该拿一个会随
-// 输入规模变化的分子去除一个不会变的分母。
-// 改用"总变差"（totalVariation = 所有相邻档差值的绝对值之和，涨跌都算）归一：
-// zigzagPenalty = 倒挂步长之和 / 总变差。totalDrop 天然是 totalVariation 的一个子集（只数
-// 跌的部分），比值永远落在 [0,1]，不需要额外封顶，也不会随档数增多而发散——它衡量的是"整条
-// 序列的涨涨跌跌里，有多少比例是在往回跌"，跟档数无关，只跟"跌的部分占涨跌总量的比例"有关。
-function bucketRankRho(pairs, winThreshold) {
-  const built = computeRankBuckets(pairs, winThreshold);
-  if (!built) return NaN;
-  const series = Number.isFinite(winThreshold)
-    ? built.buckets.map((b, i) => [i, b.hitRate])
-    : built.buckets.map((b, i) => [i, b.medianRet]);
-  const rho = spearman(series);
-  if (!Number.isFinite(rho)) return NaN;
-  let zigzagPenalty = 0;
-  if (Number.isFinite(winThreshold)) {
-    const hitRates = built.buckets.map(b => b.hitRate);
-    let totalVariation = 0;
-    for (let i = 1; i < hitRates.length; i++) totalVariation += Math.abs(hitRates[i] - hitRates[i - 1]);
-    if (totalVariation > 0) {
-      const totalDrop = bucketZigzag(built.buckets).inversions.reduce((s, x) => s + x.drop, 0);
-      zigzagPenalty = totalDrop / totalVariation;
+// ---------- 边际ρ 的置换零分布（"这个增量算不算超出噪声"的经验标尺）----------
+// 边际ρ 不是教科书统计量，没有现成的 p 值可查，SOP 里"≥0.005 才算有正贡献"那条线是拍出来的。
+// 这里给它一个经验零分布：把 returnMax 在样本间【完全打乱】（字段值原样不动，只切断字段与
+// 收益的对应关系），再把整条流水线原样重跑一遍——重挖区间、重推梯形、重算 Δρ。
+// 必须整条重跑而不是复用真标签挖出的区间：边际ρ 的水分有很大一部分正是"从几百个候选窗口里
+// 挑最优"挑出来的，只打乱标签却沿用旧区间，等于把这部分搜索自由度藏起来，零分布会偏低。
+//
+// 得到的分布回答两个问题：
+//   · 这批数据、这个池子下，纯噪声能凑出多大的边际ρ（q95/q99 就是"阈值该设多少"的依据）；
+//   · 某个候选的 Δρ 在零分布里排第几（经验 p 值）。
+//
+// 量的必须是【跟候选表同一个统计量】：候选表显示的是 computeHeldOutDeltaRho 的 deltaTest
+// （held-out 增量），所以零分布也必须用 deltaTest 去凑，不能用样本内增量——两者的噪声量级不是
+// 一回事（held-out 更散），拿样本内的 q95 去卡 held-out 的观测值，这把尺子就是错的。
+//
+// 成本 = permutations × candidates 次"挖区间 + 切分 + 四次打分"（held-out 要 train/test 各评
+// baseline 与 with 两次，比样本内版本贵一倍左右），所以：
+//   · 区间挖掘的内部置换检验关掉（permB:0）——那是给单区间显著性用的，这里只要区间本身；
+//   · 候选由调用方抽样传入（UI 默认等间隔抽一批），不必也不该跑满全表。
+// 种子固定（mulberry32，跟 bootstrapAucCI/scanIntervalCore 同一套），同一份数据结果可复现。
+export function permutationNullMarginalRho(rows, currentFactors, candidates, winThreshold = WIN_THRESHOLD, opts = {}) {
+  const { shape = 'trap', missingPolicy = 'zero', buildRows = rows, minCoverage = 0.3,
+          trainRatio = 0.7, timeField = 'swapBeginTime', splitMethod = 'time',
+          permutations = 20, seed = 0x5EED1234, onProgress } = opts;
+  const cands = (candidates || []).filter(c => c && c.field);
+  if (!cands.length) return { error: '没有可用于置换检验的候选' };
+  if (!rows || rows.length < 20) return { error: '样本太少，置换零分布没有意义' };
+
+  const rand = mulberry32(seed);
+  const deltas = [];
+  let attempted = 0;
+  for (let b = 0; b < permutations; b++) {
+    // 打乱 returnMax：行对象浅拷贝（features/ctx 仍是引用，不额外占内存），只把收益换成别人的。
+    // 同时记下"原行 → 置换行"的映射，好让 buildRows（候选实际挖自的那份行集，通常就是 rows）跟着换成
+    // 同一批置换行——否则挖区间用的是打乱后的标签、打分用的是原标签，零分布就不干净了。
+    const rets = rows.map(r => r.returnMax);
+    for (let i = rets.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      const t = rets[i]; rets[i] = rets[j]; rets[j] = t;
     }
+    const permMap = new Map();
+    const permRows = rows.map((r, i) => { const p = { ...r, returnMax: rets[i] }; permMap.set(r, p); return p; });
+    const permBuild = buildRows === rows ? permRows : buildRows.map(r => permMap.get(r)).filter(Boolean);
+    if (!permBuild.length) continue;
+
+    for (const c of cands) {
+      attempted++;
+      const camp = c.camp === 'evil' ? 'evil' : 'hero';
+      const findInterval = camp === 'evil' ? findColdInterval : findHotInterval;
+      // 区间仍在【全量】permBuild 上挖，不切训练段——观测侧的候选 .interval 也是全样本扫描
+      // 挖出来的，零分布必须复刻同一条流水线（切了反而比观测值少一层搜索自由度，尺子偏松）。
+      // 真正的 held-out 只发生在下一步：梯形边界只看 train，Δρ 只在 test 上读。
+      const interval = findInterval(permBuild, c.field, { winThreshold, minCoverage, permB: 0 });
+      if (!interval || interval.error) continue;   // 打乱后挖不出区间 = 这一次没有候选可加，不计入分布
+      const r = computeHeldOutDeltaRho(permRows, currentFactors || [], { field: c.field, camp, interval }, camp,
+        winThreshold, { shape, missingPolicy, buildRows: permBuild, trainRatio, timeField, splitMethod });
+      if (r && Number.isFinite(r.deltaTest)) deltas.push(r.deltaTest);
+    }
+    if (onProgress) onProgress({ completed: b + 1, total: permutations });
   }
-  return rho * (1 - built.maxBucketFrac) * (1 - zigzagPenalty);
+  return summarizeNullDistribution(deltas, { permutations, candidates: cands.length, attempted });
 }
 
-function scorePoolTierGain(rows, factorSet, cutoff, missingPolicy, winThreshold, volumeWeighted = true, minGroupN = 20) {
-  if (!factorSet.length) return NaN;
-  const scored = scoreRows(rows, factorSet, { missingPolicy });
-  const pairs = [];
-  for (const s of scored) {
-    const ret = Number(s.row.returnMax);
-    if (Number.isFinite(s.score) && Number.isFinite(ret)) pairs.push({ score: s.score, ret });
-  }
-  const n = pairs.length;
-  if (n < 10) return NaN;
-
-  // ① 主台阶：cutoff 二分的命中率差
-  const above = pairs.filter(p => p.score >= cutoff);
-  const below = pairs.filter(p => p.score < cutoff);
-  if (above.length < minGroupN || below.length < minGroupN) return NaN;   // 两层都要有起码的统计意义才评估台阶差
-  const hitRateOf = arr => arr.filter(p => p.ret > winThreshold).length / arr.length;
-  const tierGap = hitRateOf(above) - hitRateOf(below);
-
-  // ② 粗粒度秩相关：跟 cutoff 无关，见 bucketRankRho；档内统计量用命中率（跟①同一把 winThreshold），
-  // 不用中位数——原因见 bucketRankRho 上方 2026-07-28 三订正的注释。
-  const rawTierRho = bucketRankRho(pairs, winThreshold);
-  const tierRho = Number.isFinite(rawTierRho) ? rawTierRho : 0;
-
-  const gapScore = 0.7 * tierGap + 0.3 * tierRho;
-  return volumeWeighted ? above.length * gapScore : gapScore;
+// 把置换出来的一堆 Δρ 汇总成零分布描述。单独一个函数是为了让"分片并行跑置换、主线程合并"
+// 这条路径（workerPool.runPermutationNullWithWorkers）用同一套分位数口径，而不是各算各的。
+export function summarizeNullDistribution(deltas, meta = {}) {
+  const vals = (deltas || []).filter(Number.isFinite);
+  const sorted = vals.slice().sort((a, b) => a - b);
+  // 样本不够时仍然把 deltas 原样带回：分片并行跑置换时，单片可能不够 10 个，
+  // 但几片合起来往往够——调用方要能把碎片拼起来再汇总一次。
+  if (sorted.length < 10) return { error: `置换后只得到 ${sorted.length} 个有效样本，无法给出零分布`, deltas: sorted, ...meta };
+  const q = p => sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(p * (sorted.length - 1))))];
+  return {
+    n: sorted.length,
+    // 挖不出区间的那部分（attempted - n）本身也是信息：打乱后压根找不到区间，说明该字段的
+    // 区间强依赖真实标签，这是好事；但比例过高会让分布只由少数字段贡献，所以一并报出来
+    ...meta,
+    q50: q(0.50), q90: q(0.90), q95: q(0.95), q99: q(0.99), max: sorted[sorted.length - 1],
+    deltas: sorted,
+  };
 }
 
-// ---------- 分层秩相关（cutoff-free，"推荐"场景独立北极星）----------
-// 用户订正（2026-07-28）："围绕 cutoff 判定"这个方向本身就不对——应该先排序，按整体单调性
-// （不要求逐点严格单调，只要求粗粒度分层递增）配好权重，cutoff 是排序定下来之后【从结果里读出来
-// 的一个点】（用现成的「推荐阈值」/recommendCutoff，按净超额命中数找），不该反过来先猜一个 cutoff
-// 去当配权目标函数的输入。上面 scorePoolTierGain 把"cutoff 台阶差"当主判据（权重 0.7）正是这个
-// 本末倒置的来源——cutoff 一变，配权就要整个重来，还牵出触发量乘数是否该奖励、held-out 在固定
-// 切分点两侧样本失衡（甚至算出 NaN）等一串连带问题，这些坑本质上都是"cutoff 绑定"这个设计缺陷的
-// 表现，不是碰巧。
-// scorePoolBucketRho 完全不吃 cutoff：只用 bucketRankRho（自适应分位档，同分不跨档，
-// 档内统计量用命中率）算"档序号 vs 档命中率"的秩相关，∈[-1,1]。适用场景：策略以"推荐"
-// （挑出一批候选，不是卡一条硬线）为第一目标——配完权重后再用「推荐阈值」单独定 cutoff，两件事
-// 彻底解耦，不会因为换 cutoff 就要重新配权。"筛垃圾"场景仍用 scorePoolTierGain（那边确实需要
-// 一条硬过线，cutoff 绑定是合理的）。
-// winThreshold 传给 bucketRankRho 用来算每档命中率——见 2026-07-28 三订正：中位数对右偏的
-// 倍数分布不敏感（一大坨低倍盘钉死中位数，尾部涨多猛都感受不到），命中率才是真正对应
-// "阈值右侧赚率"的统计量。
-export function scorePoolBucketRho(rows, factorSet, missingPolicy, winThreshold) {
-  if (!factorSet.length) return NaN;
-  const scored = scoreRows(rows, factorSet, { missingPolicy });
-  const pairs = [];
-  for (const s of scored) {
-    const ret = Number(s.row.returnMax);
-    if (Number.isFinite(s.score) && Number.isFinite(ret)) pairs.push({ score: s.score, ret });
-  }
-  if (pairs.length < 10) return NaN;
-  return bucketRankRho(pairs, winThreshold);
+// 某个观测到的边际ρ 在零分布里的经验 p 值（有多大比例的纯噪声能达到或超过它）。
+// +1/+1 是置换检验的标准修正，保证 p 永远 > 0（跑 N 次置换最多只能说"p < 1/(N+1)"）。
+export function permutationPValue(nullDist, delta) {
+  if (!nullDist || !nullDist.deltas || !Number.isFinite(delta)) return NaN;
+  const ge = nullDist.deltas.reduce((a, d) => a + (d >= delta ? 1 : 0), 0);
+  return (ge + 1) / (nullDist.deltas.length + 1);
 }
 
-// currentFactors：当前已选因子池（不含候选自己）；candidate：来自扫描结果的候选行
-// （需带 .interval，否则无法推导打分边界）；camp：候选所属阵营。rows 用于评估目标函数（通常是
-// 全体样本，因为最终是要在全体样本上打分）；opts.buildRows 用于推导梯形边界，默认等于 rows——
-// 如果候选的 .interval 是在另一份子集（如残差子集）上挖出来的，应传入同一份子集，保证区间与
-// 梯形边界口径一致。opts.scoreFn 是"打分池→目标值"的评估函数，默认 scorePoolRho（全程强单调）；
-// 不写死在函数体里，是为了让"评估用哪个目标函数"这件事可以从调用侧决定，而不是散落在各处改字面量。
-export function factorMarginalRho(rows, currentFactors, candidate, camp, winThreshold = WIN_THRESHOLD, opts = {}) {
-  const { shape = 'trap', missingPolicy = 'zero', buildRows = rows, scoreFn = scorePoolRho } = opts;
-  if (!candidate || !candidate.interval) return { error: '该字段无可信区间，无法评估' };
-  const { factors: withOne } = buildFactors(buildRows, [candidate], [{ field: candidate.field, camp }], winThreshold, { shape });
-  if (!withOne.length) return { error: '无法推导打分边界' };
-  const baseline = scoreFn(rows, autoWeights(currentFactors), missingPolicy);
-  const merged = autoWeights([...currentFactors, ...withOne]);
-  const withCandidate = scoreFn(rows, merged, missingPolicy);
-  const delta = Number.isFinite(withCandidate) && Number.isFinite(baseline) ? withCandidate - baseline
-    : Number.isFinite(withCandidate) ? withCandidate : NaN;
-  return { baseline, withCandidate, delta };
-}
-
-// 计算 held-out（验证段）与样本内（训练段/全样本） 目标函数的增量对照。
-// - 在训练段推导区间/梯形边界（build on train），在验证段计算目标函数的增量（held-out Δ）
-// - 同时返回训练段内的 Δ 供对照（样本内 Δ），帮助识别过拟合（两者背离大）
-// opts.scoreFn 同 factorMarginalRho，默认 scorePoolRho。
+// 【边际ρ 的唯一口径】候选字段进池后对目标函数的增量，train 拟合 / test 验证。
+// - 在训练段推导梯形边界（build on train），在验证段计算目标函数的增量（held-out Δ）
+// - 同时返回训练段内的 Δ 供对照，帮助识别过拟合（deltaTrain 涨而 deltaTest 不涨）
+// 2026-07-29 起「计算候选边际ρ贡献」按钮、「算推荐」的候选预筛、置换零分布三处全部走这一个
+// 函数——此前按钮走的是样本内版 factorMarginalRho（无 train/test 切分），"挑因子"这一步因此
+// 没有任何过拟合防护，噪声候选可以带着虚高的增量直接进池，而下游 train/test 对比只看得见
+// "权重组合"层面的过拟合、看不见这层。那个函数已删除，避免两套口径再次分叉。
+//
+// opts.buildRows：候选的 .interval 是在哪份数据上挖出来的（默认就是 rows；rows 换过而候选还是老那批时不同），边界就得在
+// 同一份数据上推——但同样只取它的 train 段，否则边界看过验证段，deltaTest 就不是 held-out 了。
+// opts.scoreFn：目标函数，默认 scorePoolRho（全程 spearman）；注入而不写死，见 optimizeWeightsForRho。
 // 返回 { baselineTrain, withTrain, deltaTrain, baselineTest, withTest, deltaTest, nTrain, nTest }
 export function computeHeldOutDeltaRho(rows, currentFactors, candidate, camp, winThreshold = WIN_THRESHOLD, opts = {}) {
   const { shape = 'trap', missingPolicy = 'zero', trainRatio = 0.7, timeField = 'swapBeginTime', splitMethod = 'time',
-          scoreFn = scorePoolRho } = opts;
+          buildRows = null, scoreFn = scorePoolRho } = opts;
   if (!candidate || !candidate.interval) return { error: '该字段无可信区间，无法评估' };
   const { train, test } = splitTrainTest(rows, splitMethod, trainRatio, timeField);
   if (!train.length || !test.length) return { error: '训练/验证分割后样本不足' };
 
-  // 构造只含 candidate 的因子（在 train 上推导梯形/界限）
-  const built = buildFactors(train, [candidate], [{ field: candidate.field, camp }], winThreshold, { shape }).factors;
+  // 构造只含 candidate 的因子（在 train 上推导梯形/界限）；传了 buildRows 就改用那份行集的 train 段
+  const deriveRows = buildRows && buildRows !== rows
+    ? splitTrainTest(buildRows, splitMethod, trainRatio, timeField).train
+    : train;
+  if (!deriveRows.length) return { error: '训练段没有可用于推导边界的样本' };
+  const built = buildFactors(deriveRows, [candidate], [{ field: candidate.field, camp }], winThreshold, { shape }).factors;
   if (!built || !built.length) return { error: '无法在训练段推导出 candidate 的打分边界' };
 
   // baseline 用当前因子池（假定为已推导好的因子对象数组）
@@ -658,8 +651,8 @@ export function computeHeldOutDeltaRho(rows, currentFactors, candidate, camp, wi
 const applyWeights = (factors, weights) => factors.map((f, i) => ({ ...f, weight: weights[i] }));
 
 // 通用乘法坐标上升：给一个"打分函数"objFn(rowsSet, weightedFactors, missingPolicy)->越大越好的目标值，
-// 搜非负权重最大化它。ρ 最优配权、分层增益配权共用这一套搜索外壳，只是 objFn 换了——
-// 前者塞 scorePoolRho（可由调用方注入别的目标函数），后者塞 scorePoolTierGain（多绑一个 cutoff/winThreshold）。
+// 搜非负权重最大化它。ρ 最优配权、recommendFactorPool 的精配权与影子权重共用这一套搜索外壳——
+// 目前唯一的 objFn 是 scorePoolRho（可由调用方注入别的目标函数）。
 function coordinateAscentGeneric(objFn, rowsSet, factors, start, missingPolicy, maxRounds) {
   const valueOf = w => objFn(rowsSet, applyWeights(factors, w), missingPolicy);
   let w = start.map(x => (Number.isFinite(x) && x > 0 ? x : 0));
@@ -684,7 +677,7 @@ function coordinateAscentGeneric(objFn, rowsSet, factors, start, missingPolicy, 
   return { w, rho: val };
 }
 
-// opts.scoreFn 是注入的目标函数（同 factorMarginalRho/computeHeldOutDeltaRho），默认 scorePoolRho；
+// opts.scoreFn 是注入的目标函数（同 computeHeldOutDeltaRho），默认 scorePoolRho；
 // 不写死在函数体里，跟 coordinateAscentGeneric(objFn, ...) 是同一个原则——"该用哪个目标函数"由
 // 调用方决定，避免同一套逻辑改个目标就要在多处复制粘贴。
 export function optimizeWeightsForRho(rows, factors, opts = {}) {
@@ -718,111 +711,50 @@ export function optimizeWeightsForRho(rows, factors, opts = {}) {
   };
 }
 
-// ---------- 分层增益配权（筛垃圾类策略的北极星例外：分段台阶）----------
-// 跟 optimizeWeightsForRho 是同一套框架（train 拟合 δ 坐标上升、两个起点各跑一次取 train 最优、
-// test 段只验证不参与搜索），只是目标函数换成 scorePoolTierGain：
-//   触发数(score>=cutoff) × (0.7×台阶差_过线vs未过线 + 0.3×粗粒度秩相关_档位vs档命中率)
-// "秩相关 + cutoff 主台阶加权"——见 scorePoolTierGain 内部注释：早期纯 cutoff 二分版本会让坐标
-// 上升退化成"单因子全权重"的角点解，加一个粗粒度排序约束能堵住这个漏洞，同时不要求全程细粒度
-// 单调（只切 3~5 档，不逼 decile 级处处爬升）。
-// 适用场景：策略以"过滤垃圾/防踩雷"为第一目标（用户明确说明），而不是要全程精细单调——
-// 此时按 ρ 最优配权会去追逐"处处爬升"，容易被小样本噪声牵着走；分层增益只要求粗粒度的
-// 台阶式区分，更贴合"区分垃圾"本身。返回结构与 optimizeWeightsForRho 对齐（字段名沿用 rho* 前缀
-// 是为了复用同一套展示/报告代码——这里的数值语义是"分层增益"而不是 Spearman ρ）。
-// opts.volumeWeighted（默认 true）：筛垃圾场景要"覆盖更多触发样本"，保持默认。策略若是
-// "推荐"类想要少而精的候选名单，传 false——去掉触发数乘数，配权不再被"放量"牵着走
-// （见 scorePoolTierGain 内部注释，2026-07-28 因"分层增益版触发率飙到92%、形同虚设"而加）。
-// opts.minGroupN（默认 20）：过线/未过线两层各自的最小样本量门槛，volumeWeighted:false 时
-// 尤其关键——去掉触发数乘数后失去了"样本越少分数天然越小"这层隐式正则化，minGroupN 补回来，
-// 见 scorePoolTierGain 内部注释（2026-07-28 因 volumeWeighted:false 版 held-out test 台阶差
-// 翻车、从正变负而加）。
-export function optimizeWeightsForTierGain(rows, factors, cutoff, opts = {}) {
-  const { missingPolicy = 'zero', trainRatio = 0.7, timeField = 'swapBeginTime',
-          splitMethod = 'time', maxRounds = 40, zeroEps = 0.05, winThreshold = DEFAULT_FACTOR_WIN_THRESHOLD,
-          volumeWeighted = true, minGroupN = 20 } = opts;
-  if (!Array.isArray(factors) || factors.length < 2) return { error: '至少要有 2 个因子才谈得上配权' };
-  const { train, test } = splitTrainTest(rows, splitMethod, trainRatio, timeField);
-  const curWeights = factors.map(f => Number(f.weight) || 0);
-  const objFn = (rowsSet, factorSet, mp) => scorePoolTierGain(rowsSet, factorSet, cutoff, mp, winThreshold, volumeWeighted, minGroupN);
-  const gainTrainBefore = objFn(train, factors, missingPolicy);
-  if (!Number.isFinite(gainTrainBefore)) return { error: `train 集在该 cutoff 下两层样本不足（各需 ≥${minGroupN}），无法评估分层增益` };
-
-  const starts = [autoWeights(factors).map(f => f.weight), factors.map(() => 1)];
-  let best = null;
-  for (const s of starts) {
-    const r = coordinateAscentGeneric(objFn, train, factors, s, missingPolicy, maxRounds);
-    if (!best || r.rho > best.rho) best = r;
-  }
-  const sum = best.w.reduce((a, b) => a + b, 0);
-  const normW = sum > 0 ? best.w.map(x => Math.round(x / sum * 1000) / 10) : best.w.map(() => Math.round(1000 / best.w.length) / 10);
-  const newFactors = applyWeights(factors, normW);
-  const zeroedFields = newFactors.filter(f => f.weight <= zeroEps).map(f => f.field);
-
-  return {
-    factors: newFactors,
-    rhoTrainBefore: gainTrainBefore, rhoTrainAfter: best.rho,
-    rhoTestBefore: objFn(test, applyWeights(factors, curWeights), missingPolicy),
-    rhoTestAfter: objFn(test, newFactors, missingPolicy),
-    zeroedFields, nTrain: train.length, nTest: test.length,
-  };
-}
-
-// ---------- 分层秩相关配权（"推荐"场景的独立北极星：不需要 cutoff）----------
-// 跟 optimizeWeightsForRho/TierGain 同一套框架（train 拟合 δ 坐标上升、两个起点各跑一次取 train
-// 最优、test 段只验证不参与搜索），目标函数换成 scorePoolBucketRho——完全不吃 cutoff，只要求
-// K=3~5 粗粒度分档递增，不追全程精细单调（避免被小样本噪声牵着走），也不绑定任何具体 cutoff
-// （避免 cutoff 一变、配权就要重来，见 scorePoolBucketRho 内部注释）。
-// 配完权重后，cutoff 用「推荐阈值」（recommendCutoff，按净超额命中数找）另外去定，不在这里定。
-export function optimizeWeightsForBucketRho(rows, factors, opts = {}) {
-  const { missingPolicy = 'zero', trainRatio = 0.7, timeField = 'swapBeginTime',
-          splitMethod = 'time', maxRounds = 40, zeroEps = 0.05, winThreshold = DEFAULT_FACTOR_WIN_THRESHOLD } = opts;
-  if (!Array.isArray(factors) || factors.length < 2) return { error: '至少要有 2 个因子才谈得上配权' };
-  const { train, test } = splitTrainTest(rows, splitMethod, trainRatio, timeField);
-  const curWeights = factors.map(f => Number(f.weight) || 0);
-  const objFn = (rowsSet, factorSet, mp) => scorePoolBucketRho(rowsSet, factorSet, mp, winThreshold);
-  const rhoTrainBefore = objFn(train, factors, missingPolicy);
-  if (!Number.isFinite(rhoTrainBefore)) return { error: 'train 集样本不足，切不出至少 3 个有效分位档，无法评估分层秩相关' };
-
-  const starts = [autoWeights(factors).map(f => f.weight), factors.map(() => 1)];
-  let best = null;
-  for (const s of starts) {
-    const r = coordinateAscentGeneric(objFn, train, factors, s, missingPolicy, maxRounds);
-    if (!best || r.rho > best.rho) best = r;
-  }
-  const sum = best.w.reduce((a, b) => a + b, 0);
-  const normW = sum > 0 ? best.w.map(x => Math.round(x / sum * 1000) / 10) : best.w.map(() => Math.round(1000 / best.w.length) / 10);
-  const newFactors = applyWeights(factors, normW);
-  const zeroedFields = newFactors.filter(f => f.weight <= zeroEps).map(f => f.field);
-
-  return {
-    factors: newFactors,
-    rhoTrainBefore, rhoTrainAfter: best.rho,
-    rhoTestBefore: objFn(test, applyWeights(factors, curWeights), missingPolicy),
-    rhoTestAfter: objFn(test, newFactors, missingPolicy),
-    zeroedFields, nTrain: train.length, nTest: test.length,
-  };
+// 起点池（"组合路径"模式）+ 新增字段一起建因子。
+// 为什么不能直接 buildFactors(rows, candidates, [...起点spec, ...新增spec])：起点池里的因子未必
+// 能从【本次】candidates 重建——勾了"只看勇者阵营"会把 evil 候选整个滤掉、换过字段范围
+// 后候选集也会变、上一轮扫描没挖出区间的字段同样不在里面。buildFactors 对查不到候选的 spec 是
+// 【静默跳过】的，于是起点池会悄悄少几个因子，后果有两层：① 基线目标值按残缺池算，新增字段的 Δ
+// 虚高；② UI 的"采用"是整体替换因子池，用户池子里那几个因子就这么没了（真实可复现：combo 模式
+// + 只看勇者，池里的邪恶因子采用一次就消失）。
+// 这里统一兜底：能从候选重建的照常重建（保住"边界在 train 段推导"这条纪律），重建不出来的直接
+// 沿用传进来的因子对象本身（它自带边界，只是这次不重新推导）——起点池只增不减。
+function buildWithBase(baseFactors, rowsForBuild, candidates, addSpecs, threshold, shape) {
+  const base = baseFactors || [];
+  const specs = [...base.map(f => ({ field: f.field, camp: f.camp })), ...addSpecs];
+  const built = buildFactors(rowsForBuild, candidates, specs, threshold, { shape }).factors;
+  const builtKeys = new Set(built.map(f => f.camp + ':' + f.field));
+  const kept = base.filter(f => !builtKeys.has(f.camp + ':' + f.field));
+  return [...kept, ...built];
 }
 
 // ---------- 因子推荐：贪心前向，按 held-out 边际 ρ 排（抗过拟合）----------
 // 从 startFactors 出发（组合路径模式）或从空（探索全路径模式，startFactors=[]），每步选
 // 「加进去让验证段 ρ 涨最多」的候选，加入，再算下一步 → 一条 a→b→c 路径。
 // 口径：区间/边界在【训练段】推导（减少泄漏），权重 autoWeights，目标函数在【验证段】评估；
-// 同时给样本内 Δ 供对照（两者背离大=过拟合迹象）。候选先按 interval.score（区间感知，见
-// scanIntervalCore/autoWeights 注释）预筛控算力——2026-07-28 从 |AUC−0.5| 换过来，AUC 假设
-// 方向单调会漏掉"驼峰型"字段，interval.score 才跟下游打分（区间/梯形）口径一致。
+// 同时给样本内 Δ 供对照（两者背离大=过拟合迹象）。候选按 interval.score（区间感知，见
+// scanIntervalCore/autoWeights 注释）降序排（2026-07-28 从 |AUC−0.5| 换过来，AUC 假设方向
+// 单调会漏掉"驼峰型"字段，interval.score 才跟下游打分（区间/梯形）口径一致），排序只影响
+// 同一步内候选评估的先后顺序，不截断——2026-07-28 又订正：曾经在这里加过 candLimit=50 只取
+// 排名前50的候选控算力，真实数据上会漏掉排名靠后但组合起来有用的字段，用户明确要求去掉这道截断。
+//
+// 2026-07-29：本函数现在是【唯一】的选字段引擎——`recommendFactorPool`（UI 那张合并后的
+// 「因子推荐」卡片）直接调它选字段，再接自己的收尾（精配权/影子权重/K折 k*）。此前还有一条
+// `recommendFactorPoolFull` 的平行实现在【全样本内】贪心选字段（靠事后校验兜底），已删除：
+// 那正是 computeHeldOutDeltaRho 那次统一要修的毛病——在同一批样本上挖边界又评估增量，
+// 等于自己给自己判卷，事后校验只能说"整体过不过拟合"，改变不了选的时候就被噪声带偏。
 // candidates: [{ field, camp, interval, auc }]（两阵营合并，需带 interval）。
-// opts.scoreFn 同 factorMarginalRho，默认 scorePoolRho——注入而不是写死，避免"换目标函数"要在
+// opts.scoreFn 同 computeHeldOutDeltaRho，默认 scorePoolRho——注入而不是写死，避免"换目标函数"要在
 // 多处复制这条贪心搜索逻辑。
 // 返回 { path:[{field,camp,deltaTest,deltaIn,testRho,inRho,overfit}], baseTestRho, nTrain, nTest }。
 export function recommendFactorPath(rows, startFactors, candidates, opts = {}) {
   const { threshold = WIN_THRESHOLD, missingPolicy = 'zero', shape = 'trap',
     maxSteps = 6, minGain = 0.003, trainRatio = 0.7, timeField = 'swapBeginTime',
-    splitMethod = 'time', candLimit = 50, batchSize = 10, scoreFn = scorePoolRho } = opts;
+    splitMethod = 'time', candLimit = Infinity, batchSize = 10, scoreFn = scorePoolRho } = opts;
   const { train, test } = splitTrainTest(rows, splitMethod, trainRatio, timeField);
   const scoreOf = (rowsSet, factorSet) => scoreFn(rowsSet, factorSet, missingPolicy);
-  // 候选：必须有区间；按 interval.score（区间感知，见 scanIntervalCore/autoWeights 注释）
-  // 预筛到 candLimit 个控算力——之前用 |AUC−0.5|，会误伤"驼峰型"字段（AUC假设方向单调，
-  // 区间打分不假设，两者可能反着来）；排除已在起点池里的。
+  // 候选：必须有区间；按 interval.score 降序排（不截断，见上方注释）；排除已在起点池里的。
   // 2026-07-28 试过又撤销：曾经在这里加过"区间显著性不能明确为false"的硬过滤，真实数据上
   // 单字段AUC普遍贴着0.5（这套系统本来就是靠很多个体弱信号加权组合，不是靠单字段自证清白），
   // 硬门槛会把候选池筛空、因子推荐直接变成"没有可推荐的候选"——比偶尔推荐一个不够严谨的
@@ -835,11 +767,12 @@ export function recommendFactorPath(rows, startFactors, candidates, opts = {}) {
     .slice(0, candLimit);
   if (!pool.length) return { path: [], baseTestRho: NaN, nTrain: train.length, nTest: test.length, error: '没有可推荐的候选（先扫描）' };
 
-  const buildOf = (specs, rowsForBuild) => buildFactors(rowsForBuild, candidates, specs, threshold, { shape }).factors;
-  let pathSpecs = (startFactors || []).map(f => ({ field: f.field, camp: f.camp }));
+  const buildOf = (addSpecs, rowsForBuild) => buildWithBase(startFactors, rowsForBuild, candidates, addSpecs, threshold, shape);
+  let pathSpecs = [];          // 只记【新增】的 spec，起点池由 buildWithBase 兜底（见其注释）
   const chosen = new Set(startKeys);
-  let baseTestRho = pathSpecs.length ? scoreOf(test, autoWeights(buildOf(pathSpecs, train))) : NaN;
-  let baseInRho = pathSpecs.length ? scoreOf(rows, autoWeights(buildOf(pathSpecs, train))) : NaN;
+  const hasBase = !!(startFactors && startFactors.length);
+  let baseTestRho = hasBase ? scoreOf(test, autoWeights(buildOf([], train))) : NaN;
+  let baseInRho = hasBase ? scoreOf(rows, autoWeights(buildOf([], train))) : NaN;
   const path = [];
 
   for (let step = 0; step < maxSteps; step++) {
@@ -891,14 +824,190 @@ export function recommendFactorPath(rows, startFactors, candidates, opts = {}) {
   return { path, baseTestRho, nTrain: train.length, nTest: test.length };
 }
 
-// Mode A: 从当前池出发（动态组合路径）
-export function buildPathFromPool(rows, currentFactors, candidates, opts = {}) {
-  return recommendFactorPath(rows, currentFactors, candidates, opts);
+// ---------- 因子推荐：选字段（held-out 贪心）→ 精配权 → 过拟合校验 → K折定因子数 ----------
+// 2026-07-29 合并：此前这里是两个并列的推荐函数——`recommendFactorPath`（选字段做 train/test
+// 切分，抗过拟合，但不配权、不给因子数建议）和 `recommendFactorPoolFull`（选字段在全样本内做，
+// 靠事后校验兜底，但会精配权 + 给 K折 k*），UI 上是两张卡片。并列的代价不是多几行代码，是
+// 【同一个问题两个答案】，用户还得判断信哪个。
+// 合并取的是各自的长处：**选字段用 held-out**（跟 computeHeldOutDeltaRho 那次统一同一套纪律——
+// 边界是从这批样本里搜出来的，就不能在同一批样本上评估它的增量），**收尾用原来因子推荐2 那三件套**：
+//   ① 全样本坐标上升精配权（采用即用，不必再手动点「🎯按ρ最优配权」）；
+//   ② 影子权重过拟合校验（只用 train 拟合、对 test 全盲，见下方注释）；
+//   ③ heldOutFactorCurve K折曲线 + 1-SE 推荐因子数 k*（甩掉过拟合尾巴）。
+//
+// candidates: [{ field, camp, interval, auc }]（两阵营合并，需带 interval；字段范围由调用方决定）。
+// opts.startFactors（"组合路径"模式）：非空时贪心从这份起点池出发，只找【新增】字段——起点池不
+// 重复挑选、也不计入 held-out 曲线的因子数 k（视为用户已采信，见 heldOutFactorCurve 的 baseFactors）。
+// 返回 { path, factors, rhoBefore, rhoAfter, rhoTrain, rhoTest, overfit, nTrain, nTest,
+//        zeroedFields, n, heldoutCurve, recommendedCount, factorsTrimmed } 或 { path: [], error }。
+// path 每项来自 recommendFactorPath，带 deltaTest/deltaIn/overfit/testZigzag 等逐步诊断。
+export function recommendFactorPool(rows, candidates, opts = {}) {
+  const { threshold = WIN_THRESHOLD, missingPolicy = 'zero', shape = 'trap',
+    // maxSteps 从原「因子推荐」的 6 放宽到 12：后面还有 K折 k* 兜底截断长尾，与其在贪心阶段
+    // 就保守停手（可能漏掉组合起来才有用的字段），不如多走几步、由 held-out 曲线决定砍在哪。
+    // minGain 维持 0.003（原「因子推荐」的值），没跟着放宽——本来想收到 0.001，实测被打脸：
+    // 概念漂移那条用例里，一个验证段上其实已经没有信号的字段拿到 deltaTest=+0.009，两个阈值
+    // 都拦不住。说明 minGain 只是个"别把 0 也算进来"的地板，**它不是过拟合防线**；真正认得出
+    // 这种字段的是每步的 overfit 标记（deltaIn 0.249 vs deltaTest 0.009）和影子权重校验。
+    // 既然拦不住，就没有理由为它放宽——保持原值。
+    maxSteps = 12, minGain = 0.003, maxRounds = 40,
+    trainRatio = 0.7, timeField = 'swapBeginTime', splitMethod = 'time',
+    startFactors: startPool = [] } = opts;
+  const scoreOf = (rowsSet, factorSet) => scorePoolRho(rowsSet, factorSet, missingPolicy);
+  if (!(candidates || []).some(c => c && c.interval)) return { path: [], error: '没有可推荐的候选（先扫描）' };
+
+  // ① 选字段：held-out 贪心。边界在 train 段推、增量在 test 段读，只收验证段真涨的候选。
+  const sel = recommendFactorPath(rows, startPool, candidates,
+    { threshold, missingPolicy, shape, maxSteps, minGain, trainRatio, timeField, splitMethod });
+  const path = sel.path || [];
+  if (!path.length) {
+    return { path: [], baseTestRho: sel.baseTestRho, nTrain: sel.nTrain, nTest: sel.nTest,
+      error: sel.error || (startPool.length
+        ? '当前池子已经不错——没有候选能让验证段ρ再提升（或都是负贡献）。'
+        : '没有候选能让验证段ρ提升（先降低阈值或多攒数据）') };
+  }
+
+  // buildWithBase 而不是裸 buildFactors：起点池里重建不出来的因子（heroOnly 滤掉了 evil 候选、
+  // 换过字段范围等）原样保留，不会被静默丢掉——见 buildWithBase 注释。
+  const buildOf = addSpecs => buildWithBase(startPool, rows, candidates, addSpecs, threshold, shape);
+  const pathSpecs = path.map(p => ({ field: p.field, camp: p.camp }));
+
+  // 坐标上升配权的公共外壳：两个初值（autoWeights + 等权）各跑一次取目标值更优的。
+  // 精配权/影子权重/截断池三处都要，抽出来免得三份复制粘贴各自漂移。
+  const fitWeights = (rowsSet, factorList) => {
+    const starts = [autoWeights(factorList).map(f => f.weight), factorList.map(() => 1)];
+    let best = null;
+    for (const st of starts) {
+      const r = coordinateAscentGeneric(scoreOf, rowsSet, factorList, st, missingPolicy, maxRounds);
+      if (!best || r.rho > best.rho) best = r;
+    }
+    return best;
+  };
+  const normalizeWeights = w => {
+    const sum = w.reduce((a, b) => a + b, 0);
+    return sum > 0 ? w.map(x => Math.round(x / sum * 1000) / 10)
+                   : w.map(() => Math.round(1000 / w.length) / 10);
+  };
+
+  // ② 精配权：路径定下来后在全样本上配一次权重，这份才是返回给用户"采用即用"的。
+  // 全样本而不是只用 train——最终就是要在全体样本上打分，物尽其用；它是否过拟合由 ③ 单独校验。
+  const fullFactors = buildOf(pathSpecs);
+  const rhoBefore = scoreOf(rows, autoWeights(fullFactors));   // 精配权前：区间打分自动权重
+  const bestW = fitWeights(rows, fullFactors);
+  const newFactors = applyWeights(fullFactors, normalizeWeights(bestW.w));
+  const zeroedFields = newFactors.filter(f => f.weight <= 0.05).map(f => f.field);
+
+  // ③ 事后过拟合校验：另配一份"影子权重"——只用 train 拟合（对 test 完全盲），拿去 test 上打分。
+  // 不能直接拿上面已经用全样本配好的 newFactors 去两边打分：那份权重配权时已经见过 test，
+  // 事后怎么切都显得稳，等于拿抄过答案的卷子对答案（2026-07-28 真实数据上现过原形，见 readme）。
+  // 影子权重只用于诊断数字，不影响返回给用户的 factors。
+  const { train, test } = splitTrainTest(rows, splitMethod, trainRatio, timeField);
+  const bestShadow = fitWeights(train, fullFactors);
+  const rhoTrain = bestShadow.rho;   // = scoreOf(train, shadowFactors)，坐标上升内部已经算过
+  const rhoTest = scoreOf(test, applyWeights(fullFactors, bestShadow.w));
+  const overfit = Number.isFinite(rhoTrain) && rhoTrain > 0 && Number.isFinite(rhoTest) && rhoTest < rhoTrain * 0.4;
+
+  // ④ held-out 因子数验证曲线（K折）+ 1-SE 推荐因子数 k*：回答"这次新推荐的 N 个里几个能泛化"。
+  // 选字段已经是 held-out 的了，为什么还要这条？两者管的不是同一件事：贪心的 test 段是【固定的
+  // 那一刀】，逐步累加时同一段验证数据被反复用来做选择决策，走到后面几步难免开始贴着它；这条曲线
+  // 换成 K 折、每折重新推边界+配权，专门回答"加到第几个开始不泛化"。③ 只校验【配权】那一层，
+  // 对"因子数是不是太多"几乎失明。只对【新增路径】做前缀扫描，起点池当固定基座不参与 k 的计数。
+  const heldoutCurve = heldOutFactorCurve(rows, candidates, pathSpecs,
+    { threshold, missingPolicy, shape, K: opts.K ?? 5, baseFactors: startPool });
+  let factorsTrimmed = newFactors, recommendedCount = path.length;
+  if (heldoutCurve && heldoutCurve.recommendedCount < path.length) {
+    recommendedCount = heldoutCurve.recommendedCount;
+    // 截断到 k* 后同样在全样本上精配一次权重（跟整条路径一个纪律）；基座原样保留，只截新增的尾巴。
+    const trimStart = buildOf(pathSpecs.slice(0, recommendedCount));
+    factorsTrimmed = applyWeights(trimStart, normalizeWeights(fitWeights(rows, trimStart).w));
+  }
+
+  return { path, factors: newFactors, rhoBefore, rhoAfter: bestW.rho,
+    rhoTrain, rhoTest, overfit, nTrain: train.length, nTest: test.length,
+    baseTestRho: sel.baseTestRho, zeroedFields, n: rows.length,
+    heldoutCurve, recommendedCount, factorsTrimmed };
 }
 
-// Mode B: 从空池出发（独立探索从零最优路径）
-export function buildPathFromZero(rows, candidates, opts = {}) {
-  return recommendFactorPath(rows, [], candidates, opts);
+// held-out 因子数验证曲线：固定贪心选出来的因子顺序 pathSpecs，用 K 折随机交叉验证逐前缀评估——
+// 每折在 train 上【重新推导区间/梯形边界 + 自动配权】（buildFactors(train,...)，边界不碰 test），再去
+// test 折上打全程 ρ，K 折平均得到"test ρ 随因子数 k"的曲线。噪声因子在 held-out 上平均贡献≈0，曲线会走平。
+// 用 1-SE 规则挑最省的 k*：先找均值最高的 kBest，再取"均值 ≥ 峰值 − 1个标准误"的最小 k（宁可少几个）。
+// 说明：因子的【选择顺序】沿用 recommendFactorPath 那一刀固定切分下选出来的顺序（没在每折重做贪心，
+// 避免 K×贪心 的开销）；但每个前缀的边界/权重都在本折 train 上重新拟合，足以暴露"加到后面不再
+// 泛化"的过拟合尾巴——也正好补上"贪心一直对着同一段 test 做选择决策"这个盲区。样本太少（< K×4）返回 null。
+// opts.baseFactors（配合 recommendFactorPool 的"组合路径"模式；原名 baseSpecs，现在收的是
+// 【因子对象】而不是 spec）：非空时视为固定基座，每折都跟当前前缀一起建，但不参与 k 的扫描——
+// kMax 仍然只数 pathSpecs（新增路径）的长度。用途：起点池已经是用户采信过的因子，"这次新推荐的
+// N 个该留几个"这个诊断不该把起点池也算进"因子数"里连带判定。收因子对象是为了走 buildWithBase：
+// 基座里从本次 candidates 重建不出来的因子能原样保留，不会被静默丢掉（见 buildWithBase 注释）。
+// 固定种子分 K 折，但按 **token 分组**：同一个 token 的所有信号整组进同一折，返回 foldOf[i]。
+// 按行分折是错的：同一 token 的多条信号收益高度相关（summary.js 那条"非独立样本"警告说的就是这件
+// 事，而找因子默认并不去重），兄弟样本被分到 train/test 两边时，test 折上考的其实是已经见过的题——
+// held-out ρ 被系统性抬高，1-SE 选出来的 k* 跟着偏大，噪声因子看起来"还在涨"。
+// 分组键优先 tokenAddress，缺失时退回 id / 下标（自成一组，退化成按行分折）。
+export function assignFoldsByToken(rows, K, seed = 0x1234567) {
+  const n = rows.length;
+  const groups = new Map();
+  for (let i = 0; i < n; i++) {
+    const key = String(rows[i]?.tokenAddress || rows[i]?.id || i);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(i);
+  }
+  const groupKeys = [...groups.keys()];
+  const rand = mulberry32(seed);
+  for (let i = groupKeys.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    const t = groupKeys[i]; groupKeys[i] = groupKeys[j]; groupKeys[j] = t;
+  }
+  const foldOf = new Array(n);
+  groupKeys.forEach((key, pos) => { for (const idx of groups.get(key)) foldOf[idx] = pos % K; });
+  return foldOf;
+}
+
+export function heldOutFactorCurve(rows, candidates, pathSpecs, opts = {}) {
+  const { threshold = WIN_THRESHOLD, missingPolicy = 'zero', shape = 'trap', K = 5, seed = 0x1234567,
+          baseFactors = [] } = opts;
+  const n = rows.length;
+  if (!pathSpecs || pathSpecs.length < 1 || n < K * 4) return null;
+  const kMax = pathSpecs.length;
+
+  const foldOf = assignFoldsByToken(rows, K, seed);
+
+  const perK = Array.from({ length: kMax }, () => []);   // 每个前缀 k 收集 K 折的 test ρ
+  for (let f = 0; f < K; f++) {
+    const train = [], test = [];
+    for (let i = 0; i < n; i++) (foldOf[i] === f ? test : train).push(rows[i]);
+    if (train.length < 10 || test.length < 5) continue;
+    for (let k = 1; k <= kMax; k++) {
+      const built = autoWeights(buildWithBase(baseFactors, train, candidates, pathSpecs.slice(0, k), threshold, shape));
+      if (!built.length) continue;
+      const rho = scorePoolRho(test, built, missingPolicy);
+      if (Number.isFinite(rho)) perK[k - 1].push(rho);
+    }
+  }
+
+  const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
+  // 顺带算一条"样本内"曲线做对照（全样本 build+autoWeights、全样本打分）——它会一路爬，
+  // 跟 held-out 走平之间的缝就是过拟合量，画一张图上最直观。
+  const curve = perK.map((arr, i) => {
+    const inBuilt = autoWeights(buildWithBase(baseFactors, rows, candidates, pathSpecs.slice(0, i + 1), threshold, shape));
+    const inRho = inBuilt.length ? scorePoolRho(rows, inBuilt, missingPolicy) : NaN;
+    if (!arr.length) return { k: i + 1, testRho: NaN, testStd: NaN, nFolds: 0, inRho };
+    const m = mean(arr);
+    const variance = arr.length > 1 ? mean(arr.map(x => (x - m) ** 2)) : 0;
+    return { k: i + 1, testRho: m, testStd: Math.sqrt(variance), nFolds: arr.length, inRho };
+  });
+
+  // 1-SE 规则：峰值 kBest → 取"均值 ≥ 峰值 − 峰值处1个标准误"的最小 k
+  let kBestIdx = 0, best = -Infinity;
+  curve.forEach((c, i) => { if (Number.isFinite(c.testRho) && c.testRho > best) { best = c.testRho; kBestIdx = i; } });
+  if (!Number.isFinite(best)) return { curve, recommendedCount: kMax, kBest: kMax, kMax, K, bestTestRho: NaN };
+  const seBest = curve[kBestIdx].nFolds > 1 ? curve[kBestIdx].testStd / Math.sqrt(curve[kBestIdx].nFolds) : 0;
+  let recommendedCount = kBestIdx + 1;
+  for (let i = 0; i <= kBestIdx; i++) {
+    if (Number.isFinite(curve[i].testRho) && curve[i].testRho >= best - seBest) { recommendedCount = i + 1; break; }
+  }
+  return { curve, recommendedCount, kBest: kBestIdx + 1, kMax, K, bestTestRho: best };
 }
 
 // ---------- 打分与回测 ----------
@@ -909,28 +1018,24 @@ export function buildPathFromZero(rows, candidates, opts = {}) {
 // 邪恶阵营（camp==='evil'）命中自己的区间（输家密集/危险区）= -weight·s（减分）。
 // 纯勇者阵营场景下（没有 evil 因子）行为与之前完全一致，分数仍落在 0~100。
 //
-// missingPolicy 两种缺失口径：
-//   'zero'（默认）——缺失记 0 分（不加不减）。惩罚的是数据覆盖不是盘质量，但保守。
-//   'renorm'——缺失因子不参与，按【在场因子】的权重和归一（score = Σᵢ±wᵢsᵢ / Σ_{有值}wᵢ ×100）。
-//     防走样约束：在场权重 < minCoverage（默认 50%）时判 0 分——只剩一两个字段有值的盘
-//     不该靠单因子拿高分。
+// 缺失口径只有一种：**缺失记 0 分**（不加不减）。惩罚的是数据覆盖而不是盘质量，偏保守，
+// 但它跟策略侧「生成上线代码」(lib/onlineExport.js) 的行为一致——这是不能变的约束，
+// 回测分数和线上分数必须同一个尺度，否则面板上选出来的 cutoff 搬到线上就是错的。
+//
+// 2026-07-29 删除了 'renorm' 口径（缺失因子不参与、按在场权重重归一，在场权重 <50% 判 0 分）。
+// 它的算法没问题，问题是 onlineExport 里【没有】对应实现，选中它就等于让回测和线上系统性错位——
+// 这不是一个选项，是一个陷阱。UI 上的开关同时删除。
+// opts.missingPolicy 仍在整条调用链里传递（scoreRow → 回测 → 边际ρ → 配权 → worker），
+// 只是当前唯一取值是 'zero'；真要再加第二种口径，先在 onlineExport 里实现对应分支。
 export function scoreRow(row, factors, opts = {}) {
-  const { missingPolicy = 'zero', minCoverage = 0.5 } = opts;
-  let total = 0, wsum = 0, wPresent = 0;
+  let total = 0, wsum = 0;
   const perFactor = factors.map(f => {
     const v = getFeatureValue(row, f.field);
-    if (Number.isFinite(v)) wPresent += f.weight;
     const hit = trapScore(v, f.lo0, f.lo1, f.hi1, f.hi0);
     const s = f.camp === 'evil' ? -hit : hit;   // 邪恶阵营命中危险区 → 负分
     total += s * f.weight; wsum += f.weight;
     return s;
   });
-  if (missingPolicy === 'renorm') {
-    if (wsum <= 0 || wPresent <= 0 || wPresent < wsum * minCoverage) {
-      return { score: 0, perFactor, lowCoverage: wPresent < wsum * minCoverage };
-    }
-    return { score: total / wPresent * 100, perFactor };
-  }
   return { score: wsum > 0 ? total / wsum * 100 : 0, perFactor };
 }
 
@@ -996,7 +1101,7 @@ export function sweepScoreCutoffs(scored, winThreshold = WIN_THRESHOLD, step = 2
       }
     }
     points.push({
-      cut, triggered,
+      cut, triggered, hit,
       hitRate: triggered ? hit / triggered : NaN,
       capture: base.pos ? hit / base.pos : NaN,
       lift: triggered && base.baseRate > 0 ? (hit / triggered) / base.baseRate : NaN,
@@ -1033,17 +1138,18 @@ export function backtestFactors(rows, factors, winThreshold = WIN_THRESHOLD, sco
   };
 }
 
-// 时间外推验证：区间/梯形/权重【只】在训练段推导，原样套到验证段。
-// 验证段指标明显低于训练段 = 参数过拟合了训练期的行情，别直接上实盘。
+// 时间外推验证的单段核心逻辑：区间/梯形/权重【只】在 train 上推导，原样套到 test。
+// runOOSBacktest（单次70/30）和 runWalkForwardBacktest（多段滚动）共用这一份，避免逻辑分叉。
 //
 // fieldSpecs 支持两种写法：字符串数组（向后兼容，全部当勇者阵营处理，行为与改动前完全一致），
 // 或 {field, camp} 对象数组（camp='hero'|'evil'，两阵营各自在训练段用各自的区间挖掘重新扫描）。
-export async function runOOSBacktest(rows, fieldSpecs, winThreshold = WIN_THRESHOLD, opts = {}) {
-  const { trainRatio = 0.7, bootstrapB = 100, minCoverage = 0.3, shape = 'trap', missingPolicy = 'zero' } = opts;
-  const { train, test } = splitRowsByTime(rows, trainRatio);
-  if (train.length < 30 || test.length < 15) {
-    return { error: `样本太少：训练段 ${train.length} / 验证段 ${test.length}，至少需要 30/15` };
-  }
+//
+// 2026-07-28 新增 factorDecay（逐因子归因）：训练段每个因子的 AUC（c.auc）扫描时已经算好，这里
+// 补一份该字段在验证段独立重算的 AUC，两者差值大的就是"验证段失效"的候选嫌疑字段——用于回答
+// "总分lift塌了，是哪个字段拖累的"，是粗略的诊断线索，不是严格统计检验（两段各自的最优方向
+// 都是独立选出来的，不排除方向翻转；仅供定位排查，不作为下线某字段的唯一依据）。
+async function backtestOneSplit(train, test, fieldSpecs, winThreshold, opts) {
+  const { bootstrapB = 100, minCoverage = 0.3, shape = 'trap', missingPolicy = 'zero' } = opts;
   const specs = fieldSpecs.map(s => (typeof s === 'string' ? { field: s, camp: 'hero' } : s));
   const heroFields = specs.filter(s => s.camp !== 'evil').map(s => s.field);
   const evilFields = specs.filter(s => s.camp === 'evil').map(s => s.field);
@@ -1054,13 +1160,112 @@ export async function runOOSBacktest(rows, fieldSpecs, winThreshold = WIN_THRESH
   ]);
   const candidates = scans.filter(Boolean).flatMap(s => s.candidates);
   const { factors, skipped } = buildFactors(train, candidates, specs, winThreshold, { shape });
-  if (!factors.length) return { error: '训练段推导不出任何有效因子', skipped };
+  if (!factors.length) {
+    return { error: '训练段推导不出任何有效因子', skipped, trainSize: train.length, testSize: test.length };
+  }
+  // testN/testPos：验证段这次独立AUC计算依据的样本量/正类数——这两个数字很小时（尤其 walk-forward
+  // 切了多段、每段验证窗口本来就小时），AUC 估计本身方差很大，跌/涨看着夸张多半是噪声，不是真信号
+  // 变化。归因表/导出报告都该把这两个数字带出去，不能只给一个孤零零的 AUC 差值让人误判。
+  const factorDecay = factors.map(f => {
+    const t = aucForField(test, f.field, { winThreshold, bootstrapB: Math.min(bootstrapB, 100) });
+    return { field: f.field, camp: f.camp, trainAuc: f.auc, testAuc: t.auc, testN: t.n, testPos: t.pos,
+             aucDrop: Number.isFinite(f.auc) && Number.isFinite(t.auc) ? f.auc - t.auc : NaN };
+  });
   return {
-    trainFactors: factors, skipped,
+    trainFactors: factors, skipped, factorDecay,
     trainSize: train.length, testSize: test.length,
     train: backtestFactors(train, factors, winThreshold, { missingPolicy }),
     test: backtestFactors(test, factors, winThreshold, { missingPolicy }),
   };
+}
+
+// 时间外推验证：单次 70/30 切分（保留原样，向后兼容——返回形状没变，`backtestReportExport.js`
+// 和既有测试都直接读 trainFactors/trainSize/testSize/train/test 这几个顶层字段）。
+// 验证段指标明显低于训练段 = 参数过拟合了训练期的行情，别直接上实盘。
+export async function runOOSBacktest(rows, fieldSpecs, winThreshold = WIN_THRESHOLD, opts = {}) {
+  const { trainRatio = 0.7 } = opts;
+  const { train, test } = splitRowsByTime(rows, trainRatio);
+  if (train.length < 30 || test.length < 15) {
+    return { error: `样本太少：训练段 ${train.length} / 验证段 ${test.length}，至少需要 30/15` };
+  }
+  return backtestOneSplit(train, test, fieldSpecs, winThreshold, opts);
+}
+
+// 时间外推验证（walk-forward 多段滚动，2026-07-28 新增）：单次 70/30 切分只看"这一刀"的运气——
+// 如果恰好切在行情转折点附近，结果可能纯粹是运气好/坏，不代表参数真的稳。这里训练段固定用最早
+// trainRatio 比例做"起步窗口"（跟 runOOSBacktest 同一个默认值，第 0 段跟单次切分完全等价），
+// 剩下的验证池切成 splits 段连续时间窗、扩张窗口滚动（每段训练集 = 从最早到该段验证窗口开始
+// 为止的全部历史，不是只用起步窗口）——逐段各自独立推导区间/权重、套到该段验证。多段都稳定，
+// 比单次切分可信得多；只有某几段衰减，也能看出是不是特定行情阶段的问题，而不是参数本身坏了。
+// opts.onProgress({completed,total}) 供 UI 显示"验证 2/5 段"这类进度。
+export async function runWalkForwardBacktest(rows, fieldSpecs, winThreshold = WIN_THRESHOLD, opts = {}) {
+  const { trainRatio = 0.7, splits = 5, onProgress, ...restOpts } = opts;
+  const ordered = rows.slice().sort((a, b) => timeAnchor(a) - timeAnchor(b));
+  const n = ordered.length;
+  const burnIn = Math.floor(n * trainRatio);
+  const poolSize = n - burnIn;
+  if (burnIn < 30 || poolSize < 15) {
+    return { error: `样本太少：训练段 ${burnIn} / 验证池 ${poolSize}，至少需要 30/15` };
+  }
+  // 每段验证窗口至少 15 条：验证池不够切出 splits 段时自动减少段数，宁可少切几段也不给不可信的小段。
+  const nSplits = Math.max(1, Math.min(splits, Math.floor(poolSize / 15)));
+  const perTest = Math.floor(poolSize / nSplits);
+
+  const folds = [];
+  for (let i = 0; i < nSplits; i++) {
+    const trainEnd = burnIn + i * perTest;
+    const testEnd = i === nSplits - 1 ? n : trainEnd + perTest; // 最后一段吃掉除不尽的余数
+    const train = ordered.slice(0, trainEnd), test = ordered.slice(trainEnd, testEnd);
+    const res = await backtestOneSplit(train, test, fieldSpecs, winThreshold, restOpts);
+    folds.push({ splitIndex: i, testStart: timeAnchor(test[0]), testEnd: timeAnchor(test[test.length - 1]), ...res });
+    if (typeof onProgress === 'function') onProgress({ completed: i + 1, total: nSplits });
+  }
+  if (!folds.some(f => !f.error)) return { error: folds[0]?.error || '所有切分段都推导不出有效因子' };
+  return { folds, splits: nSplits, trainRatio, burnIn };
+}
+
+// 用两比例检验判断"验证段命中率是否显著低于训练段"，替代"lift<训练段60%"这种固定阈值——
+// 那条固定阈值跟样本量无关：触发数少时正常抽样噪声就能把 lift 打到 60% 以下（假警报），
+// 触发数很大时哪怕只跌了 20% 也可能是真实衰减（漏报）。trainPoint/testPoint 是 sweepScoreCutoffs
+// 某个 cutoff 对应的 point（需要 hit/triggered 字段）。
+// 返回 { p, decayed, significant, insufficientN }：decayed=验证段命中率是否比训练段低（不看显著性）；
+// significant=差异是否统计显著（p<0.05）且方向是衰减；insufficientN=两段任一触发数<5，
+// 正态近似不成立，p 是 NaN，前端该提示"样本不足，不下结论"而不是硬套一个判定。
+export function assessSplitDecay(trainPoint, testPoint) {
+  if (!trainPoint || !testPoint) return { p: NaN, decayed: false, significant: false, insufficientN: true };
+  const p = twoProportionTestP(trainPoint.hit, trainPoint.triggered, testPoint.hit, testPoint.triggered);
+  const decayed = Number.isFinite(trainPoint.hitRate) && Number.isFinite(testPoint.hitRate) && testPoint.hitRate < trainPoint.hitRate;
+  return { p, decayed, significant: Number.isFinite(p) && p < 0.05 && decayed, insufficientN: !Number.isFinite(p) };
+}
+
+// 用【当前因子池】原样打分，对比若干组样本 vs 一个参照组——2026-07-28 新增，服务"基线库(整体)
+// vs 训练集(按天)"这个场景：不重新推导任何区间/权重（跟 runWalkForwardBacktest 不一样，那个是
+// 每段都重新训练评估过拟合；这个是监控"现成、已经在用的策略"在不同数据来源/时间上表现是否
+// 一致），纯粹拿现成 factors 去打分对比。groups 用通用命名（不叫"day"）——这个函数不需要知道
+// "天"/"基线库"这些概念从哪来，调用方（FactorLab.jsx）负责用 dataSlices.js 把训练集样本按天分组
+// 后传进来，保持这个模块跟"数据按天怎么归类"解耦。
+// baselineRows：参照整体（比如基准库全部样本，不切分）；groups: [{label, rows}]（比如训练集按天）。
+// 返回 { baseline:{n,...point}, groups:[{label,n,...point,decay}] } 或 { error }。
+// decay 用跟 runWalkForwardBacktest 同一套 assessSplitDecay（两比例检验，不是固定阈值）——
+// 这里把 baseline 当"预期基准"、group 当"观察值"，group 命中率显著低于 baseline = 判定偏离。
+export function compareGroupsAgainstBaseline(baselineRows, groups, factors, winThreshold = WIN_THRESHOLD, opts = {}) {
+  const { missingPolicy = 'zero', cutoff = 0 } = opts;
+  if (!factors?.length) return { error: '因子池为空，先建好因子池再对比' };
+  if (!baselineRows?.length) return { error: '基准库没有样本（先在「数据与过滤」把部分天归为基准库）' };
+  if (!groups?.length || !groups.some(g => g.rows?.length)) {
+    return { error: '训练集没有样本（先在「数据与过滤」把部分天归为训练集）' };
+  }
+  const pointAt = rows => {
+    const bt = backtestFactors(rows, factors, winThreshold, { missingPolicy });
+    return bt.sweep.points.reduce((best, p) => (p.cut <= cutoff ? p : best), bt.sweep.points[0]);
+  };
+  const baselinePoint = pointAt(baselineRows);
+  const groupResults = groups.map(g => {
+    if (!g.rows?.length) return { label: g.label, n: 0, error: '无样本' };
+    const point = pointAt(g.rows);
+    return { label: g.label, n: g.rows.length, ...point, decay: assessSplitDecay(baselinePoint, point) };
+  });
+  return { baseline: { n: baselineRows.length, ...baselinePoint }, groups: groupResults };
 }
 
 // ---------- 与现有硬门槛策略对比 ----------
@@ -1150,87 +1355,12 @@ export function resolveCtxAccessor(rows, field) {
   const anyCtx = rows.some(r => r.rawCtx);
   return { ok: false, reason: anyCtx ? '原始 ctx 中找不到与该字段数值一致的路径' : '样本缺少原始 ctx，无法核对' };
 }
-
-// ---------- 策略打分代码生成 ----------
-// 生成强势盘 code.js 风格的自包含函数体：checks 契约兼容 StrategyReplay 回放。
-// 数值序列化要能表达 ±Infinity（JSON 做不到），所以用自定义格式化。
-function fmtNum(v) {
-  if (v === Infinity) return 'Infinity';
-  if (v === -Infinity) return '-Infinity';
-  if (!Number.isFinite(v)) return '0';
-  return String(Number(v.toPrecision(8)));
-}
-
-export function generateStrategyCode({ factors, resolved, cutoff, winThreshold = WIN_THRESHOLD, sampleN = 0,
-                                       missingPolicy = 'zero', minCoverage = 0.5 }) {
-  const included = [], excluded = [];
-  factors.forEach((f, i) => {
-    const r = resolved[i];
-    if (r && r.ok) included.push({ f, r });
-    else excluded.push({ field: f.field, reason: (r && r.reason) || '未解析' });
-  });
-  if (!included.length) return { code: null, excluded, error: '没有可映射回原始 ctx 的因子' };
-
-  const lines = [];
-  lines.push(`// 打分策略（review 回测·因子面板生成）`);
-  lines.push(`// 高倍口径: returnMax > ${winThreshold}x；样本 n=${sampleN}；触发阈值: 总分 >= ${cutoff}`);
-  if (excluded.length) {
-    lines.push(`// ⚠️ 以下因子无法映射回原始 ctx，已排除（权重未参与归一）：`);
-    for (const e of excluded) lines.push(`//    ${e.field}: ${e.reason}`);
-  }
-  lines.push(`const VERSION = 'factor-score-v1'`);
-  lines.push(`const CUTOFF = ${fmtNum(cutoff)}`);
-  lines.push(`// 按点号路径取原始 ctx 值`);
-  lines.push(`const P = (o, p) => p.split('.').reduce((a, k) => (a == null ? undefined : a[k]), o)`);
-  lines.push(`// 取值口径与回测面板一致：布尔→0/1；null/undefined/空串/非数值视为缺失(null)。缺失记 0 分——`);
-  lines.push(`// null 必须显式判（Number(null)===0），否则满分区间含 0 或开区间的因子会把缺失误打成满分。`);
-  lines.push(`const V = (x) => { if (x === null || x === undefined) return null; if (typeof x === 'boolean') return x ? 1 : 0; if (typeof x === 'string' && x.trim() === '') return null; const n = Number(x); return Number.isFinite(n) ? n : null }`);
-  lines.push(`// 梯形打分：[lo1,hi1] 满分 1，[lo0,lo1]/[hi1,hi0] 线性过渡，界外与缺失为 0`);
-  lines.push(`const trap = (x, lo0, lo1, hi1, hi0) => {`);
-  lines.push(`  if (x === null || !Number.isFinite(Number(x))) return 0`);
-  lines.push(`  const v = Number(x)`);
-  lines.push(`  if (v >= lo1 && v <= hi1) return 1`);
-  lines.push(`  if (v <= lo0 || v >= hi0) return 0`);
-  lines.push(`  if (v < lo1) { const w = lo1 - lo0; return Number.isFinite(w) && w > 0 ? (v - lo0) / w : 0 }`);
-  lines.push(`  const w = hi0 - hi1; return Number.isFinite(w) && w > 0 ? (hi0 - v) / w : 0`);
-  lines.push(`}`);
-  const needEffMcap = included.some(({ r }) => r.path === '__effMcap__');
-  if (needEffMcap) {
-    lines.push(`// mcap 合并口径与回测数据构建一致：mcap → current_mcap → fdv 按缺失回退`);
-    lines.push(`const effMcap = (() => { const a = V(P(ctx, 'logearn.mcap')); if (a !== null) return a; const b = V(P(ctx, 'logearn.current_mcap')); if (b !== null) return b; return V(P(ctx, 'logearn.fdv')) })()`);
-  }
-  lines.push(`// [名称, 路径, 倍率, 阵营符号(1=勇者阵营加分/-1=邪恶阵营减分), 权重, lo0, lo1, hi1, hi0]`);
-  lines.push(`// （倍率：gmgn 的 0-1 占比字段 ×100 成百分比，与面板一致）`);
-  lines.push(`const FACTORS = [`);
-  for (const { f, r } of included) {
-    const b = [f.lo0, f.lo1, f.hi1, f.hi0].map(fmtNum).join(', ');
-    const sign = f.camp === 'evil' ? -1 : 1;
-    lines.push(`  ['${f.field}', '${r.path}', ${r.mul}, ${sign}, ${fmtNum(f.weight)}, ${b}],`);
-  }
-  lines.push(`]`);
-  lines.push(`let total = 0, wsum = 0, wpres = 0`);
-  lines.push(`const checks = FACTORS.map(fc => {`);
-  lines.push(`  const raw = fc[1] === '__effMcap__' ? effMcap : V(P(ctx, fc[1]))`);
-  lines.push(`  const val = raw === null ? null : raw * fc[2]`);
-  lines.push(`  const hit = trap(val, fc[5], fc[6], fc[7], fc[8])`);
-  lines.push(`  const s = fc[3] * hit   // 邪恶阵营(fc[3]=-1)命中危险区 → 负分`);
-  lines.push(`  total += s * fc[4]; wsum += fc[4]; if (val !== null) wpres += fc[4]`);
-  lines.push(`  const label = fc[3] < 0 ? '危险区 ' : '满分 '`);
-  lines.push(`  return [fc[0], hit > 0, (val === null ? '缺失' : String(Number(val.toFixed(4)))) + ' → ' + (s * fc[4]).toFixed(1) + '分', label + fc[6] + '~' + fc[7] + ' 权重 ' + fc[4]]`);
-  lines.push(`})`);
-  if (missingPolicy === 'renorm') {
-    lines.push(`// 缺失口径=重归一：缺失因子不参与，按在场因子权重和归一；`);
-    lines.push(`// 在场权重不足 ${Math.round(minCoverage * 100)}% 时判 0 分（数据太残缺的盘不靠单因子拿高分）。与回测面板一致`);
-    lines.push(`const score = (wsum > 0 && wpres > 0 && wpres >= wsum * ${fmtNum(minCoverage)}) ? total / wpres * 100 : 0`);
-  } else {
-    lines.push(`// 缺失口径=记0分；总分按权重和归一到 0~100，cutoff 的含义（满分的百分之几）不随权重编辑漂移`);
-    lines.push(`const score = wsum > 0 ? total / wsum * 100 : 0`);
-  }
-  lines.push(`checks.push(['总分', score >= CUTOFF, score.toFixed(1), '>= ' + CUTOFF])`);
-  lines.push(`const head = VERSION + ' [' + ((ctx.logearn && ctx.logearn.symbol) || 'UNKNOWN') + '] 总分 ' + score.toFixed(1)`);
-  lines.push(`const detail = checks.map(c => c[0] + '(' + c[1] + '): ' + c[2] + ' [' + c[3] + ']').join('  |  ')`);
-  lines.push(`if (score < CUTOFF) { ctx.log.error('未命中 ' + head + '  ||  ' + detail); return false }`);
-  lines.push(`ctx.log.success('命中<打分> ' + head + '  ||  ' + detail)`);
-  lines.push(`return true`);
-  return { code: lines.join('\n'), excluded, includedCount: included.length };
-}
+// ---------- 策略打分代码生成：已删除（2026-07-29）----------
+// 这里原本是 `generateStrategyCode` + 它的 `fmtNum` 序列化辅助（约 85 行），把因子池渲染成一段
+// 自包含的实盘打分函数体。FactorLab 侧的「生成代码」卡片早就撤了——上线代码统一由策略侧的
+// 「生成上线代码」(lib/onlineExport.js) 出，那条路把 f('字段') 翻译成纯 native ctx 取值并逐字段自检。
+// 留着第二个生成器的代价是"缺失语义 / VETO 保留 / cutoff 同步"这三份一致性要在两处各维护一遍，
+// 而它已经无人调用（本次删除前，全项目只有它自己的两条测试在调）。
+//
+// 注意别一起删掉的：`classifyFieldOrigin` / `resolveCtxAccessor` 仍在用——FactorLab 的
+// 「有 N 个因子映射不回原始 ctx，上线后取不到值」那条上线尺度告警就靠它们，跟代码生成无关。

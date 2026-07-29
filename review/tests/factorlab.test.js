@@ -8,10 +8,12 @@ import {
   trapScore, findHotInterval, findColdInterval, deriveTrapezoid, deriveColdTrapezoid,
   splitRowsByTime, autoWeights,
   scoreRow, scoreRows, buildScoreDeciles, sweepScoreCutoffs, backtestFactors,
-  runOOSBacktest, compareWithHardGate, resolveCtxAccessor, generateStrategyCode,
+  runOOSBacktest, runWalkForwardBacktest, assessSplitDecay, compareGroupsAgainstBaseline, compareWithHardGate, resolveCtxAccessor,
   buildFactors, scanFactorCandidates, missingRate, classifyFieldOrigin, factorCorrelations,
-  factorMarginalRho, recommendCutoff, recommendFactorPath,
+  computeHeldOutDeltaRho, recommendCutoff, recommendFactorPath,
+  computeFieldRaw, assembleCampScan,
 } from '../src/lib/factorLab.js';
+import { AUC_TARGET_FIELDS } from '../src/lib/auc.js';
 import { compileStrategy, runStrategyOnRow, aggregateScoreStats, parseFactorCheck } from '../src/lib/proAnalytics.js';
 import { mergeDaily } from '../src/lib/mergeDaily.js';
 import fs from 'node:fs';
@@ -238,6 +240,120 @@ export async function run(test, testAsync) {
       assert.ok(trainLift > 1.5, `trainLift=${trainLift}`);
       assert.ok(testLift < trainLift, `test=${testLift} train=${trainLift}`);
     });
+
+    // 2026-07-28 新增 walk-forward 多段滚动：splits=1 时第 0 段应该跟 runOOSBacktest 单次切分
+    // 完全等价（同一个 trainRatio、同一份数据、同一套 backtestOneSplit 核心逻辑），验证重构没有
+    // 悄悄改变原有单次切分的行为。
+    const wf1 = await runWalkForwardBacktest(rows, ['x'], T, { bootstrapB: 60, splits: 1 });
+    test('runWalkForwardBacktest: splits=1 时应与 runOOSBacktest 单次切分等价', () => {
+      assert.ok(!wf1.error, wf1.error);
+      assert.strictEqual(wf1.folds.length, 1);
+      assert.strictEqual(wf1.folds[0].trainSize, oos.trainSize);
+      assert.strictEqual(wf1.folds[0].testSize, oos.testSize);
+      assert.strictEqual(wf1.folds[0].splitIndex, 0);
+      assert.ok(Array.isArray(wf1.folds[0].factorDecay) && wf1.folds[0].factorDecay.length === 1,
+        '应带逐因子归因(factorDecay)');
+      assert.strictEqual(wf1.folds[0].factorDecay[0].field, 'x');
+      assert.ok(Number.isFinite(wf1.folds[0].factorDecay[0].trainAuc));
+    });
+
+    // 多段（splits=3）：扩张窗口——后一段训练集应该包含前一段的验证窗口，因此严格递增。
+    const wf3 = await runWalkForwardBacktest(rows, ['x'], T, { bootstrapB: 60, splits: 3 });
+    test('runWalkForwardBacktest: splits=3 时应切出3段，训练集逐段扩张（扩张窗口）', () => {
+      assert.ok(!wf3.error, wf3.error);
+      assert.strictEqual(wf3.folds.length, 3);
+      assert.ok(wf3.folds[1].trainSize > wf3.folds[0].trainSize, '第1段训练集应比第0段大');
+      assert.ok(wf3.folds[2].trainSize > wf3.folds[1].trainSize, '第2段训练集应比第1段大');
+      // 验证窗口按时间顺序前进，互不重叠
+      assert.ok(wf3.folds[0].testEnd <= wf3.folds[1].testStart + 1, '验证窗口应按时间前后相接');
+      assert.ok(wf3.folds[1].testEnd <= wf3.folds[2].testStart + 1);
+    });
+
+    {
+      // 验证池只有 60 条，要求 splits=20 段（每段将<15条）——应该自动降到能保证每段≥15条的段数
+      const wfMany = await runWalkForwardBacktest(rows, ['x'], T, { bootstrapB: 60, splits: 20 });
+      test('runWalkForwardBacktest: 段数请求过多时自动降段，每段验证窗口≥15条', () => {
+        assert.ok(!wfMany.error, wfMany.error);
+        assert.ok(wfMany.splits < 20, `验证池只有60条，不该真的切出20段，实际 ${wfMany.splits}`);
+        assert.ok(wfMany.folds.every(f => f.testSize >= 15), '每段验证窗口应≥15条');
+      });
+    }
+  }
+
+  // ---------- assessSplitDecay：用两比例检验判断验证段是否显著衰减，替代固定阈值 ----------
+  test('assessSplitDecay: 大样本下命中率明显更低应判显著衰减', () => {
+    const train = { hit: 60, triggered: 200, hitRate: 0.3 };  // 训练段 30%
+    const test_ = { hit: 10, triggered: 200, hitRate: 0.05 }; // 验证段 5%，明显更低
+    const r = assessSplitDecay(train, test_);
+    assert.ok(!r.insufficientN);
+    assert.strictEqual(r.decayed, true);
+    assert.strictEqual(r.significant, true, `应判显著衰减，p=${r.p}`);
+  });
+  test('assessSplitDecay: 命中率相近（抽样噪声范围内）不该判显著', () => {
+    const train = { hit: 60, triggered: 200, hitRate: 0.3 };
+    const test_ = { hit: 55, triggered: 200, hitRate: 0.275 }; // 差异很小
+    const r = assessSplitDecay(train, test_);
+    assert.strictEqual(r.significant, false, `差异很小不该判显著，p=${r.p}`);
+  });
+  test('assessSplitDecay: 验证段命中率反而更高时不该判衰减', () => {
+    const train = { hit: 20, triggered: 200, hitRate: 0.1 };
+    const test_ = { hit: 40, triggered: 200, hitRate: 0.2 };
+    const r = assessSplitDecay(train, test_);
+    assert.strictEqual(r.decayed, false);
+    assert.strictEqual(r.significant, false);
+  });
+  test('assessSplitDecay: 触发数太少（<5）时应标 insufficientN，不给出判定', () => {
+    const train = { hit: 1, triggered: 3, hitRate: 1 / 3 };
+    const test_ = { hit: 0, triggered: 2, hitRate: 0 };
+    const r = assessSplitDecay(train, test_);
+    assert.strictEqual(r.insufficientN, true);
+    assert.ok(!Number.isFinite(r.p));
+    assert.strictEqual(r.significant, false, '样本不足不该报显著（宁可不下结论）');
+  });
+
+  // ---------- compareGroupsAgainstBaseline：基线库(整体) vs 训练集(按天/按组) 对比，不重训因子 ----------
+  // 用一个恒定命中区间的因子（x 固定=8，永远落在 [5,∞)，score 恒为满分）——这样 sweepAt(cutoff=0)
+  // 恒好触发全部样本，纯粹隔离测试"组 vs 基线库 命中率对比"这个逻辑，不跟区间/梯形细节纠缠。
+  {
+    const cmpFactor = [{ field: 'x', camp: 'hero', weight: 100, lo0: -Infinity, lo1: 5, hi1: Infinity, hi0: Infinity }];
+    // 用取模构造【精确】命中率，不靠 RNG 凑近似值——LCG 在小样本上离目标概率飘多少不可控，
+    // 精确取模让"命中率该判显著/不该判显著"这类边界断言可复现、不受种子选择影响。
+    const mkCmpRowsExact = (n, hitsPer100) => {
+      const out = [];
+      for (let i = 0; i < n; i++) out.push(makeRow(i, 8, (i % 100) < hitsPer100, T));
+      return out;
+    };
+    test('compareGroupsAgainstBaseline: 组命中率明显低于基线库时应判显著偏离', () => {
+      const baseline = mkCmpRowsExact(300, 30);   // 命中率精确 30%
+      const groupBad = mkCmpRowsExact(200, 5);    // 命中率精确 5%，明显更差
+      const r = compareGroupsAgainstBaseline(baseline, [{ label: 'day1', rows: groupBad }], cmpFactor, T, { cutoff: 0 });
+      assert.ok(!r.error, r.error);
+      assert.strictEqual(r.groups[0].label, 'day1');
+      assert.ok(r.groups[0].decay.significant, `应判显著偏离，p=${r.groups[0].decay.p}`);
+    });
+    test('compareGroupsAgainstBaseline: 命中率接近基线库时不该判偏离', () => {
+      const baseline = mkCmpRowsExact(300, 30);   // 命中率精确 30%
+      const groupOk = mkCmpRowsExact(250, 29);    // 命中率精确 29%，跟基线几乎一样
+      const r = compareGroupsAgainstBaseline(baseline, [{ label: 'day1', rows: groupOk }], cmpFactor, T, { cutoff: 0 });
+      assert.ok(!r.error, r.error);
+      assert.strictEqual(r.groups[0].decay.significant, false);
+    });
+    test('compareGroupsAgainstBaseline: 多组各自独立对比，互不影响', () => {
+      const baseline = mkCmpRowsExact(300, 30);
+      const g1 = mkCmpRowsExact(200, 5);          // 明显更差
+      const g2 = mkCmpRowsExact(200, 31);         // 跟基线几乎一样（还略高）
+      const r = compareGroupsAgainstBaseline(baseline, [{ label: 'd1', rows: g1 }, { label: 'd2', rows: g2 }], cmpFactor, T, { cutoff: 0 });
+      assert.strictEqual(r.groups.length, 2);
+      assert.ok(r.groups[0].decay.significant, 'd1明显更差应判显著');
+      assert.ok(!r.groups[1].decay.significant, 'd2跟基线接近（甚至更高）不该判显著');
+    });
+    test('compareGroupsAgainstBaseline: 因子池/基准库/对比组为空时应给出明确error而不是崩溃', () => {
+      const baseline = mkCmpRowsExact(300, 30);
+      assert.ok(compareGroupsAgainstBaseline(baseline, [{ label: 'd1', rows: baseline }], [], T).error, '因子池为空应报错');
+      assert.ok(compareGroupsAgainstBaseline([], [{ label: 'd1', rows: baseline }], cmpFactor, T).error, '基准库为空应报错');
+      assert.ok(compareGroupsAgainstBaseline(baseline, [], cmpFactor, T).error, '对比组为空应报错');
+      assert.ok(compareGroupsAgainstBaseline(baseline, [{ label: 'd1', rows: [] }], cmpFactor, T).error, '唯一一组也是空应报错');
+    });
   }
 
   // ---------- scanFactorCandidates / buildFactors ----------
@@ -266,28 +382,9 @@ export async function run(test, testAsync) {
       assert.ok(Math.abs(factors[0].weight - 100) < 1e-6, '单因子权重应为 100');
       assert.ok(factors[0].lo0 <= factors[0].lo1);
     });
-    test('buildFactors(区间命中): 边界=可信区间，区间内满权重、区间外 0 分、无过渡段', () => {
-      const { factors } = buildFactors(planted, scan.candidates, ['x'], T, { shape: 'interval' });
-      const f = factors[0];
-      const iv = scan.candidates[0].interval;
-      assert.strictEqual(f.lo0, iv.lo);
-      assert.strictEqual(f.lo1, iv.lo);
-      assert.strictEqual(f.hi1, iv.hi);
-      assert.strictEqual(f.hi0, iv.hi);
-      // 区间内 = 满分，区间外一点点 = 0 分（矩形，无线性过渡）
-      const mid = (Math.max(iv.lo, 0) + Math.min(iv.hi, 100)) / 2;
-      assert.strictEqual(scoreRow(makeRow(1, mid, false, T), [f]).score, 100);
-      if (Number.isFinite(iv.lo)) assert.strictEqual(scoreRow(makeRow(2, iv.lo - 0.01, false, T), [f]).score, 0);
-      if (Number.isFinite(iv.hi)) assert.strictEqual(scoreRow(makeRow(3, iv.hi + 0.01, false, T), [f]).score, 0);
-    });
-    await testAsync('runOOSBacktest: shape=interval 时训练段因子应是矩形边界', async () => {
-      // 复用 planted：时间锚点已按 id 递增
-      const oos2 = await runOOSBacktest(planted, ['x'], T, { bootstrapB: 40, shape: 'interval' });
-      assert.ok(!oos2.error, oos2.error);
-      const f = oos2.trainFactors[0];
-      assert.strictEqual(f.lo0, f.lo1);
-      assert.strictEqual(f.hi1, f.hi0);
-    });
+    // shape:'interval'（矩形边界）的两条用例随该选项一起删除（2026-07-29，见 buildFactors 注释）。
+    // trapScore 处理矩形因子的能力仍被 factorlab-fixes.test.js 的开区间/矩形用例覆盖——
+    // 从策略导入的因子就是矩形，那条路还在。
   }
 
   // ---------- 候选粗筛/配权改用 interval.score（区间感知）而不是单调AUC 的回归测试 ----------
@@ -446,6 +543,33 @@ export async function run(test, testAsync) {
       // 两者的核心区边界也应分别对应各自阵营的区间，而不是同一份
       assert.notStrictEqual(fHero[0].lo1, fEvil[0].lo1, '两个阵营对同一字段推导出的核心区应该不同');
     });
+    // 并行扫描等价性回归：「扫全部字段」搬进 worker 池后，worker 路径 = computeFieldRaw（逐字段并行）
+    // + assembleCampScan（主线程汇齐后统一做 AUC/区间的 BH 校正）。这套必须跟串行 scanFactorCandidates
+    // 逐字段【完全一致】，否则搬进 worker 会让候选/显著性判定悄悄漂移。这里锁死等价性（含目标变量
+    // returnMax 必须被两条路径同样剔除、不进候选也不进 skipped）。
+    {
+      const rnd = makeRand(20260728);
+      const parRows = [];
+      for (let i = 0; i < 400; i++) {
+        const win = rnd() < 0.3;
+        const sig = win ? 40 + rnd() * 20 : (rnd() < 0.5 ? rnd() * 40 : 60 + rnd() * 40); // 赢家聚在中段
+        const danger = win ? rnd() * 50 : 60 + rnd() * 40;                                 // 输家聚在高位
+        const noise = rnd() * 100;                                                          // 无关字段
+        parRows.push({ id: i, returnMax: win ? T + 1 + (i % 5) : 1 + rnd(), features: { sig, danger, noise } });
+      }
+      const parFields = ['sig', 'danger', 'noise', 'returnMax'];
+      const parOpts = { winThreshold: T, bootstrapB: 60, minCoverage: 0.3 };
+      for (const camp of ['hero', 'evil']) {
+        const serial = await scanFactorCandidates(parRows, parFields, { ...parOpts, camp });
+        const scanned = parFields.filter(f => !AUC_TARGET_FIELDS.has(f));
+        const viaWorkerPieces = assembleCampScan(
+          scanned.map(f => computeFieldRaw(parRows, f, { ...parOpts, camp })), camp);
+        test(`并行扫描等价性(camp=${camp}): computeFieldRaw + assembleCampScan 与 scanFactorCandidates 逐字段一致`, () => {
+          assert.ok(serial.candidates.length >= 2, '前提：应有多个可用候选参与 BH 校正');
+          assert.deepStrictEqual(viaWorkerPieces, serial);
+        });
+      }
+    }
     test('scoreRow: 邪恶阵营命中危险区应扣分（负贡献），赢家在安全区不扣分', () => {
       const winnerRow = { id: 9001, returnMax: T + 3, features: { x: 45, y: 16 } };  // x 在勇者核心区，y 安全
       const loserRow = { id: 9002, returnMax: 1, features: { x: 5, y: 82 } };        // x 不在核心区，y 深陷危险区
@@ -477,68 +601,6 @@ export async function run(test, testAsync) {
     });
   }
 
-  // ---------- 代码生成往返：混合阵营（勇者+邪恶） ----------
-  {
-    function ctxRowMixed(id, freqVol, botDegenPct) {
-      return {
-        id, tokenAddress: 'CM' + id, swapBeginTime: 3000 + id, buyTimestamp: 4000 + id, returnMax: 2,
-        features: {
-          ...(freqVol !== undefined ? { frequent_volume: freqVol } : {}),
-          ...(botDegenPct !== undefined ? { 'gmgn.stat.bot_degen_rate': botDegenPct } : {}),
-        },
-        rawCtx: {
-          gmgn: { stat: { bot_degen_rate: botDegenPct !== undefined ? botDegenPct / 100 : undefined } },
-          logearn: { frequent_volume: freqVol, symbol: 'MIX' },
-        },
-      };
-    }
-    const mixedFactorsGen = [
-      { field: 'frequent_volume', camp: 'hero', weight: 60, lo0: 5, lo1: 10, hi1: 20, hi0: 30 },
-      { field: 'gmgn.stat.bot_degen_rate', camp: 'evil', weight: 40, lo0: 30, lo1: 50, hi1: Infinity, hi0: Infinity },
-    ];
-    const r6 = makeRand(55);
-    const mixRows = [];
-    for (let i = 0; i < 30; i++) mixRows.push(ctxRowMixed(i, r6() * 40, r6() * 100));
-    mixRows.push(ctxRowMixed(99, undefined, undefined)); // 两项都缺失
-    const resolvedMixed = mixedFactorsGen.map(f => resolveCtxAccessor(mixRows, f.field));
-    const genMixed = generateStrategyCode({ factors: mixedFactorsGen, resolved: resolvedMixed, cutoff: 30, winThreshold: T, sampleN: mixRows.length });
-    test('generateStrategyCode(混合阵营): 应生成代码，邪恶阵营因子标记「危险区」而非「满分」', () => {
-      assert.ok(genMixed.code, genMixed.error);
-      assert.ok(genMixed.code.includes('危险区'), '邪恶阵营因子的 expect 文案应带「危险区」前缀');
-    });
-    const compiledMixed = compileStrategy(genMixed.code);
-    test('generateStrategyCode(混合阵营): 生成代码可编译', () => {
-      assert.ok(!compiledMixed.error, compiledMixed.error);
-    });
-    test('往返一致（混合阵营）：面板 scoreRow（含负分）≡ 生成代码回放，逐行一致', () => {
-      for (const row of mixRows) {
-        const panelScore = scoreRow(row, mixedFactorsGen).score;
-        const res = runStrategyOnRow(compiledMixed, row);
-        assert.ok(!res.error, `回放报错: ${res.error}`);
-        assert.strictEqual(res.passed, panelScore >= 30,
-          `row ${row.id}: 面板分 ${panelScore.toFixed(2)}，回放 passed=${res.passed}`);
-        const totalCheck = res.checks[res.checks.length - 1];
-        assert.strictEqual(totalCheck.value, panelScore.toFixed(1),
-          `row ${row.id}: 面板 ${panelScore.toFixed(1)} vs 回放 ${totalCheck.value}`);
-      }
-    });
-    test('往返一致（混合阵营）：邪恶阵营命中危险区时，生成代码里该项贡献应为负', () => {
-      const dangerRow = ctxRowMixed(201, 15, 80); // botDegen 80% 深陷危险区(lo1=50~Infinity 满分核)
-      const res = runStrategyOnRow(compiledMixed, dangerRow);
-      const evilCheck = res.checks.find(c => c.name.includes('bot_degen_rate'));
-      assert.ok(evilCheck, '应能找到邪恶阵营的 check');
-      assert.ok(/→ -[\d.]+分/.test(evilCheck.value), `邪恶阵营命中危险区应显示负分，实际: ${evilCheck.value}`);
-    });
-    test('aggregateScoreStats（混合阵营）：能从生成代码回放里正确识别两个阵营的因子', () => {
-      const results = mixRows.map(row => ({ input: row.tokenAddress, row, res: runStrategyOnRow(compiledMixed, row) }));
-      const sa = aggregateScoreStats(results, T);
-      assert.ok(sa, '应识别为打分版');
-      const heroF = sa.factors.find(f => f.name.includes('frequent_volume'));
-      const evilF = sa.factors.find(f => f.name.includes('bot_degen_rate'));
-      assert.strictEqual(heroF.camp, 'hero');
-      assert.strictEqual(evilF.camp, 'evil');
-    });
-  }
 
   test('missingRate: 缺失比例验算', () => {
     const rows = [makeRow(1, 5, false, T), makeRow(2, undefined, false, T),
@@ -612,81 +674,14 @@ export async function run(test, testAsync) {
     assert.ok(!r.ok && r.reason.includes('ctx'), r.reason);
   });
 
-  // ---------- 代码生成往返（最重要）----------
-  {
-    const factors = [
-      { field: 'gmgn.stat.top_rat_trader_percentage', weight: 60, lo0: -Infinity, lo1: -Infinity, hi1: 5, hi0: 10 },
-      { field: 'frequent_volume', weight: 40, lo0: 5, lo1: 10, hi1: 20, hi0: 30 },
-    ];
-    const r5 = makeRand(77);
-    const rtRows = [];
-    for (let i = 0; i < 40; i++) rtRows.push(ctxRow(i, r5() * 15, r5() * 40));
-    // 一行两个字段都缺失：面板与生成代码都必须记 0 分
-    rtRows.push(ctxRow(99, undefined, undefined));
-    const resolved = factors.map(f => resolveCtxAccessor(rtRows, f.field));
-    const gen = generateStrategyCode({ factors, resolved, cutoff: 60, winThreshold: T, sampleN: rtRows.length });
-    test('generateStrategyCode: 全部因子可解析时应生成代码且无排除项', () => {
-      assert.ok(gen.code, gen.error);
-      assert.strictEqual(gen.excluded.length, 0);
-      assert.ok(gen.code.includes('const checks'), 'checks 契约（StrategyReplay 回放依赖）');
-    });
-    const compiled = compileStrategy(gen.code);
-    test('generateStrategyCode: 生成代码应能被 compileStrategy 编译', () => {
-      assert.ok(!compiled.error, compiled.error);
-    });
-    test('往返一致：生成代码的命中判定 ≡ 面板 scoreRow >= cutoff（含缺失行）', () => {
-      for (const row of rtRows) {
-        const panelScore = scoreRow(row, factors).score;
-        const res = runStrategyOnRow(compiled, row);
-        assert.ok(!res.error, `回放报错: ${res.error}`);
-        assert.strictEqual(res.passed, panelScore >= 60,
-          `row ${row.id}: 面板分 ${panelScore.toFixed(2)}，回放 passed=${res.passed}`);
-        // 总分数值也要对得上（末尾那条"总分"check）
-        const totalCheck = res.checks[res.checks.length - 1];
-        assert.strictEqual(totalCheck.name, '总分');
-        assert.strictEqual(totalCheck.value, panelScore.toFixed(1),
-          `row ${row.id}: 面板 ${panelScore.toFixed(1)} vs 回放 ${totalCheck.value}`);
-      }
-    });
-    test('往返一致（回归）：原始 ctx 里显式 null 的字段必须按缺失记 0 分，不能被 Number(null)=0 蒙混', () => {
-      // 真实快照的缺失字段就是显式 null；开区间因子（lo1=-∞）遇到 0 会得满分，此处必须为 0 分
-      const row = ctxRow(101, undefined, 15);
-      row.rawCtx.gmgn.stat.top_rat_trader_percentage = null;
-      delete row.features['gmgn.stat.top_rat_trader_percentage'];
-      const panelScore = scoreRow(row, factors).score;
-      assert.ok(Math.abs(panelScore - 40) < 1e-6, `面板分应只有 frequent_volume 的 40，实际 ${panelScore}`);
-      const res = runStrategyOnRow(compiled, row);
-      assert.ok(!res.error, res.error);
-      assert.strictEqual(res.passed, false, 'null 字段被打了分：生成代码把缺失当成了 0');
-      assert.strictEqual(res.checks[res.checks.length - 1].value, panelScore.toFixed(1));
-    });
-    test('往返一致（renorm）：缺失重归一口径下，生成代码与面板打分逐行一致', () => {
-      const genR = generateStrategyCode({ factors, resolved, cutoff: 60, winThreshold: T,
-                                          sampleN: rtRows.length, missingPolicy: 'renorm' });
-      assert.ok(genR.code, genR.error);
-      assert.ok(genR.code.includes('重归一'), '生成代码应注明重归一口径');
-      const compR = compileStrategy(genR.code);
-      assert.ok(!compR.error, compR.error);
-      // 造几行缺失样本：缺 frequent_volume（40 权重缺席，覆盖 60% 仍够）
-      const extra = [ctxRow(201, 4, undefined), ctxRow(202, 12, undefined), ctxRow(203, undefined, 15)];
-      for (const row of [...rtRows, ...extra]) {
-        const panel = scoreRow(row, factors, { missingPolicy: 'renorm' }).score;
-        const res = runStrategyOnRow(compR, row);
-        assert.ok(!res.error, res.error);
-        assert.strictEqual(res.passed, panel >= 60, `row ${row.id}: 面板 ${panel.toFixed(2)} 回放 ${res.passed}`);
-        assert.strictEqual(res.checks[res.checks.length - 1].value, panel.toFixed(1), `row ${row.id}`);
-      }
-    });
-    test('generateStrategyCode: 不可解析因子应被排除并列出原因，剩余因子照常生成', () => {
-      const f3 = [...factors, { field: 'buy_sell_amount_ratio', weight: 20, lo0: 0, lo1: 1, hi1: 2, hi0: 3 }];
-      const res3 = f3.map(f => resolveCtxAccessor(rtRows, f.field));
-      const gen3 = generateStrategyCode({ factors: f3, resolved: res3, cutoff: 60, winThreshold: T, sampleN: 1 });
-      assert.strictEqual(gen3.excluded.length, 1);
-      assert.strictEqual(gen3.excluded[0].field, 'buy_sell_amount_ratio');
-      assert.ok(gen3.code.includes('buy_sell_amount_ratio: '), '排除原因应写进头部注释');
-      assert.ok(!compileStrategy(gen3.code).error);
-    });
-  }
+  // ---------- 代码生成往返：已随 generateStrategyCode 一起删除（2026-07-29）----------
+  // 这里原本有两组共约 130 行的往返用例（普通阵营 / 混合阵营）：生成代码 → compileStrategy 编译 →
+  // 逐行回放，断言"回放总分 ≡ 面板 scoreRow"。被测函数 generateStrategyCode 已删除（上线代码统一
+  // 由策略侧 lib/onlineExport.js 生成），用例随之移除。
+  // 这两组用例顺带覆盖到的东西，都另有直接用例守着，没有留下缺口：
+  //   · scoreRow 的缺失记 0 分 / 权重归一 / 邪恶阵营负分 —— 见本文件 'scoreRow: ...' 三条；
+  //   · 从 checks 文案反解阵营 —— 见 strategy-replay-logic 的 parseFactorCheck 用例；
+  //   · 线上代码生成本身 —— 见 tests/online-export.test.js。
 
   // ---------- compareWithHardGate ----------
   test('compareWithHardGate: 三组统计验算', () => {
@@ -724,75 +719,88 @@ export async function run(test, testAsync) {
     assert.strictEqual(factorCorrelations(rows, ['a', 'b']).length, 0);
   });
 
-  // ---------- factorMarginalRho（P2-2：候选字段进池后对 score↔returnMax ρ 的边际贡献）----------
+  // ---------- computeHeldOutDeltaRho（边际ρ 的【唯一】口径：train 推边界、test 读增量）----------
+  // 2026-07-29：这一组用例原本测的是样本内版 factorMarginalRho，那个函数已删除——候选表按钮、
+  // 「算推荐」预筛、置换零分布三处统一走这一个函数，不再有第二套"边际ρ"。
   {
     // 复用 planted：field 'x' 在 [30,60] 集中高倍信号；额外造一个与 x 完全重复的字段 'xDup'，
     // 用来验证"信息重叠时边际贡献应趋近 0"（即便它自己单独进池的边际贡献不小）。
     const plantedDup = planted.map(r => ({ ...r, features: { x: r.features.x, xDup: r.features.x } }));
 
-    await testAsync('factorMarginalRho: 空因子池时，候选自己进池应给出正的边际贡献（withCandidate=delta）', async () => {
+    await testAsync('computeHeldOutDeltaRho: 空因子池时，候选自己进池应给出正的验证段增量（deltaTest=withTest）', async () => {
       const scan = await scanFactorCandidates(plantedDup, ['x'], { winThreshold: T, bootstrapB: 60 });
       const c = scan.candidates[0];
       assert.ok(c.interval, 'x 应挖出可信区间');
-      const res = factorMarginalRho(plantedDup, [], c, 'hero', T);
+      const res = computeHeldOutDeltaRho(plantedDup, [], c, 'hero', T);
       assert.ok(!res.error, res.error);
-      assert.ok(!Number.isFinite(res.baseline), `空池 baseline 应为 NaN，实际 ${res.baseline}`);
-      assert.ok(Number.isFinite(res.withCandidate) && res.withCandidate > 0, `withCandidate=${res.withCandidate}`);
-      assert.strictEqual(res.delta, res.withCandidate);
+      assert.ok(!Number.isFinite(res.baselineTest), `空池 baselineTest 应为 NaN，实际 ${res.baselineTest}`);
+      assert.ok(Number.isFinite(res.withTest) && res.withTest > 0, `withTest=${res.withTest}`);
+      assert.strictEqual(res.deltaTest, res.withTest);
+      assert.ok(res.nTrain > 0 && res.nTest > 0, `切分应给出两段：nTrain=${res.nTrain} nTest=${res.nTest}`);
     });
 
-    await testAsync('factorMarginalRho: 候选与已选因子信息完全重叠时，边际贡献应远小于其独立进池的贡献', async () => {
+    await testAsync('computeHeldOutDeltaRho: 候选与已选因子信息完全重叠时，验证段边际贡献应远小于其独立进池的贡献', async () => {
       const scan = await scanFactorCandidates(plantedDup, ['x', 'xDup'], { winThreshold: T, bootstrapB: 60 });
       const cx = scan.candidates.find(c => c.field === 'x');
       const cDup = scan.candidates.find(c => c.field === 'xDup');
       assert.ok(cx.interval && cDup.interval);
       const { factors: poolWithX } = buildFactors(plantedDup, [cx], [{ field: 'x', camp: 'hero' }], T);
-      const alone = factorMarginalRho(plantedDup, [], cDup, 'hero', T);
-      const withXInPool = factorMarginalRho(plantedDup, poolWithX, cDup, 'hero', T);
-      assert.ok(Number.isFinite(alone.delta) && alone.delta > 0.05, `alone.delta=${alone.delta}`);
-      assert.ok(Number.isFinite(withXInPool.delta), `withXInPool.delta=${withXInPool.delta}`);
-      assert.ok(withXInPool.delta < alone.delta * 0.5,
-        `重复字段的边际贡献应显著小于独立贡献：alone=${alone.delta} withPool=${withXInPool.delta}`);
+      const alone = computeHeldOutDeltaRho(plantedDup, [], cDup, 'hero', T);
+      const withXInPool = computeHeldOutDeltaRho(plantedDup, poolWithX, cDup, 'hero', T);
+      assert.ok(Number.isFinite(alone.deltaTest) && alone.deltaTest > 0.05, `alone.deltaTest=${alone.deltaTest}`);
+      assert.ok(Number.isFinite(withXInPool.deltaTest), `withXInPool.deltaTest=${withXInPool.deltaTest}`);
+      assert.ok(withXInPool.deltaTest < alone.deltaTest * 0.5,
+        `重复字段的边际贡献应显著小于独立贡献：alone=${alone.deltaTest} withPool=${withXInPool.deltaTest}`);
     });
 
-    test('factorMarginalRho: 无可信区间的候选应报错而不是抛异常', () => {
-      const res = factorMarginalRho(plantedDup, [], { field: 'x', interval: null }, 'hero', T);
+    test('computeHeldOutDeltaRho: 无可信区间的候选应报错而不是抛异常', () => {
+      const res = computeHeldOutDeltaRho(plantedDup, [], { field: 'x', interval: null }, 'hero', T);
       assert.ok(res.error);
     });
 
     // 残差挖掘：候选的 .interval 是在残差子集（这里用前一半样本模拟）上挖出来的，
-    // opts.buildRows 必须传同一份子集去推梯形边界，ρ 仍在全体（plantedDup）上评估。
-    await testAsync('factorMarginalRho: opts.buildRows 用于推导梯形边界，rows 仍用于评估全局 ρ', async () => {
+    // opts.buildRows 必须传同一份子集去推梯形边界，ρ 仍在全体（plantedDup）的 train/test 上评估。
+    await testAsync('computeHeldOutDeltaRho: opts.buildRows 用于推导梯形边界，rows 仍用于 train/test 评估', async () => {
       const half = plantedDup.slice(0, 150);
       const scan = await scanFactorCandidates(half, ['x'], { winThreshold: T, bootstrapB: 60 });
       const c = scan.candidates[0];
       assert.ok(c.interval, '子集上 x 应挖出可信区间');
-      const res = factorMarginalRho(plantedDup, [], c, 'hero', T, { buildRows: half });
+      const res = computeHeldOutDeltaRho(plantedDup, [], c, 'hero', T, { buildRows: half });
       assert.ok(!res.error, res.error);
-      assert.ok(Number.isFinite(res.withCandidate), `withCandidate=${res.withCandidate}`);
-      // 不传 buildRows 时默认退化为用 rows（全体）推导，同样不应报错
-      const resDefault = factorMarginalRho(plantedDup, [], c, 'hero', T);
+      assert.ok(Number.isFinite(res.deltaTest), `deltaTest=${res.deltaTest}`);
+      assert.strictEqual(res.nTest, plantedDup.length - Math.round(plantedDup.length * 0.7),
+        'buildRows 只影响边界推导，评估切分仍按 rows 来');
+      // 不传 buildRows 时默认用 rows 的 train 段推导，同样不应报错
+      const resDefault = computeHeldOutDeltaRho(plantedDup, [], c, 'hero', T);
       assert.ok(!resDefault.error, resDefault.error);
+    });
+
+    // 泄漏回归：buildRows 也必须按同一把尺子切一刀、只用它的 train 段推边界。
+    // 构造一份 buildRows，其【训练段】该字段全缺失——只有"偷偷用了全量 buildRows（含验证段）"
+    // 才能推出边界；正确实现必须报错。这是"边界看过验证段、deltaTest 不再是 held-out"的守门用例。
+    await testAsync('computeHeldOutDeltaRho: buildRows 只取 train 段推边界（训练段无值时报错，不偷用验证段）', async () => {
+      const scan = await scanFactorCandidates(plantedDup, ['x'], { winThreshold: T, bootstrapB: 60 });
+      const c = scan.candidates[0];
+      const cut = Math.round(plantedDup.length * 0.7);
+      // 按 swapBeginTime 升序即原序（makeRow 里 swapBeginTime=1000+id），前 70% 抹掉 x
+      const trainBlind = plantedDup.map((r, i) => (i < cut ? { ...r, features: { ...r.features, x: null } } : r));
+      const res = computeHeldOutDeltaRho(plantedDup, [], c, 'hero', T, { buildRows: trainBlind });
+      assert.ok(res.error, `训练段推不出边界时必须报错，实际拿到 deltaTest=${res.deltaTest}`);
     });
   }
 
-  // ---------- 缺失重归一（missingPolicy: renorm）----------
+  // ---------- 缺失口径：只剩"记 0 分"一种 ----------
+  // 原来这里有两条 missingPolicy:'renorm' 用例，随该口径一起删除（2026-07-29，见 scoreRow 注释：
+  // onlineExport 没有对应实现，选中它回测和线上就系统性错位）。缺失记 0 分的行为由
+  // 'scoreRow: 满分核 100 分，过渡段 50 分，缺失 0 分' 那条守着。
   {
     const fA = { field: 'a', weight: 60, lo0: 0, lo1: 10, hi1: 20, hi0: 30 };
     const fB = { field: 'b', weight: 40, lo0: 0, lo1: 10, hi1: 20, hi0: 30 };
-    const renorm = { missingPolicy: 'renorm' };
-    test('scoreRow(renorm): 缺失因子不参与，按在场权重归一', () => {
+    test('scoreRow: 缺失因子的权重仍留在分母里（这正是"惩罚数据不全的盘"的含义）', () => {
       const full = { id: 1, returnMax: 1, features: { a: 15, b: 5 } };   // a 满分, b 半分
-      assert.strictEqual(scoreRow(full, [fA, fB], renorm).score, 80);    // (60+20)/100
+      assert.strictEqual(scoreRow(full, [fA, fB]).score, 80);            // (60+20)/100
       const missB = { id: 2, returnMax: 1, features: { a: 15 } };
-      assert.strictEqual(scoreRow(missB, [fA, fB], renorm).score, 100);  // 只按 a 归一
-      assert.strictEqual(scoreRow(missB, [fA, fB]).score, 60);           // zero 口径对照
-    });
-    test('scoreRow(renorm): 在场权重不足 50% 判 0 分（防单因子撑高分）', () => {
-      const missA = { id: 3, returnMax: 1, features: { b: 15 } };        // 只剩 40 权重在场
-      const r = scoreRow(missA, [fA, fB], renorm);
-      assert.strictEqual(r.score, 0);
-      assert.strictEqual(r.lowCoverage, true);
+      assert.strictEqual(scoreRow(missB, [fA, fB]).score, 60);           // b 缺失，60/100 而不是 100
     });
   }
 

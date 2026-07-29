@@ -1,13 +1,15 @@
-// 差分测试：recommendBreakpoints / mineBreakpointsOOS / scanFieldsForPeaks 三个函数
+// 差分测试：recommendBreakpoints / mineBreakpointsOOS 两个函数
 // 在搬运时改了签名（全局 activeRows / scatterOptions / currentWinThreshold → 入参），
 // 不再是逐字节机械搬运，所以必须证明"签名变了但行为没变"：
 // 同一份数据分别喂给旧版（vm 里设好全局）和新版（参数传入），断言输出一致。
+// 2026-07-29：scanFieldsForPeaks 差分测试已删——该函数只服务已删除的"波峰扫描"面板
+// （见 src/ui/FieldHealth.jsx），随之一并删除。
 import assert from 'node:assert';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { recommendBreakpoints, mineBreakpointsOOS, scanFieldsForPeaks, calibrateOOSMining } from '../src/lib/analytics.js';
+import { recommendBreakpoints, mineBreakpointsOOS, calibrateOOSMining } from '../src/lib/analytics.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -31,9 +33,8 @@ function loadLegacyAnalytics(rows, candidateFields, winThreshold) {
     return lines.slice(i, e).join('\n');
   };
   // 这几个函数依赖的其它纯函数也要一起放进去
-  for (const n of ['binLabel', 'parseBreakpoints', 'requiredPermN', 'minDetectableDiff',
-                   'longestAboveRun', 'permutationPeakTest', 'winRateOf',
-                   'recommendBreakpoints', 'mineBreakpointsOOS', 'scanFieldsForPeaks']) {
+  for (const n of ['binLabel', 'parseBreakpoints', 'minDetectableDiff', 'winRateOf',
+                   'recommendBreakpoints', 'mineBreakpointsOOS']) {
     vm.runInContext(pick(n), sandbox, { filename: n });
   }
   return sandbox;
@@ -92,23 +93,6 @@ export function run(test) {
       const n = mineBreakpointsOOS(rows, field, 'returnMax', 20);
       assert.deepStrictEqual(sameDeep(o, n), [], `${field} 结果不一致`);
     }
-  });
-
-  test('差分：scanFieldsForPeaks 改签名后结果应与旧版一致', () => {
-    const rows = fixture();
-    const cands = ['sig', 'noise', 'few'];
-    const legacy = loadLegacyAnalytics(rows, cands, 2);
-    // 置换检验用到随机数，两侧必须喂同一个序列才可比 —— 把 Math.random 同时钉成确定序列
-    const mkRnd = () => { let s = 7; return () => (s = (s * 1103515245 + 12345) % 2147483648) / 2147483648; };
-    const realRandom = Math.random;
-    let r1 = mkRnd(); legacy.Math = Object.create(Math); legacy.Math.random = () => r1();
-    vm.runInContext('Math.random = globalThis.__r', Object.assign(legacy, { __r: () => r1() }));
-    let r2 = mkRnd(); Math.random = () => r2();
-    try {
-      const o = legacy.scanFieldsForPeaks('returnMax', 'trusted', 100);
-      const n = scanFieldsForPeaks(rows, cands, 'returnMax', 100, 2);
-      assert.deepStrictEqual(sameDeep(o, n), [], '结果不一致');
-    } finally { Math.random = realRandom; }
   });
 
   test('calibrateOOSMining: 应能把真信号和纯噪声区分开', () => {

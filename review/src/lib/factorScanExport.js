@@ -15,15 +15,21 @@ const fmtPct = v => (Number.isFinite(v) ? (v * 100).toFixed(1) + '%' : '-');
 const verdictText = c => (c.significantAdj ? '校正后显著' : c.significant ? '仅未校正显著' : '不显著');
 const directionText = d => (d === 'high' ? '值大更好' : d === 'low' ? '值小更好' : '-');
 
+// 边际ρ 导出两列而不是一列：test 是挑因子的判据，train 单独列出来是为了让"train 涨、test 不涨"
+// 这种过拟合候选在表格/AI 眼里也一眼可辨——只给一个数看不出这层。
 const COLUMNS = [
-  '阵营', '字段', '含义', '方向', 'AUC', 'CI下', 'CI上', '判定', 'pAdj', '边际ρ贡献',
+  '阵营', '字段', '含义', '方向', 'AUC', 'CI下', 'CI上', '判定', 'pAdj', '边际ρ(test)', '边际ρ(train)',
   '集中区间', 'lift', 'coverage', '区间n', 'pos', '总n', '缺失率',
 ];
 
 // 单条候选 → 一行（数组），camp 决定阵营中文名
 function candidateRow(c, camp, { getDesc, getMarginal }) {
-  const m = getMarginal ? getMarginal(c.field) : undefined;
-  const marginal = m && Number.isFinite(m.delta) ? m.delta.toFixed(3) : '';
+  // 带 camp 取：同一字段在两个阵营各有一份边际贡献（见 useFactorScan 的 getMarginal），
+  // 只按字段名取会把邪恶那份的数导进勇者那几行。
+  const m = getMarginal ? getMarginal(c.field, camp) : undefined;
+  const fmtDelta = v => (Number.isFinite(v) ? v.toFixed(3) : '');
+  const marginalTest = fmtDelta(m?.deltaTest);
+  const marginalTrain = fmtDelta(m?.deltaTrain);
   const iv = c.interval;
   return [
     camp === 'evil' ? '邪恶' : '勇者',
@@ -35,7 +41,8 @@ function candidateRow(c, camp, { getDesc, getMarginal }) {
     Array.isArray(c.ci) ? fmtBound(c.ci[1]) : '-',
     verdictText(c),
     Number.isFinite(c.pAdj) ? c.pAdj.toExponential(2) : '-',
-    marginal,
+    marginalTest,
+    marginalTrain,
     fmtInterval(iv),
     iv && Number.isFinite(iv.lift) ? iv.lift.toFixed(2) : '-',
     iv && Number.isFinite(iv.coverage) ? fmtPct(iv.coverage) : '-',
@@ -48,7 +55,7 @@ function candidateRow(c, camp, { getDesc, getMarginal }) {
 
 // 把若干阵营的候选清单合并导出成 TSV。
 // camps: [{ camp: 'hero'|'evil', list: candidate[] }, ...]
-// opts: { getDesc(field)->string, getMarginal(field)->{delta}|undefined, meta?: string }
+// opts: { getDesc(field)->string, getMarginal(field,camp)->{deltaTest,deltaTrain}|undefined, meta?: string }
 // meta 会作为顶部注释行（# 开头），比如"高倍阈值=3x，样本=1234"，方便留档/发给 AI 时带上下文。
 export function buildCandidateExportTsv(camps, opts = {}) {
   const { getDesc, getMarginal, meta } = opts;

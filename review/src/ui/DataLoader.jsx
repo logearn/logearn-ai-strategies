@@ -18,7 +18,7 @@ const shortId = id => (id && id !== UNKNOWN_ID && id.length > 12 ? id.slice(0, 8
 
 const storageLabel = backend => (backend === 'fs' ? '本地文件夹' : '浏览器内置数据库');
 
-export default function DataLoader({ onRows }) {
+export default function DataLoader({ onRows, onArchiveChange }) {
   // 只留一个上传入口——calls/snapshots 不用用户自己分拣，靠 detectFileKind 看 JSON 内容形状识别。
   // files 存 antd Upload 自己的 UploadFile 对象（{uid, name, originFileObj, ...}），走官方推荐的
   // onChange 受控写法。
@@ -58,6 +58,14 @@ export default function DataLoader({ onRows }) {
   // 数据源管理（批次/文件夹归档）默认折叠——有持久化作用域时会自动载入训练集/基准库，让切片成为主体；
   // 没有作用域（首次使用）则展开，方便选数据。
   const [showArchive, setShowArchive] = useState(() => !loadSliceScope());
+
+  // allRows/sliceCats（全量样本 + 天→类别归类表）本来只在这个组件内部用——FactorLab 想做
+  // "基线库整体 vs 训练集按天" 对比，需要不受当前 sliceSel（分析范围）影响、独立拿到这两样东西。
+  // 用一个 effect 统一往上抛，比在每个 setAllRows/setSliceCats 调用点都手动通知一遍更不容易漏。
+  useEffect(() => {
+    if (typeof onArchiveChange === 'function') onArchiveChange({ allRows, sliceCats });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allRows, sliceCats]);
 
   const store = backend === 'fs' ? fsStore : idbStore;
   const refreshBatches = () => store.listBatches().then(setBatches).catch(() => setStoreOk(false));

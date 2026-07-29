@@ -1,5 +1,6 @@
 import assert from 'node:assert';
-import { excludeFactor, unexcludeFactor, isFactorExcluded, filterExcluded } from '../src/lib/factorExclusions.js';
+import { excludeFactor, unexcludeFactor, isFactorExcluded, filterExcluded,
+         restoreAllExcluded, sortExclusionsByRecency } from '../src/lib/factorExclusions.js';
 
 export function run(test) {
   test('excludeFactor: 加入排除清单，重复排除同一 camp+field 不产生重复条目', () => {
@@ -48,5 +49,46 @@ export function run(test) {
   test('filterExcluded: 排除清单为空时应原样返回（不做无意义的数组拷贝判断影响正确性）', () => {
     const fields = ['a', 'b'];
     assert.deepStrictEqual(filterExcluded(fields, [], 'hero'), fields);
+  });
+
+  test('restoreAllExcluded: 一键恢复只清空指定阵营，不影响另一阵营', () => {
+    let list = excludeFactor([], { camp: 'hero', field: 'a' });
+    list = excludeFactor(list, { camp: 'hero', field: 'b' });
+    list = excludeFactor(list, { camp: 'evil', field: 'c' });
+    const next = restoreAllExcluded(list, 'hero');
+    assert.strictEqual(next.length, 1);
+    assert.strictEqual(next[0].field, 'c');
+    assert.strictEqual(next[0].camp, 'evil');
+  });
+
+  test('restoreAllExcluded: 该阵营本来就没有排除项时应原样返回空结果，不报错', () => {
+    const list = excludeFactor([], { camp: 'evil', field: 'x' });
+    assert.deepStrictEqual(restoreAllExcluded(list, 'hero'), list, '恢复一个没有排除项的阵营不该动到别的阵营');
+  });
+
+  test('sortExclusionsByRecency: 按排除时间新→旧排序，最近排除的排最前', () => {
+    const list = [
+      { camp: 'hero', field: 'old', excludedAt: 1000 },
+      { camp: 'hero', field: 'newest', excludedAt: 3000 },
+      { camp: 'hero', field: 'mid', excludedAt: 2000 },
+    ];
+    const sorted = sortExclusionsByRecency(list);
+    assert.deepStrictEqual(sorted.map(x => x.field), ['newest', 'mid', 'old']);
+  });
+
+  test('sortExclusionsByRecency: 不改动原数组（返回新数组）', () => {
+    const list = [{ camp: 'hero', field: 'a', excludedAt: 1 }, { camp: 'hero', field: 'b', excludedAt: 2 }];
+    const original = [...list];
+    sortExclusionsByRecency(list);
+    assert.deepStrictEqual(list, original, '排序不该 mutate 传入的原数组');
+  });
+
+  test('sortExclusionsByRecency: 真实场景——先排除 a 再排除 b，b(更晚)应排在 a 前面', () => {
+    let list = excludeFactor([], { camp: 'hero', field: 'a' });
+    // 模拟时间流逝：确保第二条的 excludedAt 严格更大（真实场景里 Date.now() 两次调用间隔够长）
+    list = list.map(x => ({ ...x, excludedAt: 1000 }));
+    list = excludeFactor(list, { camp: 'hero', field: 'b' }).map(x => x.field === 'b' ? { ...x, excludedAt: 2000 } : x);
+    const sorted = sortExclusionsByRecency(list);
+    assert.deepStrictEqual(sorted.map(x => x.field), ['b', 'a'], '后排除的 b 应该排在先排除的 a 前面');
   });
 }

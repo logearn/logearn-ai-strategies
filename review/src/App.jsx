@@ -17,7 +17,6 @@ import { loadCampLibrary, saveCampLibrary, addCampEntry, removeCampEntry, remove
 import CampLibrary from './ui/CampLibrary.jsx';
 import CorrTable from './ui/CorrTable.jsx';
 import BinBarCard from './ui/BinBarCard.jsx';
-import AucPanel from './ui/AucPanel.jsx';
 import FieldHealth from './ui/FieldHealth.jsx';
 import StrategyReplay from './ui/StrategyReplay.jsx';
 import BacktestReports from './ui/strategyReplay/BacktestReports.jsx';
@@ -25,6 +24,7 @@ import CustomFields from './ui/CustomFields.jsx';
 import FieldBrowser from './ui/FieldBrowser.jsx';
 import ScatterBoard from './ui/ScatterBoard.jsx';
 import FactorLab from './ui/FactorLab.jsx';
+import PerfMonitor from './ui/PerfMonitor.jsx';
 import { isNonAnalyticField, getFeature, ROW_LEVEL_FIELDS } from './lib/data.js';
 import { compileStrategy, runStrategyOnRow, parseFactorCheck } from './lib/proAnalytics.js';
 
@@ -39,7 +39,10 @@ function loadStrategyCode() {
   try { return localStorage.getItem(STRATEGY_CODE_KEY) || ''; } catch { return ''; }
 }
 
-// 「找因子」tab 合并了 FactorLab 内部好几张卡片 + 散点/相关性/AUC/字段体检/分箱共 9 张卡片，
+// 「找因子」tab 合并了 FactorLab 内部好几张卡片 + 散点/相关性/共线性体检/分箱共 8 张卡片
+// （AUC 批量检测、字段体检里的波峰扫描已删——前者跟 FactorLab 候选表已有的 AUC 列重复，且
+// SOP 明写"别按 AUC 挑因子"；后者是纯只读发现工具，结果不接回任何后续步骤，FactorLab 自己的
+// findHotInterval 已经在做同一件事、还更严谨。字段体检现在只剩 VIF 共线性诊断，其它工具都没有），
 // 纵向堆叠很长，靠滚轮翻找成本高。给一条吸顶的锚点导航条，点了平滑滚动到对应卡片——
 // 目标 id 有的在 FactorLab 内部（因子池为空/未回测时那几个 id 不存在于 DOM），
 // 找不到就静默不跳，不报错。
@@ -97,6 +100,10 @@ export default function App() {
   // 导入批次重复记录这类脏数据，标垃圾只是不算赢家但样本还在，得靠这层再筛掉一次。
   const [excludedTokens, setExcludedTokens] = useState(loadExcludedTokens);
   const workingRows = useMemo(() => filterExcludedTokens(labeledRows, excludedTokens), [labeledRows, excludedTokens]);
+  // 全量样本 + 天→类别归类表（基准库/训练集，见 lib/dataSlices.js）——DataLoader 内部本来就有，
+  // 这里接住往下传给 FactorLab，让"基线库 vs 训练集按天"对比不受当前分析范围（sliceSel）影响，
+  // 独立从归类表里现分基准库/训练集。
+  const [archive, setArchive] = useState({ allRows: [], sliceCats: {} });
   // 标注变化后：没在过滤态就直接用最新的 workingRows 当工作集
   React.useEffect(() => { if (!filtered) setActiveRows(workingRows); }, [workingRows, filtered]);
   const setOneLabel = (ca, label) => {
@@ -210,7 +217,8 @@ export default function App() {
       key: 'data', label: '数据与过滤',
       children: (
         <Space direction="vertical" size={16} style={{ width: '100%' }}>
-          <DataLoader onRows={r => { setRows(r); setActiveRows(filterExcludedTokens(applyLabels(r, labels), excludedTokens)); setFiltered(false); }} />
+          <DataLoader onRows={r => { setRows(r); setActiveRows(filterExcludedTokens(applyLabels(r, labels), excludedTokens)); setFiltered(false); }}
+            onArchiveChange={setArchive} />
           {hasData && <ErrorBoundary title="快照速查渲染出错" resetKey={rows.length}><SnapshotInspector rows={workingRows} labels={labels} onLabel={setOneLabel} light={!dark} /></ErrorBoundary>}
           {hasData && <FilterPanel rows={workingRows} fields={fields}
             onActiveRows={(r, isF) => { setActiveRows(r); setFiltered(isF); }} />}
@@ -222,7 +230,7 @@ export default function App() {
     {
       // P2-1：原「相关性与显著性」+「图表」+「回测·因子」三个并列的"找因子"入口合一。
       // FactorLab（回测·因子）是超集（挖区间+lift+捕获率+样本外+生成代码），放最前面当主体；
-      // 散点/相关性/AUC/字段体检是复核视角，折叠在其后，减少重复入口、tab 数 7→5。
+      // 散点/相关性/字段体检是复核视角，折叠在其后，减少重复入口、tab 数 7→5。
       key: 'findFactor', label: '找因子', disabled: !hasData,
       children: (
         <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -232,13 +240,16 @@ export default function App() {
             { id: 'fl-discover', label: '因子发现' },
             { id: 'fl-weights', label: '因子权重' },
             { id: 'fl-backtest', label: '回测' },
-            { id: 'fl-generate', label: '生成代码' },
+            // 曾经是 'fl-generate'（FactorLab 自己生成上线代码那张卡）。代码生成已统一到策略侧的
+            // 「生成上线代码」，那张卡随之删掉，锚点却留着——点了不跳，是个死链。现在指向真正的末节。
+            { id: 'fl-send', label: '发送到策略' },
             { id: 'section-scatter', label: '散点图' },
             { id: 'section-corr', label: '相关性' },
-            { id: 'section-auc', label: 'AUC/体检/分箱' },
+            { id: 'section-health', label: '体检/分箱' },
           ]} />
           <ErrorBoundary title="回测·因子面板渲染出错" resetKey={activeRows.length}>
             <FactorLab rows={activeRows} fields={fields} light={!dark}
+              archiveAllRows={archive.allRows} archiveSliceCats={archive.sliceCats}
               strategyCode={strategyCode} onStrategyCodeChange={setStrategyCode}
               onGoToStrategy={() => setActiveTabKey('strategy')} />
           </ErrorBoundary>
@@ -249,8 +260,7 @@ export default function App() {
               isCampFieldExisting={isCampFieldExisting} isStrategyFactorField={isStrategyFactorField} />
           </div>
           <div id="section-corr"><CorrTable rows={activeRows} /></div>
-          <div id="section-auc" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            <AucPanel rows={activeRows} fields={fields} />
+          <div id="section-health" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
             <FieldHealth rows={activeRows} fields={fields} />
             <BinBarCard rows={activeRows} fields={fields} light={!dark} />
           </div>
@@ -338,6 +348,7 @@ export default function App() {
             )}
           </Content>
         </Layout>
+        <PerfMonitor />
       </AntApp>
     </ConfigProvider>
   );

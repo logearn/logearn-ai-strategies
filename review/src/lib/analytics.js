@@ -1,22 +1,12 @@
-// 由 js/charts.js 机械抽出的纯统计计算：峰值检测的置换检验、断点解析、MDE 等。
+// 由 js/charts.js 机械抽出的纯统计计算：断点解析、MDE 等。
 // 只搬了【不读任何全局状态】的函数，函数体一行未改。读 activeRows / chartSettings 的
-// 那批（scanFieldsForPeaks / mineBreakpointsOOS / buildBinBarAiReport 等）留在原处，
+// 那批（mineBreakpointsOOS / buildBinBarAiReport 等）留在原处，
 // 等对应 React 组件落地时把状态改成入参再搬，那时才有办法做差分验证。
-import { WIN_THRESHOLD, benjaminiHochbergAdjust, percentile, rankAuc, wilsonInterval } from './utils.js';
+// 2026-07-29：峰值检测的置换检验（scanFieldsForPeaks/permutationPeakTest/longestAboveRun/
+// requiredPermN）已删——只服务 FieldHealth.jsx 的"波峰扫描"，该功能已删，见该文件头注释。
+import { WIN_THRESHOLD, percentile, rankAuc } from './utils.js';
 import { getFeature, isFiniteNumber } from './data.js';
 
-// ---------- 常用字段集体检测 ----------
-// 逐个字段跑上面那套置换检验，把"确实存在非噪声波峰"的字段挑出来，省去一个个手动试。
-// 关键：这里同时检验几十个字段，本身又是一次多重比较——46 个字段纯随机也会有 2~3 个 p<0.05，
-// 所以对所有字段的置换 p 再做一次 BH-FDR 校正，只有校正后仍显著的才标为可用。
-// permN 的下限由字段数决定：置换 p 的最小可能值是 1/(permN+1)，而 BH 校正在最好情况下要求
-// 原始 p < 0.05/m（m = 字段数）。若 permN 不够，即使效应极强、置换中一次都没被超过，
-// p 也只能触底在 1/(permN+1)，乘以 m 之后必然 >0.05——真信号会被数学上判死。
-// 实测：43 个字段 × 200 次置换，一个"最长区段 73 vs 随机 23"的强信号照样被判不通过。
-// 所以按字段数自动抬高置换次数，取 m/0.04 留出余量。
-function requiredPermN(m) {
-  return Math.ceil(m / 0.04);
-}
 
 // 当前样本量下能检出的最小差异（α=0.05 双尾、power=0.8、两组等分的经典近似）。
 // 用途：让使用者知道能力边界——观察到的差异若小于它，就算是真的也测不出来。
@@ -25,52 +15,6 @@ function minDetectableDiff(n, baseRate) {
   return (1.96 + 0.8416) * Math.sqrt(2 * baseRate * (1 - baseRate) / (n / 2));
 }
 
-// 当前"赢"的阈值：默认 WIN_THRESHOLD(2)，但胜率曲线/集体检测面板可切到 5、10——
-// meme 极度右偏，只看 >2 看不见"哪个区间更容易出大票"。下拉不存在时退回 2。
-
-// 滑动窗口胜率曲线的核心：给定按 x 排好序的 0/1 胜负序列，返回"Wilson 下界高于基准"的
-// 最长连续区段长度。用增量更新维护窗口内赢数（进一个出一个），整条曲线 O(n)，
-// 这样几百次置换才跑得动。
-function longestAboveRun(arr, W, baselinePct) {
-  if (arr.length < W) return 0;
-  let k = 0;
-  for (let i = 0; i < W; i++) k += arr[i];
-  let best = 0, cur = 0;
-  for (let i = 0; i + W <= arr.length; i++) {
-    if (i > 0) k += arr[i + W - 1] - arr[i - 1];
-    if (wilsonInterval(k, W).lo * 100 > baselinePct) { cur++; if (cur > best) best = cur; }
-    else cur = 0;
-  }
-  return best;
-}
-
-// 置换检验：把胜负标签相对字段值随机打乱若干次，得到"纯随机下最长达标区段"的分布，
-// 只有实际数据的最长区段显著长于它，波峰才不是噪声。
-// 为什么必须这么做：曲线上有几百个位置、每个按 95% 判一次，纯随机也会有约 5% 越界；
-// 而且滑动窗口相邻点高度相关，一次随机偏高会连续影响约 W 个窗口，噪声区段长度天然接近 W，
-// 靠固定宽度门槛分不开（实测 5 次纯噪声有 3 次报出跨 13~20 个位置的"波峰"）。
-// 置换用数据自身的重排定基准，自动把这层自相关也包含进去。
-
-// 置换检验：把胜负标签相对字段值随机打乱若干次，得到"纯随机下最长达标区段"的分布，
-// 只有实际数据的最长区段显著长于它，波峰才不是噪声。
-// 为什么必须这么做：曲线上有几百个位置、每个按 95% 判一次，纯随机也会有约 5% 越界；
-// 而且滑动窗口相邻点高度相关，一次随机偏高会连续影响约 W 个窗口，噪声区段长度天然接近 W，
-// 靠固定宽度门槛分不开（实测 5 次纯噪声有 3 次报出跨 13~20 个位置的"波峰"）。
-// 置换用数据自身的重排定基准，自动把这层自相关也包含进去。
-function permutationPeakTest(wins01, W, baselinePct, permN = 300) {
-  const obs = longestAboveRun(wins01, W, baselinePct);
-  const shuffled = wins01.slice();
-  const runs = [];
-  for (let t = 0; t < permN; t++) {
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      const tmp = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = tmp;
-    }
-    runs.push(longestAboveRun(shuffled, W, baselinePct));
-  }
-  runs.sort((a, b) => a - b);
-  return { obs, perm95: percentile(runs, 0.95), p: (runs.filter(r => r >= obs).length + 1) / (permN + 1) };
-}
 
 // ---------- 常用字段集体检测 ----------
 // 逐个字段跑上面那套置换检验，把"确实存在非噪声波峰"的字段挑出来，省去一个个手动试。
@@ -249,52 +193,6 @@ function mineBreakpointsOOS(sourceRows, field, targetField, minSide, winThreshol
   return { results, trainBase, testBase, trainSize: train.length, testSize: test.length };
 }
 
-function scanFieldsForPeaks(rows, candidateFields, targetField, permN, winThreshold) {
-  const excluded = new Set([targetField, 'returnMax', 'logReturnMax']);
-  const candidates = candidateFields.filter(f => !excluded.has(f));
-  // 先按候选字段数把置换次数抬到够用的水平，否则多重比较校正会把真信号一并判死
-  const effPermN = Math.max(permN, requiredPermN(candidates.length));
-  const out = [];
-  for (const field of candidates) {
-    const pairs = [];
-    for (const r of rows) {
-      const x = getFeature(r, field), y = getFeature(r, targetField);
-      if (isFiniteNumber(x) && isFiniteNumber(y)) pairs.push([Number(x), Number(y)]);
-    }
-    // 样本太少或字段几乎是常量，都没有"沿着取值找波峰"的意义
-    if (pairs.length < 40) continue;
-    if (new Set(pairs.map(p => p[0])).size < 5) continue;
-    pairs.sort((a, b) => a[0] - b[0]);
-    const T = winThreshold;
-    const wins01 = pairs.map(([, y]) => y > T ? 1 : 0);
-    const base = wins01.reduce((a, b) => a + b, 0) / wins01.length;
-    if (base <= 0 || base >= 1) continue; // 全赢或全输，没有可比的基准
-    // 窗口随该字段的有效样本量自适应：太大曲线被抹平（用户实测窗口 140 / 样本 148 只剩 9 个位置），
-    // 太小噪声压不住。取 n/5 并夹在 [20, 60]。
-    const W = Math.min(60, Math.max(20, Math.round(pairs.length / 5)));
-    const t = permutationPeakTest(wins01, W, base * 100, effPermN);
-    // 波峰位置：实际曲线上达标区段对应的字段取值范围
-    let bestSeg = null;
-    if (t.obs > 0) {
-      let k = 0; for (let i = 0; i < W; i++) k += wins01[i];
-      let cur = 0, curStart = -1;
-      for (let i = 0; i + W <= wins01.length; i++) {
-        if (i > 0) k += wins01[i + W - 1] - wins01[i - 1];
-        if (wilsonInterval(k, W).lo * 100 > base * 100) {
-          if (cur === 0) curStart = i;
-          cur++;
-          if (cur === t.obs) { bestSeg = [pairs[curStart + Math.floor(W / 2)][0], pairs[i + Math.floor(W / 2)][0]]; break; }
-        } else cur = 0;
-      }
-    }
-    out.push({ field, n: pairs.length, W, base, obs: t.obs, perm95: t.perm95, p: t.p, seg: bestSeg });
-  }
-  const adj = benjaminiHochbergAdjust(out.map(r => r.p));
-  out.forEach((r, i) => { r.adjP = adj[i]; });
-  return { rows: out, scanned: candidates.length, effPermN };
-}
-
-let lastFieldScanPassed = [];
 
 // 样本外断点挖掘的零假设校准。
 //
@@ -348,11 +246,7 @@ export {
   winRateOf,
   recommendBreakpoints,
   mineBreakpointsOOS,
-  scanFieldsForPeaks,
-  requiredPermN,
   minDetectableDiff,
-  longestAboveRun,
-  permutationPeakTest,
   parseBreakpoints,
   binLabel,
 };

@@ -38,6 +38,7 @@ import { run as runExcludedTokens } from './excluded-tokens.test.js';
 import { run as runStrategyReplayLogic } from './strategy-replay-logic.test.js';
 import { run as runCampLibrary } from './camp-library.test.js';
 import { run as runRemovedFactors } from './removed-factors.test.js';
+import { run as runFieldAudit } from './field-audit.test.js';
 import { run as runDataArchive } from './data-archive.test.js';
 import { run as runStrategySpec } from './strategy-spec.test.js';
 import { run as runDataSlices } from './data-slices.test.js';
@@ -46,12 +47,12 @@ import { run as runDataHelpers } from './data-helpers.test.js';
 import { run as runDataFolders } from './data-folders.test.js';
 import { run as runFactorPoolStore } from './factor-pool-store.test.js';
 import { run as runOnlineExport } from './online-export.test.js';
+import { run as runOnlineExportCoverage } from './online-export-coverage.test.js';
 import { run as runFactorScanExport } from './factor-scan-export.test.js';
 import { run as runRhoOptimize } from './rho-optimize.test.js';
-import { run as runTierGainOptimize } from './tier-gain-optimize.test.js';
-import { run as runBucketRhoOptimize } from './bucket-rho-optimize.test.js';
 import { run as runBacktestReport } from './backtest-report-export.test.js';
 import { run as runFactorRecommend } from './factor-recommend.test.js';
+import { run as runFactorLabFixes } from './factorlab-fixes.test.js';
 import { run as runFactorRecommendWorker } from './factor-recommend-worker.test.js';
 
 // 旧测试全部写成 sandbox.foo(...)，这里把四个模块的导出合并成同名对象，
@@ -1632,6 +1633,7 @@ runExcludedTokens(test);
 runStrategyReplayLogic(test);
 runCampLibrary(test);
 runRemovedFactors(test);
+runFieldAudit(test);
 runDataArchive(test);
 runStrategySpec(test);
 runDataSlices(test);
@@ -1640,12 +1642,12 @@ runDataHelpers(test);
 runDataFolders(test);
 runFactorPoolStore(test);
 runOnlineExport(test);
+runOnlineExportCoverage(test);
 runFactorScanExport(test);
 runRhoOptimize(test);
-runTierGainOptimize(test);
-runBucketRhoOptimize(test);
 runBacktestReport(test);
 runFactorRecommend(test);
+runFactorLabFixes(test);
 // 2026-07-28 修复：这里必须 await + 用 testAsync（跟上面几百个 buildRows 测试同一个模式）——
 // factor-recommend-worker.test.js 的 run() 内部 test(name, async fn) 是异步的，之前用同步
 // test() 调用只会走到第一个 await 就同步返回，断言失败会变成脚本已经打印完总数之后才触发的

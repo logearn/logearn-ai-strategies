@@ -2,19 +2,11 @@
 // 这两个文件此前是【零测试覆盖】——本次会话里点击绑定失效、策略回放命中数恒为 0、
 // 置换检验样本量不足等 bug 全部出在这里，而 122 个既有测试一个都没红。
 import assert from 'node:assert';
-import { requiredPermN, minDetectableDiff, longestAboveRun, permutationPeakTest, parseBreakpoints } from '../src/lib/analytics.js';
+import { minDetectableDiff, parseBreakpoints } from '../src/lib/analytics.js';
 import { logearnUrl } from '../src/lib/utils.js';
 import { parseCheckNumber, parseCheckDirection, buildStrategyVerdict, aucVerdict, solveLinearSystem, computeVIFs, standardize, standardizeWith, percentileRankOf, makeFrozenDate, makeCtxRecorder, compileStrategy, sanitizeForFieldName, computeQuantileBreakpoints, detectTimeReads } from '../src/lib/proAnalytics.js';
 
 export function run(test) {
-  test('requiredPermN: 置换次数必须随字段数放大，否则 BH 校正后真信号数学上不可能显著', () => {
-    // 真实踩过的坑：43 个字段配 200 次置换，p 的下限被钉死在 1/201≈0.005，
-    // 而 BH 要求 < 0.05/43≈0.0012 —— 无论信号多强都不可能通过。
-    assert.ok(requiredPermN(43) * 0.05 / 43 > 1, '43 字段时置换次数应足以让最小 p 低于 BH 阈值');
-    assert.ok(requiredPermN(50) > requiredPermN(10), '字段越多要求的置换次数越多');
-    assert.strictEqual(requiredPermN(4), 100);
-  });
-
   test('logearnUrl: 必须带链前缀，且按地址格式区分 BSC / Solana', () => {
     // 之前 React 版把 URL 拼成了 /token/{addr}（少了 /cn/{chain}/tokens），点数据点全是 404
     assert.strictEqual(logearnUrl('5KJXGabc'), 'https://logearn.com/cn/solana/tokens/5KJXGabc');
@@ -29,24 +21,6 @@ export function run(test) {
     assert.ok(Math.abs(b - a / 2) < 0.02, 'MDE 应约与 sqrt(n) 成反比');
     assert.ok(Number.isNaN(minDetectableDiff(5, 0.4)), 'n<10 应返回 NaN');
     assert.ok(Number.isNaN(minDetectableDiff(100, 0)), '基准率为 0 应返回 NaN');
-  });
-
-  test('longestAboveRun: 应返回滑窗内连续高于基准的最长长度', () => {
-    // W=1 时退化成"最长连续高于基准的元素个数"
-    assert.strictEqual(longestAboveRun([1, 1, 1, 0, 1, 1], 1, 0.5), 3);
-    assert.strictEqual(longestAboveRun([0, 0, 0], 1, 0.5), 0);
-    assert.strictEqual(longestAboveRun([1, 1], 5, 0.5), 0, '数组短于窗口应返回 0');
-  });
-
-  test('permutationPeakTest: 纯噪声不应判为显著波峰', () => {
-    // 滑窗会让噪声也形成约 W 长的"连续高于基准"，只靠宽度阈值会误报——真实测过 5 次里错 3 次。
-    let seed = 42;
-    const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
-    const labels = Array.from({ length: 200 }, () => (rnd() < 0.4 ? 1 : 0));
-    const values = Array.from({ length: 200 }, () => rnd());
-    const r = permutationPeakTest(values, labels, 20, 0.4, 200);
-    assert.ok(r && Number.isFinite(r.p), '应返回 p 值');
-    assert.ok(r.p > 0.05, `纯噪声 p 应不显著，实际 ${r.p}`);
   });
 
   test('parseBreakpoints: 应解析逗号/空格分隔并排序去重，忽略非数字', () => {

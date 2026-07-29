@@ -19,7 +19,7 @@ function evilCand() {
 
 export function run(test) {
   test('buildCandidateExportTsv: 表头包含方向/coverage/CI 等挑因子必看列', () => {
-    for (const col of ['阵营', '方向', 'coverage', 'CI下', 'CI上', '边际ρ贡献']) {
+    for (const col of ['阵营', '方向', 'coverage', 'CI下', 'CI上', '边际ρ(test)', '边际ρ(train)']) {
       assert.ok(CANDIDATE_EXPORT_COLUMNS.includes(col), `缺列 ${col}`);
     }
   });
@@ -44,14 +44,18 @@ export function run(test) {
     assert.strictEqual(cells[CANDIDATE_EXPORT_COLUMNS.indexOf('coverage')], '-');
   });
 
-  test('buildCandidateExportTsv: 边际ρ有值时输出三位小数，无值时留空', () => {
+  // 边际ρ 走 held-out 一套口径（computeHeldOutDeltaRho），导出 test/train 两列：
+  // test 是挑因子的判据，train 并排放着才能一眼看出"只有 train 涨"的过拟合候选。
+  test('buildCandidateExportTsv: 边际ρ test/train 各占一列，有值时三位小数、无值留空', () => {
     const withM = buildCandidateExportTsv([{ camp: 'hero', list: [heroCand()] }],
-      { getMarginal: () => ({ delta: 0.0123 }) });
+      { getMarginal: () => ({ deltaTest: 0.0123, deltaTrain: 0.0456 }) });
     const cellsM = withM.text.split('\n')[1].split('\t');
-    assert.strictEqual(cellsM[CANDIDATE_EXPORT_COLUMNS.indexOf('边际ρ贡献')], '0.012');
+    assert.strictEqual(cellsM[CANDIDATE_EXPORT_COLUMNS.indexOf('边际ρ(test)')], '0.012');
+    assert.strictEqual(cellsM[CANDIDATE_EXPORT_COLUMNS.indexOf('边际ρ(train)')], '0.046');
     const noM = buildCandidateExportTsv([{ camp: 'hero', list: [heroCand()] }], {});
     const cellsN = noM.text.split('\n')[1].split('\t');
-    assert.strictEqual(cellsN[CANDIDATE_EXPORT_COLUMNS.indexOf('边际ρ贡献')], '');
+    assert.strictEqual(cellsN[CANDIDATE_EXPORT_COLUMNS.indexOf('边际ρ(test)')], '');
+    assert.strictEqual(cellsN[CANDIDATE_EXPORT_COLUMNS.indexOf('边际ρ(train)')], '');
   });
 
   test('buildCandidateExportTsv: meta 作为 # 注释行置顶', () => {

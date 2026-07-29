@@ -1,5 +1,5 @@
 import { parentPort } from 'worker_threads';
-import { computeHeldOutDeltaRho, scorePoolBucketRho } from './factorLab.js';
+import { computeHeldOutDeltaRho } from './factorLab.js';
 
 // Worker thread for Node: 接收 { taskId, rows, currentFactors, candidates, opts }
 // 返回 { taskId, results: [{ field, camp, result }] } 或 { taskId, error }
@@ -13,13 +13,11 @@ parentPort.on('message', (msg) => {
   if (!msg || msg.type !== 'eval') return;
   const { taskId, rows, currentFactors, candidates, opts } = msg;
   try {
-    const { threshold, scoreMode, ...restOpts } = opts || {};
-    const scoreFnOpt = scoreMode === 'bucketRho'
-      ? { scoreFn: (rowsSet, factorSet, mp) => scorePoolBucketRho(rowsSet, factorSet, mp, threshold) }
-      : {};
+    // 2026-07-29：同浏览器版 recommendWorker.js——scoreMode:'bucketRho' 分支随分层秩相关整条线删除。
+    const { threshold, ...restOpts } = opts || {};
     const results = candidates.map(c => {
       try {
-        const r = computeHeldOutDeltaRho(rows, currentFactors || [], c, c.camp, threshold, { ...restOpts, ...scoreFnOpt });
+        const r = computeHeldOutDeltaRho(rows, currentFactors || [], c, c.camp, threshold, { ...restOpts });
         return { field: c.field, camp: c.camp, result: r };
       } catch (err) {
         return { field: c.field, camp: c.camp, error: String(err) };

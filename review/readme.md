@@ -983,3 +983,129 @@ antd 的 `message` 在 `DataLoader.jsx` 里也全部失去了唯一用途，一�
 这条自动载入路径（连同上面21.2节修复的两个坑）没能在真实数据下端到端触发验证，
 只靠这次的逐行 diff + grep 覆盖率核对，建议用户下次有历史数据时留意一下自动载入
 是否正常（不再一直转圈、批次归档操作/时间切片操作是否符合预期）。
+
+
+## 22. 拆 data.js 的 buildRows()：10 个组装字段块抽成具名函数 + 补单元测试（2026-07-29）
+
+### 22.1 背景与整体方案
+
+`lib/data.js` 的 `buildRows()` 原本是约 1120 行的巨型函数，是重构清单里"高优先级"第 4 项，
+也是风险最高的一项——它是 parity 测试和 `onlineExport.js`/`strategySpec.js` 手工同步的对象，
+任何行为偏差都可能悄悄影响下游。
+
+**目标**：纯粹的 legibility 重构，逻辑一行不改，只是把循环体内一段段用注释分隔的"组装字段块"
+搬成模块级具名函数（`applyXxxFeatures`），并**新增单元测试**直接测这些函数——此前这些字段
+公式只被 `parity.test.js`/`analytics-parity.test.js` 这类端到端测试【间接】覆盖，端到端只能
+告诉你"整体对不对"，单个字段的分母为 0、数组为空、必需字段缺失这些分支从来没被直接测过。
+
+`buildRows()` 循环体一共约 17 个"块"，其中 10 个完全自包含（只读 `features`/`arrays`/`s` 已经
+摊平好的值，互不依赖），全部拆完；V 转信号（`v_breakout_volume`）那一簇因为 `breakouts`/
+`recentV` 被三处不连续的代码共用，**暂不拆**，留在 `buildRows()` 内联（原因见 22.5 节）。
+
+### 22.2 拆出来的 10 个函数
+
+按在 `data.js` 里的出现顺序（都放在 `resolveNativeDecimals` 之后、`buildRows` 之前）：
+
+| 函数 | 原注释块 | 产出字段数 |
+|---|---|---|
+| `applySimpleRatioFeatures(features, mcap)` | 买卖比率类组装字段 | 11 |
+| `applyChipShapeFeatures(features, arrays, mcap)` | 筹码分布组装字段 | 4 |
+| `applyContinueBreakoutFeatures(features, s, buyMs, swapBeginMs)` | 早期精选信号 continue_breakout_volume 明细 | 11 |
+| `applyBreakout10xFeatures(features, s, buyMs, swapBeginMs)` | 休眠苏醒信号 breakout_volume_10x 明细 | 13 |
+| `applyWhaleFeatures(features, s, buyMs, swapBeginMs)` | 蓝筹顶级赢家共振信号 whale | 8 |
+| `applyKlineVolumeShapeFeatures(features, arrays)` | K线量能形态（含"急拉程度"子块） | 10 |
+| `applyHolderStatsFeatures(features, arrays)` | Top100 持有人快照聚合（单块最大，282 行） | 34+ |
+| `applyGmgnTopFeatures(features)` | gmgn 顶层字段组装（gmgn_ 前缀） | 8 |
+| `applyMaxUpFeatures(features, mcap)` | logearn 最大涨幅(max_up)组装 | 2 |
+| `applySignalTimingFeatures(features, categorical, s, buyMs)` | 信号时序（跨类型先后关系） | 4 + 4 个 categorical |
+
+`buildRows()` 从 **1117 行降到 392 行**（-65%），循环体里对应位置变成一行函数调用。
+
+**保留在循环体里的共享局部变量**：`mcap`/`currentAvgPrice`/`fin`（=`Number.isFinite` 别名）/
+`buyMs`/`swapBeginMs`/`launchMs`——它们要么被未拆的 V 转集群用，要么要按需传参给上面这些函数，
+按参数传进去而不是在每个函数里重算一遍。原来那些只服务单个块的局部变量（`buy`/`sell`/
+`picks`/`wakes`/`whales`/`klineBarsForVol`/`holdersAll`/`gp` 等）全部随块搬进对应函数内部
+重新声明，循环体里已无残留（脚本扫过一遍，没有"声明了但只出现 1 次"的死变量）。
+
+**两处非纯机械搬移的地方**（其余都是逐字节照搬）：
+1. 原文用 `fin(...)` 别名的块（whale/kline量能/gmgn/max_up），函数内部开头补一行
+   `const fin = Number.isFinite;`——`fin` 原来是循环体局部变量，搬出去就取不到了。
+2. `SIGNAL_LISTS`（六类信号 list 的键名映射）从循环体内提到**模块顶层**——纯字面量常量、
+   与行数据无关，原来每处理一行都要重新构造一次这个对象。改动前独立核实过是安全的
+   （无副作用、无外部引用），也是这一整轮唯一一处"顺手小改进"。
+
+### 22.3 搬运手法：脚本按行切片 + 逐字节回比，不手抄
+
+第 21.2 节记过一次真实踩坑（手工搬运时 `saved.snapsArrays` 被打成 `saved.snapshots`、
+`setBusy` 被编造成 `onStatus`），所以这次**没有用手抄**：写了个 node 脚本按行号切片搬运
+（`slice(起, 止)` + 统一减 2 空格缩进 + 包成函数体），切片前先 `expect(行号, 关键字)` 断言
+边界行内容对得上，避免行号算错。
+
+搬完立刻跑第二个校验脚本：把新函数体重新加回 2 空格缩进，跟改动前文件的对应行区间逐行
+`===` 比对，**全部 10 个块都是逐字一致**（93/81/32/122/281/31/8/56 行等），并额外核对
+`features[...]=` 赋值总数（135）与 `categorical[...]=` 赋值总数（4）改动前后不变——后者正是
+第 14.2 节 `online-export-coverage.test.js` 那道闸门扫描的东西，字段搬丢了这个数就会变。
+
+### 22.4 顺带修的一处测试耦合
+
+`run-tests.js` 里"字段候选池剔除：不得误杀任何组装字段"这条测试原本扫的是
+`sandbox.buildRows.toString()`——字段计算搬出去之后它只能捞到 24 个字段（原来 130+），
+断言 `made.length > 50` 直接红。**改法**：跟 `online-export-coverage.test.js` 统一口径，
+改成静态扫描 `src/lib/data.js` 整份源码（新增 `fs`/`path`/`fileURLToPath` import 和 `ROOT`
+常量）。这样既恢复了原来的覆盖范围，也不再受后续任何拆分影响。这不是放宽断言——扫描范围
+反而比原来更大（原来只扫 buildRows 一个函数）。
+
+### 22.5 明确不动的部分：V 转信号（v_breakout_volume）集群
+
+从"buy 之前最大回撤"注释开始、到"V 转信号最低点与成本线之间的距离"结束（约 250 行），
+`breakouts`/`recentV`/`vCycleKey` 三个局部变量被**三处不连续**的代码共用（中间还穿插着
+"推特改名次数"、"last_alert 对比"两个不相关的小块）。硬拆有两个选择：
+- **(a)** 让 `recentV`/`breakouts` 作为返回值在多次函数调用之间传递——函数签名别扭，但完全
+  不改变原执行顺序；
+- **(b)** 把三处代码挪到一起合并成一个函数——逻辑不变，但**会改变 `features` 键的写入顺序**
+  （大概率不影响任何下游，因为没人依赖对象键序，但这是一处偏离"纯机械搬移"的改动）。
+
+**用户已拍板：这一轮不动，留到下次单独一个 commit 再做。** 理由是它跟前面 10 个块不是同一类
+工作——前面是"搬"，风险在"抄错字"，靠逐行 diff 能完全消掉；V 转是"改结构"，(a)/(b) 都不是
+逐字节一致能证明的，得靠人判断，收益只有 250 行。混进同一个 diff 里会让这次干净的机械重构
+变得不好验证。其余 10 个块已全部完成。
+
+### 22.6 新增单元测试：`tests/build-rows-features.test.js`
+
+用户本轮明确要求"记住加上单元测试"。新建该文件（31 条），10 个函数逐个覆盖三类场景：
+① 正常输入 → 字段值符合手算结果；② 关键缺失分支 → 该缺失时字段**确实不写入**（而不是悄悄
+写个 0/NaN/Infinity 进去）；③ 已知边界。重点测到的边界：
+
+- `applySimpleRatioFeatures`：**分子为 0 是合法值**（买入量为 0 → 比值 0，不能当缺失丢样本），
+  分母为 0/缺失时不写 Infinity。
+- `applyChipShapeFeatures`：`mcap_range` 畸形的桶不参与选峰（否则 `peakMcap` 被永久置成 NaN，
+  后面有效的 bar 再也接不上），但其 `percent` 仍计入 hhi 总量。
+- `applyContinueBreakoutFeatures`：缺 `native_coin_price` 时两个 USD 口径字段缺失、**绝不退化成
+  写原生币数值**（同字段混两种单位比缺失危险得多）；空数组记 0、整个字段不存在才算缺失。
+- `applyBreakout10xFeatures`：信号市值已超历史高点时回调深度**应为负数、不截断成 0**（平台文案
+  会截断，这里刻意不跟）。
+- `applyWhaleFeatures`：`pastMinute` 是字符串 `"1"` 要转数值；分母缺失时人均次数不写 Infinity。
+- `applyKlineVolumeShapeFeatures`：不足 10 根 K 线整组不写入；`kline_is_usd === 0` 时跳过成交额
+  类字段但换手率仍可算（代币口径不受计价单位影响）；急拉多尺度扫描取最陡那段。
+- `applyHolderStatsFeatures`：**`addr_type === 2`（交易所/流动性池）必须先剔除**，
+  `holder_exchange_ratio` 在全体上算、其余画像比例在剔除后的子集上算（分母搞错会系统性稀释
+  所有画像比例）；全是交易所地址时真实持有人为 0，只写 exchange_ratio 不写 NaN。
+- `applyGmgnTopFeatures`：buy+sell 都为 0 时净买入占比**不写入**（"完全没成交" ≠ "卖压 100%"）。
+- `applyMaxUpFeatures`：`max_up_duration` 为 0 时速度不写 Infinity。
+- `applySignalTimingFeatures`：**晚于买入时刻的信号必须排除**（未来函数）；三条取值链
+  （`s.signal` / `s.ctx.logearn` / `s.ctx`）都要能读到。
+
+**做过变异测试确认这套测试真的会咬**：故意把 `addr_type !== 2` 的剔除去掉、把
+`maxUpDur > 0` 的守卫放宽，跑一遍确实红了 3 条（不是那种怎么改都绿的摆设测试），
+验证完立刻还原。
+
+### 22.7 验证
+
+`node tests/run-tests.js` **626/626 通过**（595 基线 + 31 条新增，无回归）；`npx vite build`
+通过。10 个函数已按字母序加进 `data.js` 底部的 `export { ... }` 列表。
+
+**没有做的验证**：`buildRows` 的端到端等价性只靠"逐字节回比 + 626 个测试（含 parity 系列）"
+证明，没有拿真实数据跑一遍改前/改后的 `buildRows` 做输出 diff——仓库里的
+`top100_calls.json`/`worst100_calls.json` 只有 calls、没有配套 snapshots，`buildRows` 跑不起来。
+考虑到每个块都验证过是逐字节搬移、且循环体里没有残留死变量，风险很低，但如果用户手头有
+真实数据，值得点一次「分析」确认字段值跟改动前一致。

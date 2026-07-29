@@ -11,6 +11,9 @@
 // 这一步本身就是移植的验收：src/lib/* 是从 js/* 机械复制来的（逻辑一行未改，只加了
 // import/export），所以这 122 个测试原封不动地全部通过，就证明移植没有引入行为变化。
 import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import * as _utils from '../src/lib/utils.js';
 import * as _dictionary from '../src/lib/dictionary.js';
 import * as _data from '../src/lib/data.js';
@@ -44,6 +47,7 @@ import { run as runStrategySpec } from './strategy-spec.test.js';
 import { run as runDataSlices } from './data-slices.test.js';
 import { run as runTableHiddenFields } from './table-hidden-fields.test.js';
 import { run as runDataHelpers } from './data-helpers.test.js';
+import { run as runBuildRowsFeatures } from './build-rows-features.test.js';
 import { run as runDataFolders } from './data-folders.test.js';
 import { run as runFactorPoolStore } from './factor-pool-store.test.js';
 import { run as runOnlineExport } from './online-export.test.js';
@@ -58,6 +62,8 @@ import { run as runFactorRecommendWorker } from './factor-recommend-worker.test.
 // 旧测试全部写成 sandbox.foo(...)，这里把四个模块的导出合并成同名对象，
 // 这样 1400 行测试正文一个字都不用改。
 const sandbox = { console, ..._utils, ..._dictionary, ..._data, ..._customFields };
+// 仓库根目录（review/），供需要静态扫描源码的测试定位文件，口径同 online-export-coverage.test.js
+const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 // 旧沙箱里这几个是全局变量（真实运行时由 ui.js 提供）。逻辑层只在函数体内读它们，
 // 这里挂到 globalThis 上，避免调用到相关分支时抛 ReferenceError。
 globalThis.matchedRows = [];
@@ -905,10 +911,13 @@ test('computeCorrelations: 出现任一类被剔除字段时都不应抛异常�
   assert.ok(list.some(r => r.feature === 'buyer_count_d1'), '正常字段应参与检验');
 });
 
-test('字段候选池剔除：不得误杀任何组装字段（对 buildRows 里全部 features 赋值做全量校验）', () => {
+test('字段候选池剔除：不得误杀任何组装字段（对 data.js 里全部 features 赋值做全量校验）', () => {
   // 剔除规则用的是前缀/后缀正则，边界写松一点就会连坐成品特征，而且不报错——
   // 只是候选池里悄悄少一批，没人会发现。这里把源码里所有 features['x'] = 的字段全捞出来兜底。
-  const src = sandbox.buildRows.toString();
+  // 扫的是 data.js 整份源码而不是 buildRows.toString()：组装字段的计算已经按块拆成了一批
+  // applyXxxFeatures 函数（见 readme"拆 buildRows()"一节），只扫 buildRows 函数体会漏掉绝大
+  // 多数字段。跟 online-export-coverage.test.js 同一套静态扫描口径，也不再受后续拆分影响。
+  const src = fs.readFileSync(path.join(ROOT, 'src/lib/data.js'), 'utf8');
   const made = [...new Set([...src.matchAll(/features\[['"]([^'"]+)['"]\]\s*=/g)].map(m => m[1]))];
   assert.ok(made.length > 50, '应能解析出足量组装字段，实际 ' + made.length);
   const killed = made.filter(f => sandbox.isNonAnalyticField(f));
@@ -1639,6 +1648,7 @@ runStrategySpec(test);
 runDataSlices(test);
 runTableHiddenFields(test);
 runDataHelpers(test);
+runBuildRowsFeatures(test);
 runDataFolders(test);
 runFactorPoolStore(test);
 runOnlineExport(test);

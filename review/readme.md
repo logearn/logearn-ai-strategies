@@ -799,3 +799,35 @@ preview={preview} onCancel={...} onConfirm={confirmPreview} />`）不变。原�
 `grep` 确认 `WeightSuggestionPreview` 在源码里只声明了一次（新文件里 `export default function`
 一处 + `StrategyReplay.jsx` 里 `import` 一处），重启 dev server 这条提示会消失。因数据加载依赖
 原生文件选择框（跟前几节同样的环境限制），未在浏览器里对真实数据触发这张卡片做像素级核对。
+
+## 19. 拆"上帝组件"第三步：FactorLab.jsx 抽出 BacktestCard（2026-07-29）
+
+### 19.1 改法
+
+第17~18节的两处都是改动面很小的目标（内嵌组件/65行卡片），这次拆用户点名风险更高的一处：
+「回测」卡片（原第1202~1401行，约200行，含 cutoff 滑块/触发数统计/cutoff扫描曲线/分数-倍数
+散点/十分位表/时间外推验证 walk-forward 逐段表+详情面板，内嵌 3 层匿名 IIFE 渲染函数）。
+
+依赖梳理：这块 JSX 要读 19 个外部值（`backtest`/`cutoff`/`setCutoff`/`cutoffMin`/
+`cutoffRecommend`/`applyRecommendedCutoff`/`exportFullReport`/`exportRawDataJson`/`hasEvil`/
+`base`/`sweepFigure`/`scoreScatterFigure`/`threshold`/`oosBusy`/`runOOS`/`oosProgress`/`oos`/
+`oosFoldRows`/`oosFoldIdx`/`setOosFoldIdx`/`oosFoldSweepFigure`），全部改成 props 传入新的
+`ui/factorLab/BacktestCard.jsx`——这些计算（`useMemo`/`useState`）留在 `FactorLab.jsx`，因为
+`sweepFigure`/`oosFoldRows` 等好几个在 `exportFullReport`（导出完整报告）等其它地方还有独立
+调用点，不能整体搬走。`decileColumns`（十分位表列定义）只在这块用到，整段搬进新组件；
+`sweepAt`（纯函数，`bt`/`cut` 两个参数、不读组件状态）在 `FactorLab.jsx` 里另外 3 处还在用
+（时间外推逐段扫描），保留原地，新组件里按 `fmtPct` 的先例本地拷贝一份，不当函数类型 prop 传。
+
+组件体 JSX 一字未改，只是从"直接读闭包变量"改成"读 props"。清掉因此失去唯一用途的
+`Slider`/`PlotlyChart` 死 import。`FactorLab.jsx` 从约1443行（第18节末状态）降到约1247行——
+连同第17~18节，三步累计从最初的 1503 行降到 1247 行，去掉约 17%。
+
+### 19.2 验证
+
+`node tests/run-tests.js` 595/595 通过；`npx vite build` 通过。dev server 里仍报着第18.2节
+记录的同一条 `WeightSuggestionPreview already declared` HMR 残留（跟本次改动无关，源码里
+grep 确认只声明一次）；因数据加载依赖原生文件选择框，未在浏览器里对真实数据逐项核对
+cutoff 滑块/时间外推详情面板的渲染结果——风险集中在"prop 传漏/传错名"这一类问题上，
+19 个 prop 逐个跟原变量名核对过，且 build 不报 `is not defined`/`is not a function`
+这类运行时才会暴露的引用错误（React 组件里未定义变量在纯渲染路径下会在 build 阶段被
+当成全局引用放过，需要格外靠这次逐项核对而非只靠 build 通过）。

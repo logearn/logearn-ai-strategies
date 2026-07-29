@@ -33,7 +33,12 @@ export function compareGroups(aRows, bRows, { labelA = 'A', labelB = 'B' } = {})
   const mde = minDetectableDiff(nEff, baseRate);
 
   const medA = median(retA), medB = median(retB);
-  const maxA = Math.max(...retA), maxB = Math.max(...retB);
+  // 用 reduce 而不是 Math.max(...retA)：retA/retB 是整组样本的 returnMax 全量数组，
+  // 展开成参数列表在大样本（约 10 万起）会撞 JS 引擎的参数数量上限直接抛 RangeError，
+  // 把「分组对比」整块打挂。同样的坑 factorLab.js 的 sweepScoreCutoffs 已经踩过并修过，
+  // 这里是当时漏掉的三处之一（2026-07-29 补齐）。
+  const maxOf = arr => arr.reduce((m, v) => (v > m ? v : m), -Infinity);
+  const maxA = maxOf(retA), maxB = maxOf(retB);
 
   return {
     labelA, labelB,
@@ -44,6 +49,6 @@ export function compareGroups(aRows, bRows, { labelA = 'A', labelB = 'B' } = {})
     meanB: retB.reduce((s, v) => s + v, 0) / retB.length,
     rates, mde,
     // 样本量够不够：观察到的最大胜率差没超过 MDE 时，任何"看起来的差异"都读不出结论
-    underpowered: Number.isFinite(mde) && Math.max(...rates.map(r => Math.abs(r.diff))) < mde,
+    underpowered: Number.isFinite(mde) && maxOf(rates.map(r => Math.abs(r.diff))) < mde,
   };
 }

@@ -959,8 +959,27 @@ export function assignFoldsByToken(rows, K, seed = 0x1234567) {
     const j = Math.floor(rand() * (i + 1));
     const t = groupKeys[i]; groupKeys[i] = groupKeys[j]; groupKeys[j] = t;
   }
+  // 分配用 LPT 装箱（按组大小降序，每组放进"当前累计样本最少"的那一折），不是 pos % K 轮转。
+  //
+  // 【2026-07-29 改】轮转只保证每折拿到差不多**多少个 token**，不管每个 token 带几条信号。
+  // meme 场景里这个差别很大：一个热门币一天可以有几十条信号，而长尾币只有一两条。轮转下
+  // 某一折可能吃到远超 1/K 的样本量，另一折少到被下面 heldOutFactorCurve 的
+  // `test.length < 5` 直接整折丢掉 —— 各 k 的 nFolds 因此不齐，而 1-SE 用的是
+  // testStd/√nFolds，分母不一样的两个 k 根本不可比，选出来的 k*（推荐因子数）跟着偏。
+  // LPT 是经典的多路装箱贪心，实现只多一次排序，仍然完全确定性（同一 seed 结果可复现）。
+  //
+  // 注意排序要**稳定**：先按组大小降序，同大小时按洗牌后的顺序（groupKeys 的下标）——
+  // 直接对 groupKeys 排序会让同大小的组退回到 Map 插入顺序，白费上面那次种子洗牌。
+  const order = groupKeys.map((key, pos) => ({ key, pos, size: groups.get(key).length }));
+  order.sort((a, b) => b.size - a.size || a.pos - b.pos);
+  const foldSizes = new Array(K).fill(0);
   const foldOf = new Array(n);
-  groupKeys.forEach((key, pos) => { for (const idx of groups.get(key)) foldOf[idx] = pos % K; });
+  for (const { key } of order) {
+    let target = 0;
+    for (let f = 1; f < K; f++) if (foldSizes[f] < foldSizes[target]) target = f;
+    for (const idx of groups.get(key)) foldOf[idx] = target;
+    foldSizes[target] += groups.get(key).length;
+  }
   return foldOf;
 }
 

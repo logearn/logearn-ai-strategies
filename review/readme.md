@@ -334,6 +334,33 @@
 不是代码变差了，是原来那个数含着"边界照着这批样本挖出来"的水分，现在扣掉了。
 默认阈值 0.005 相对新口径偏松，建议点一次「跑置换零分布」按 q95 回填。
 
+### 9.1 这个 held-out 到底 held 住了什么、没 held 住什么（2026-07-29 审计订正措辞）
+
+上面反复写的"train 推边界"**只对梯形核心成立，对区间窗口不成立**，之前的措辞会让人以为 `deltaTest`
+是完全无偏的 held-out，实际不是。把话说准：
+
+| 这一层 | 在哪推的 | 是否 held-out |
+|---|---|---|
+| 梯形满分核（P25/P75） | `computeHeldOutDeltaRho` 里的 `deriveRows`，**只取 train 段** | ✅ 是 |
+| 区间窗口 `interval.lo/hi` | `computeFieldRaw` → `scanIntervalCore`，**全样本扫描**（含 test 段） | ❌ 不是 |
+
+而 winner's curse 的主要来源恰恰是后者——`scanIntervalCore` 是在 O(边界数²)≈441 个候选窗口里挑最优。
+也就是说 test 段虽然没参与"满分核画在哪"，但参与了"窗口开在哪"这个更强的搜索。
+同一族的还有 `recommendFactorPath` 贪心（`buildOf(specs, train)` 里的 candidates 同样带全样本 interval）。
+
+**实测（2026-07-29，纯噪声 40 组对照，n=400，右偏 returnMax，字段与目标完全独立）**：
+
+| | mean deltaTest | >0 占比 |
+|---|---|---|
+| A) interval 挖自全样本（现状） | −0.0191 | 53% |
+| B) interval 只挖自 train（对照） | −0.0166 | 50% |
+
+**结论：泄漏在结构上确实存在，但在这个尺度上没测出有统计意义的偏差**（53% vs 50%，40 次试验下这个
+差距本身就在噪声范围内）。所以本轮**只订正文档措辞，不动实现**——把 `computeFieldRaw` 也搬进 train 段
+重挖一次意味着每个候选多扫一遍全窗口搜索（置换检验 200 次 × 441 窗口），性能代价明确，而收益实测不显著。
+真要做，做法记在这里：`computeHeldOutDeltaRho` 里对 `deriveRows` 再跑一次 `computeFieldRaw` 拿 train 段
+自己的 interval，而不是复用候选身上那个。**在有真实数据能证明这层泄漏可测之前，不值得付这个代价。**
+
 **没做**：`FactorRecommendCard`（因子推荐1）的候选预筛现在跟这个按钮算的是同一个数、各算各的，
 存在重复计算。没合并——那属于"两张推荐卡片是否该砍掉一张"的范围，等那个决定做完再一起处理。
 `recommendFactorPoolFull`（因子推荐2）内部贪心用的仍是样本内 `scorePoolRho`，那是它刻意的

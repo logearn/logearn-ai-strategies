@@ -93,6 +93,32 @@ export function run(test) {
     assert.ok(f.mismatches > 0 && f.sample);
   });
 
+  // 2026-07-29：这条方向以前 100% 漏检——compareValue 里写的是 `if (rMiss) return {status:'ok'}`，
+  // 只要 review 侧算不出值，无论线上算出什么都判"一致"。它是有实际代价的：因子的满分区间若覆盖到
+  // 线上那个值，线上给分、回测记 0 分，同一个 cutoff 在两边含义就不同了，而这套自检的全部理由就是防这个。
+  test('verifyParity: 线上算得出、review 缺失 → 单独报 missing_review，不能混进 ok', () => {
+    const rows = mkRows(6);
+    // 只把 review 侧的特征删掉，rawCtx 原样保留 → 线上派生块照样算得出 buy_sell_count_ratio
+    for (const r of rows) delete r.features.buy_sell_count_ratio;
+    const src = `const ALL_CHECKS = [ ['买卖比', f('buy_sell_count_ratio'), 10, 1, 1, 5, 5, null, '1~5'] ]`;
+    const r = verifyParity(src, rows);
+    const f = r.fields.find(x => x.field === 'buy_sell_count_ratio');
+    assert.strictEqual(f.status, 'missing_review', '应被单列出来，而不是判成 ok');
+    assert.ok(f.missingReview > 0, '应统计到具体有多少条样本是这种情况');
+    assert.strictEqual(f.mismatches, 0, '它不是"两边算错了"，不该计进 mismatches');
+    assert.strictEqual(r.ok, true, '不该让整份自检报告变红——review 缺失往往是样本本身没这个字段');
+  });
+
+  test('verifyParity: 两边都缺失仍然算 ok（真正的一致）', () => {
+    const rows = mkRows(6);
+    for (const r of rows) { delete r.features.buy_sell_count_ratio; delete r.rawCtx.logearn.buyer_count_d1; }
+    const src = `const ALL_CHECKS = [ ['买卖比', f('buy_sell_count_ratio'), 10, 1, 1, 5, 5, null, '1~5'] ]`;
+    const r = verifyParity(src, rows);
+    const f = r.fields.find(x => x.field === 'buy_sell_count_ratio');
+    assert.strictEqual(f.status, 'ok');
+    assert.strictEqual(f.missingReview, 0);
+  });
+
   test('generateOnlineCode: 无法解析的字段退化成 null，并列进 unresolved', () => {
     const src = `const ALL_CHECKS = [ ['x', f('nope_field_xyz'), 10, 0, 0, 1, 1, null, '~1'] ]`;
     const g = generateOnlineCode(src, mkRows());

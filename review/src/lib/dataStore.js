@@ -12,8 +12,23 @@ const DB_VER = 1;
 const META = 'batch_meta';
 const DATA = 'batch_data';
 
+// 单连接复用（2026-07-29）。
+//
+// 原来这里每个导出函数都 `await openDb()` 开一个**新**连接，全文件 7 处 open、0 处 close
+// （同目录 fsStore.js 是有 close 的，所以不是不知道这个 API）。loadAllData 更是一次开两个
+// （自己一个 + 内部 listBatches 一个）。一次会话里反复"分析/删批次/归档"会攒下几十上百个
+// 常驻连接。现在不炸，但只要 DB_VER 从 1 升到 2，这些连接会让新页面的 onupgradeneeded 被
+// blocked，而且这里没有 onblocked 处理——表现就是"打不开数据、也不报错"，极难排查。
+//
+// 改成模块内缓存一个 db promise：
+//   - onversionchange：别的标签页要升级 DB 时主动让路，把连接关掉并清缓存（不让路就是上面那个死锁）。
+//   - onclose：连接被浏览器强制关闭（存储压力/用户清数据）后清缓存，下次调用重开，而不是一直用一个死连接。
+//   - 打开失败时把缓存清掉，否则一次失败会被永久缓存住，后面每次调用都拿到同一个 rejected promise。
+let dbPromise = null;
+
 function openDb() {
-  return new Promise((resolve, reject) => {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') { reject(new Error('当前环境不支持 IndexedDB')); return; }
     const rq = indexedDB.open(DB_NAME, DB_VER);
     rq.onupgradeneeded = () => {
@@ -21,9 +36,17 @@ function openDb() {
       if (!db.objectStoreNames.contains(META)) db.createObjectStore(META, { keyPath: 'id', autoIncrement: true });
       if (!db.objectStoreNames.contains(DATA)) db.createObjectStore(DATA, { keyPath: 'id' });
     };
-    rq.onsuccess = () => resolve(rq.result);
+    rq.onsuccess = () => {
+      const db = rq.result;
+      db.onversionchange = () => { try { db.close(); } catch (e) {} dbPromise = null; };
+      db.onclose = () => { dbPromise = null; };
+      resolve(db);
+    };
     rq.onerror = () => reject(rq.error || new Error('IndexedDB 打开失败'));
   });
+  // 失败不缓存：否则第一次失败之后，就算环境恢复了也永远拿到同一个 rejected promise
+  dbPromise.catch(() => { dbPromise = null; });
+  return dbPromise;
 }
 
 function tx(db, stores, mode, fn) {

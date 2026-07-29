@@ -98,6 +98,31 @@ export function run(test) {
     a.forEach(f => counts[f]++);
     assert.ok(counts.every(c => c >= 8 && c <= 12), `各折样本数应均衡：${counts}`);
   });
+  // 2026-07-29：上面那条"均衡"用例每个 token 只有 1 条信号，所以"按组轮转"和"按样本数装箱"
+  // 结果一样，测不出区别。真实数据里组大小是**极度倾斜**的——热门币一天几十条信号、长尾币一两条，
+  // 这时 pos % K 轮转只保证每折拿到差不多多少个 token，样本数可以差好几倍：某一折吃到远超 1/K，
+  // 另一折少到被 heldOutFactorCurve 的 `test.length < 5` 整折丢掉，各 k 的 nFolds 不齐，
+  // 而 1-SE 用的是 testStd/√nFolds —— 分母不同的两个 k 不可比，选出的 k*（推荐因子数）跟着偏。
+  test('assignFoldsByToken: 组大小极度倾斜时，各折的【样本数】仍应大致均衡（不是只均衡 token 数）', () => {
+    const rows = [];
+    // 3 个热门币各 40 条信号 + 30 个长尾币各 1 条 = 150 条，5 折理想值 30 条/折
+    for (let t = 0; t < 3; t++) for (let k = 0; k < 40; k++) rows.push({ tokenAddress: 'HOT' + t, id: `H${t}_${k}` });
+    for (let t = 0; t < 30; t++) rows.push({ tokenAddress: 'TAIL' + t, id: 'L' + t });
+    const foldOf = assignFoldsByToken(rows, 5, 42);
+    const counts = [0, 0, 0, 0, 0];
+    foldOf.forEach(f => counts[f]++);
+    // 3 个 40 条的大组不可拆（同 token 不能跨折），所以最少也有一折 ≥40；只要求没有空折、
+    // 且最大折不超过理想值的 1.6 倍（轮转在这个构造下会跑出 80 条 vs 极少的分布）
+    assert.ok(counts.every(c => c >= 5), `不该有折被饿死：${counts}`);
+    assert.ok(Math.max(...counts) <= 48, `最大折不该吃掉远超 1/K 的样本：${counts}`);
+    // 同 token 不跨折这条硬约束在倾斜数据下同样必须成立
+    const byToken = new Map();
+    rows.forEach((r, i) => {
+      if (!byToken.has(r.tokenAddress)) byToken.set(r.tokenAddress, new Set());
+      byToken.get(r.tokenAddress).add(foldOf[i]);
+    });
+    for (const [tok, folds] of byToken) assert.strictEqual(folds.size, 1, `${tok} 跨折了`);
+  });
   test('assignFoldsByToken: 没有 tokenAddress 时退回按行分折（每行自成一组）', () => {
     const rows = Array.from({ length: 20 }, (_, i) => ({ id: 'r' + i }));
     const foldOf = assignFoldsByToken(rows, 4, 7);

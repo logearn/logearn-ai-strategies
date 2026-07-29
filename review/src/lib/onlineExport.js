@@ -969,11 +969,20 @@ function generateOnlineCode(src, rows) {
 
 // 把某个字段的 online 值与 review 值比一比，返回 { status, rel, online, review }
 // status: 'ok' 一致 | 'mismatch' 数值不一致 | 'missing_online' review 有值线上取不到（如无法解析的字段）
-//         | 'nonnumeric' review 是非数值（地址/平台名等，native 只给数值，无法复现，仅提示）
+//         | 'missing_review' 线上有值但 review 缺失（见下）| 'nonnumeric' review 是非数值
+//         （地址/平台名等，native 只给数值，无法复现，仅提示）
 function compareValue(online, review) {
   const miss = x => x == null || (typeof x === 'number' && !Number.isFinite(x));
   const oMiss = miss(online), rMiss = miss(review);
-  if (rMiss) return { status: 'ok', rel: 0, online, review };
+  // 【2026-07-29】原来这里是 `if (rMiss) return { status: 'ok' }` —— 只要 review 侧算不出值，
+  // 无论线上算出什么都判"一致"，这条方向的偏差 100% 漏检。而它是有实际代价的：
+  // 线上派生块在某个 ctx 上算出了 review 的 buildRows 不会产生的值（比如两边的门槛没对齐，
+  // review 因 MIN_KLINE_BARS_FOR_VOLUME 这类下限跳过了、线上的内联块没跳），
+  // 那么因子的满分区间若覆盖到这个值，线上给分、回测记 0 分 —— 同一个 cutoff 在两边含义就不同了，
+  // 而这套自检存在的全部理由就是防这个。
+  // 单列一个状态而不是并进 mismatch：两边都缺才是真正的"一致"，只有线上多出值才值得看一眼，
+  // 且它不该让整份自检报告变红（review 缺失的原因往往是这条样本本来就没这个字段）。
+  if (rMiss) return { status: oMiss ? 'ok' : 'missing_review', rel: 0, online, review };
   if (typeof review !== 'number' && !Number.isFinite(Number(review))) {
     return { status: 'nonnumeric', rel: NaN, online, review };
   }
@@ -1012,7 +1021,9 @@ function verifyParity(src, rows) {
 
   const kindOf = field => (cls.direct.has(field) ? 'direct' : (cls.derived.includes(field) ? 'derived' : 'unresolved'));
   const stat = new Map();
-  for (const field of usedFields) stat.set(field, { field, kind: kindOf(field), checked: 0, mismatches: 0, maxRel: 0, status: 'ok', sample: null });
+  // missingReview：线上算出值、review 侧缺失的样本数。单独计数，不并进 mismatches
+  // （见 compareValue 里的说明：它是提示，不是"两边算错了"）。
+  for (const field of usedFields) stat.set(field, { field, kind: kindOf(field), checked: 0, mismatches: 0, missingReview: 0, maxRel: 0, status: 'ok', sample: null });
 
   for (const row of usable) {
     const nowMs = Number.isFinite(row.buyTimestamp) ? row.buyTimestamp * 1000 : Date.now();
@@ -1038,6 +1049,13 @@ function verifyParity(src, rows) {
       } else if (cmp.status === 'nonnumeric' && s.status === 'ok') {
         s.status = 'nonnumeric';
         if (!s.sample) s.sample = { tokenAddress: row.tokenAddress, online: cmp.online, review: cmp.review, rel: NaN };
+      } else if (cmp.status === 'missing_review') {
+        s.missingReview++;
+        // 只在还是 'ok' 时抬成 missing_review：真问题（mismatch/missing_online/nonnumeric）优先级更高，不能被盖掉
+        if (s.status === 'ok') {
+          s.status = 'missing_review';
+          if (!s.sample) s.sample = { tokenAddress: row.tokenAddress, online: cmp.online, review: cmp.review, rel: NaN };
+        }
       }
     }
   }

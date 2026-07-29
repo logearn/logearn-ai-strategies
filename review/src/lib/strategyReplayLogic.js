@@ -58,7 +58,11 @@ export function computeScoreBuckets(pairs, winThreshold = 2) {
   // 大部分样本 score 一样、天然分不出高下，桶数也会因合并同分而远少于 K。界面据此提示。
   const scoreCounts = new Map();
   for (const p of sorted) scoreCounts.set(p.score, (scoreCounts.get(p.score) || 0) + 1);
-  const maxTieFrac = Math.max(...scoreCounts.values()) / n;
+  // reduce 而不是 Math.max(...scoreCounts.values())：score 连续时不同分数的个数≈n，
+  // 大样本下展开成参数列表会撞引擎的参数数量上限抛 RangeError（同 compare.js / sweepScoreCutoffs）。
+  let maxTie = 0;
+  for (const c of scoreCounts.values()) if (c > maxTie) maxTie = c;
+  const maxTieFrac = maxTie / n;
   // 单调性：桶序号 vs 桶胜率的 spearman——ρ 高说明"分数高的桶确实胜率更高"这个排序关系成立
   const rho = spearman(buckets.map((b, i) => [i, b.winRate]));
   return { buckets, rho, K, maxTieFrac, effectiveBuckets: buckets.length };

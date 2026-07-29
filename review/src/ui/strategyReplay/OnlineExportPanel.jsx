@@ -46,6 +46,9 @@ export default function OnlineExportPanel({ src, rows }) {
   const report = result?.report;
   const problemFields = report ? report.fields.filter(f => f.status === 'mismatch' || f.status === 'missing_online') : [];
   const nonnumFields = report ? report.fields.filter(f => f.status === 'nonnumeric') : [];
+  // 线上算出值、review 侧缺失：不算错（不让报告变红），但要能看见——
+  // 这条方向以前被无条件判成 'ok'，等于 100% 漏检（见 onlineExport.compareValue 的注释）。
+  const onlyOnlineFields = report ? report.fields.filter(f => f.status === 'missing_review') : [];
   const okCount = report ? report.fields.filter(f => f.status === 'ok').length : 0;
 
   const fmt = v => (v == null ? '缺失' : (typeof v === 'number' ? (Number.isInteger(v) ? String(v) : v.toPrecision(6)) : String(v)));
@@ -57,6 +60,7 @@ export default function OnlineExportPanel({ src, rows }) {
     { title: '状态', dataIndex: 'status', key: 'status', render: s =>
         s === 'mismatch' ? <Tag color="error">数值不一致</Tag>
         : s === 'missing_online' ? <Tag color="error">线上取不到</Tag>
+        : s === 'missing_review' ? <Tag color="warning">仅线上有值</Tag>
         : <Tag color="warning">非数值·跳过</Tag> },
     { title: 'review 值', key: 'review', render: (_, r) => <span>{fmt(r.sample?.review)}</span> },
     { title: '线上值', key: 'online', render: (_, r) => <span>{fmt(r.sample?.online)}</span> },
@@ -97,16 +101,17 @@ export default function OnlineExportPanel({ src, rows }) {
             <Alert type="success" showIcon style={{ marginBottom: 8 }}
               message={<span style={{ fontSize: 12 }}>
                 ✓ 一致性自检通过：{okCount} 个字段在 {report.rowsChecked} 条样本上与 review 口径完全一致（native 算的 = 回测口径）
-                {nonnumFields.length > 0 && <>；另有 {nonnumFields.length} 个非数值字段已跳过</>}。
+                {nonnumFields.length > 0 && <>；另有 {nonnumFields.length} 个非数值字段已跳过</>}
+                {onlyOnlineFields.length > 0 && <>；<b>{onlyOnlineFields.length}</b> 个字段存在「线上算得出、review 缺失」的样本（见下表，不算错，但若因子满分区间覆盖到这些值，线上会给分而回测记 0 分）</>}。
               </span>} />
           ) : report && !report.ok && result.unresolved.length === 0 ? (
             <Alert type="error" showIcon style={{ marginBottom: 8 }}
               message={<span style={{ fontSize: 12 }}>⚠️ 自检发现 {problemFields.length} 个字段口径不一致——native 取值与 review 特征层不符，<b>不要直接上线</b>。</span>} />
           ) : null}
 
-          {(problemFields.length > 0 || nonnumFields.length > 0) && (
+          {(problemFields.length > 0 || nonnumFields.length > 0 || onlyOnlineFields.length > 0) && (
             <Table size="small" rowKey="field" pagination={false} style={{ marginBottom: 8 }}
-              columns={columns} dataSource={[...problemFields, ...nonnumFields]} />
+              columns={columns} dataSource={[...problemFields, ...onlyOnlineFields, ...nonnumFields]} />
           )}
 
           <Space style={{ marginBottom: 6 }}>

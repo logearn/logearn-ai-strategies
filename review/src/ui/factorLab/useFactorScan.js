@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import {
   scanFactorCandidates, buildFactors, autoWeights, computeHeldOutDeltaRho,
 } from '../../lib/factorLab.js';
@@ -67,8 +67,27 @@ export function useFactorScan({ rows, scopedFields, fieldScope, threshold, score
   // 筛选、rows 换了一份而没重扫时，候选还是老那批，建梯形得用挖出它们的那份数据。
   const [scanRowsUsed, setScanRowsUsed] = useState(null);
 
+  // 扫描 / 边际ρ 的"这一轮是不是还算数"（2026-07-29 新增）。
+  //
+  // 这两个操作都要跑几十秒到几分钟。之前既没有 AbortController、也没有 stale 判定，于是：
+  //   ① 用户在「数据与过滤」里改了筛选、或换了高倍阈值再点一次，上一轮照样在烧 CPU；
+  //   ② 先发后到时，**旧 rows 上算出的候选表会覆盖新的**——而紧跟其后的 setScanThreshold(threshold)
+  //      记的却是回调执行那一刻的【最新】阈值，于是 staleScan 判定（见下面那行）判不出过期，
+  //      界面显示的是一张"看起来是新的、其实来自旧数据"的候选表，这比直接报错危险得多。
+  // runId 自增 + abort 上一轮，两件事都解决：旧轮次被 abort 提前收工，就算跑完也会被 runId 判掉。
+  const scanRunRef = useRef(0);
+  const scanAbortRef = useRef(null);
+  const marginalRunRef = useRef(0);
+  const marginalAbortRef = useRef(null);
+
   async function runScan() {
     const scanRows = rows;
+    // 新一轮开始前先掐掉上一轮（worker 池收到 signal 会 terminate 掉手上的 worker）
+    if (scanAbortRef.current) scanAbortRef.current.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    scanAbortRef.current = ac;
+    const runId = ++scanRunRef.current;
+    const isCurrent = () => runId === scanRunRef.current;
     setScanBusy(true);
     setScanProgress(0);
     setMarginalRho(null); // 新一轮扫描的候选区间/AUC 全变了，旧的边际ρ结果直接作废
@@ -88,15 +107,21 @@ export function useFactorScan({ rows, scopedFields, fieldScope, threshold, score
         if (typeof Worker === 'undefined') throw new Error('no worker');
         const both = await scanCandidatesWithWorkers(scanRows, heroScanFields, evilScanFields, {
           ...scanOpts,
-          onProgress: ({ completed, total }) => setScanProgress(total ? completed / total : 0),
+          signal: ac ? ac.signal : undefined,
+          // 进度条也要判轮次：旧轮次的进度回调会把新轮次的进度条来回拉
+          onProgress: ({ completed, total }) => { if (isCurrent()) setScanProgress(total ? completed / total : 0); },
         });
         resHero = both.hero; resEvil = both.evil;
       } catch (e) {
+        if (!isCurrent()) return;   // 已被新一轮取代，连兜底串行都不必跑
         [resHero, resEvil] = await Promise.all([
           scanFactorCandidates(scanRows, heroScanFields, { ...scanOpts, camp: 'hero' }),
           scanFactorCandidates(scanRows, evilScanFields, { ...scanOpts, camp: 'evil' }),
         ]);
       }
+      // 已被新一轮取代就整段丢弃：候选表、scanThreshold/scanScope、重建因子池，一个都不能写，
+      // 否则就是"旧数据的候选表 + 新参数的过期判定"，界面看不出任何异常
+      if (!isCurrent()) return;
       setScanHero(resHero); setScanEvil(resEvil);
       setScanThreshold(threshold);
       setScanScope(fieldScope);
@@ -104,7 +129,10 @@ export function useFactorScan({ rows, scopedFields, fieldScope, threshold, score
       // preserved 原样保留（跨范围因子 + 仍勾选但这次没挖出区间的都留着）。只有手动取消勾选才移除。
       rebuildFactors(resHero, resEvil, selectedHero, selectedEvil, factors, scoreShape, scanRows);
       invalidateDownstream();
-    } finally { setScanBusy(false); }
+    } finally {
+      // 只有当前轮次才有资格关掉 loading——旧轮次结束时新轮次还在跑，它把按钮解开就成了"看着已结束、其实还在算"
+      if (isCurrent()) setScanBusy(false);
+    }
   }
 
   // 合并两个阵营的候选与已选字段，重新构建 factors。新增字段自动推导打分形状，
@@ -203,6 +231,12 @@ export function useFactorScan({ rows, scopedFields, fieldScope, threshold, score
   const visibleEvilCandidates = scanEvil ? filterExcluded(scanEvil.candidates, exclusions, 'evil', c => c.field) : null;
 
   async function runMarginalRho() {
+    // 同 runScan：掐掉上一轮 + runId 判过期（理由见 scanRunRef 的注释）
+    if (marginalAbortRef.current) marginalAbortRef.current.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    marginalAbortRef.current = ac;
+    const runId = ++marginalRunRef.current;
+    const isCurrent = () => runId === marginalRunRef.current;
     setMarginalBusy(true);
     await new Promise(r => setTimeout(r, 0));
     try {
@@ -228,19 +262,23 @@ export function useFactorScan({ rows, scopedFields, fieldScope, threshold, score
       let entries;
       try {
         if (typeof Worker === 'undefined') throw new Error('no worker');
-        const evalOpts = { threshold, missingPolicy, shape: scoreShape, concurrency: 4, batchSize: 16 };
+        const evalOpts = { threshold, missingPolicy, shape: scoreShape, concurrency: 4, batchSize: 16,
+                           signal: ac ? ac.signal : undefined };
         if (buildRows !== rows) evalOpts.buildRows = buildRows; // 通常两者同一份，不重复克隆
         const res = await evaluateCandidatesWithWorkers(rows, factors, cands, evalOpts);
         const byKey = new Map(res.map(r => [r.camp + ':' + r.field, r.result]));
         entries = cands.map(c => [c.camp + ':' + c.field, byKey.get(c.camp + ':' + c.field)]).filter(e => e[1] !== undefined);
       } catch (e) {
+        if (!isCurrent()) return;   // 已被新一轮取代，兜底串行也不必跑（它比 worker 版更慢）
         entries = cands.map(c => [c.camp + ':' + c.field, computeHeldOutDeltaRho(rows, factors, c, c.camp, threshold,
           { shape: scoreShape, missingPolicy, buildRows: buildRows === rows ? null : buildRows })]);
       }
+      // 过期就丢弃：poolKey 记的是【当前】因子池，旧结果配新 poolKey = 一份永远判不出过期的错数据
+      if (!isCurrent()) return;
       const map = new Map();
       for (const [key, result] of entries) map.set(key, result);
       setMarginalRho({ poolKey, map });
-    } finally { setMarginalBusy(false); }
+    } finally { if (isCurrent()) setMarginalBusy(false); }
   }
 
   // 置换零分布：把 returnMax 打乱后重跑整条"挖区间→建梯形→算Δρ"流水线，得到"纯噪声能凑出

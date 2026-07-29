@@ -917,3 +917,69 @@ JSX（第661~800行左右的"时间切片"那一整块）不用改。搬完后 `
 400行上下（上传解析约150行 + JSX约250行）。风险点跟这次一样：**逐个 grep 核对 hook
 返回值有没有被 JSX/analyze() 完整覆盖，不能只看 build 通过**（build 不报未定义变量的
 运行时引用错误，第19.2节已经记过这个坑）。
+
+## 21. 拆"上帝组件"第四步收尾：DataLoader.jsx 抽出 useTimeSlices（2026-07-29）
+
+### 21.1 改法：按第20.4节的计划执行
+
+新增 `ui/dataLoader/useTimeSlices({ batches, store, onRows, onArchiveChange, onStatus,
+onBusyChange })`，把时间切片整块（状态：`allRows`/`sliceKey`/`sliceCats`/`sliceSel`/
+`sliceSelectedDays`/`deletedDays`/`rangeStart`/`rangeEnd`；操作：`emitRows`/`autoLoad`
+及其自动载入 effect/`assignSliceDays`/`assignSelectedDays`/`deleteDays`/
+`deleteSelectedDays`/`restoreDeletedDay`/`assignRange`/`assignAllDays`/`changeSliceSel`/
+`selectDays`；派生值：`sliceSummary`/`sliceTreeData`/`dayKeyMap`/`effectiveCount`；以及
+把 `allRows`/`sliceCats` 上抛给 App 的 `onArchiveChange` effect）搬进去，`DataLoader.jsx`
+的 JSX（时间切片那一整块，约140行）跟第20.2节的 `BaselineVsTrainCard`/`useArchiveManager`
+一样**一行没改**，只是把状态声明换成一次 `useTimeSlices()` 解构。
+
+这个 hook 比 `useArchiveManager` 多两处真正的跨概念耦合（第20.4节已经预判到）：
+- **`store`/`batches`**：`autoLoad`（批次就绪后自动载入上次作用域）要用归档管理 hook
+  的这两样，作为参数传入，不是零依赖。
+- **`onBusyChange`**：原 `autoLoad` 里有 `setBusy(true)`/`setBusy(false)`（控制"分析"按钮
+  的 loading 态，属于上传解析概念、留在 `DataLoader.jsx`），照搬 `onStatus` 的先例加一个
+  回调而不是把 `busy` 状态也搬进 hook——写这段时最初漏掉了这个回调、随手拿一个
+  `onStatus?.({type:'loading'})` 占位糊过去，自己核对时发现这是编造的行为（原代码里根本
+  没有"loading"这个 status type），不是老实的机械搬移，改成了正经的 `onBusyChange` 回调
+  （详见21.2节的核对方法）。
+
+`sliceKey`（切片作用域标识，只在 `emitRows`/`autoLoad` 内部读写，从没被 JSX 或 `analyze()`
+直接引用过）、`sliceCats`（同理，只在时间切片自己的函数内部用）、`dayKeyMap`/
+`daysFromKeys`/`rowsOfKeys`（纯内部辅助）都不对外暴露，只有 JSX 和 `analyze()` 真正要用的
+21 个名字进了 hook 的返回对象。`DataLoader.jsx` 顶部的 `loadSliceCategories`/
+`saveSliceCategories`/`assignDays`/`dayInRange`/`selectRowsBySlice`/`summarizeSlices`/
+`CATEGORIES`/`loadSliceSel`/`saveSliceSel`/`saveSliceScope`/`dayOf`/`strategyOf`/
+`sliceKeyOf`/`loadDeletedDays`/`saveDeletedDays`/`filterDeletedRows`（`lib/dataSlices.js`
+的绝大部分导出）随逻辑一起搬空，只留 `loadSliceScope`（`showArchive` 折叠状态的初始值
+还需要它）。搬完之后 `useEffect`/`useMemo`/`useRef`/`startTransition`（React）和
+antd 的 `message` 在 `DataLoader.jsx` 里也全部失去了唯一用途，一并从 import 里删掉——
+（`message` 差点被误判为还在用，因为文件里还有 6 处 `message` 字样，但逐个核对发现
+全是 `e?.message`（错误对象属性）或 `<Alert message={...}>`（组件 prop 名），没有一处
+是调用antd `message` 单例本身）。
+
+`DataLoader.jsx` 从 641 行（第20节末状态）降到 443 行——连同第20节的
+`useArchiveManager`，两步合计从最初 806 行降到 443 行，去掉约 45%；`FactorLab.jsx`（1503→
+1247，第17~19节）+ `StrategyReplay.jsx`（949→822，第17节）+ `DataLoader.jsx`（806→443，
+第20~21节）三个"上帝组件"目标至此都已完成至少一轮拆分。
+
+### 21.2 验证（含一次真实踩坑）
+
+写这个 hook 时逐段对照原文件手工搬运，搬完用 `diff` 命令把原 `DataLoader.jsx` 第150~336行
+（时间切片整块原文）跟新 hook 文件对应段落做逐行比对（而不是只凭肉眼过一遍）——这一步
+揪出了两处问题：① `autoLoad` 里 `mergeDaily(saved.callsArrays, saved.snapsArrays)` 被
+手滑打成了 `saved.snapshots`（打字时可能是被同一函数里紧接着那行 `merged.snapshots`
+带偏了——两个变量名相似但字段名不同，`saved`/`merged` 是两个不同来源的对象），
+`diff` 一比对立刻现形，改回 `saved.snapsArrays`；② 上面21.1节提到的 `setBusy` 编造成
+`onStatus` 占位那处，也是同一次 `diff` 核对时发现"原文件这里明明是 `setBusy`，我写的是
+瞎编的 `onStatus`"才补上 `onBusyChange`。这两处如果不是逐行 diff 核对、只凭肉眼扫一遍
+大概率会漏过（自动载入这条路径依赖用户已有历史数据+持久化的分析范围，这次环境里
+验证不到，一旦漏改，症状会是"自动载入时长期显示 loading 转圈不停"这种只有真实数据、
+真实用户才会踩到的坑）。这次经验之后，凡是"手工搬运一大段逻辑代码"（不是简单挪 JSX）
+都应该收尾时补一次原文件 vs 新文件的逐行 diff，不能只靠"看起来对"。
+
+`node tests/run-tests.js` 595/595 通过；`npx vite build` 通过；写了个 node 脚本把 hook
+返回的 21 个 key 逐个 grep 在 `DataLoader.jsx` 里的出现次数，确认全部 ≥2 次（destructure
+声明本身 1 次 + 至少 1 次真正被 JSX/analyze() 引用），没有第20节那种"解构了但没用上"的
+死绑定。浏览器截图确认页面正常渲染、无错误边界；因本地没有已存批次数据，`autoLoad`
+这条自动载入路径（连同上面21.2节修复的两个坑）没能在真实数据下端到端触发验证，
+只靠这次的逐行 diff + grep 覆盖率核对，建议用户下次有历史数据时留意一下自动载入
+是否正常（不再一直转圈、批次归档操作/时间切片操作是否符合预期）。

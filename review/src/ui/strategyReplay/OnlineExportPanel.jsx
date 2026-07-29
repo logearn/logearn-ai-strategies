@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { Card, Button, Table, Alert, Typography, Input, Space, Tag, message } from 'antd';
 import { exportWithVerify, generateOnlineCode } from '../../lib/onlineExport.js';
+import { downloadText } from '../../lib/download.js';
+import { copyText } from '../../lib/clipboard.js';
 
 // 「生成上线代码」面板：把策略里的 f('字段') 翻译成【纯 native ctx 代码】直接贴到线上跑。
 // - 直接字段 → 内联 __Vp('ctx路径', 倍率)（gmgn 占比字段 ×100）；
@@ -31,18 +33,14 @@ export default function OnlineExportPanel({ src, rows }) {
 
   const onCopy = async () => {
     if (!result) return;
-    try { await navigator.clipboard.writeText(result.code); message.success('已复制到剪贴板'); }
-    catch { message.error('复制失败，请手动从下方文本框选择'); }
+    const ok = await copyText(result.code);
+    if (ok) message.success('已复制到剪贴板');
+    else message.error('复制失败，请手动从下方文本框选择');
   };
 
   const onDownload = () => {
     if (!result) return;
-    const blob = new Blob([result.code], { type: 'text/javascript;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'strategy-online.js';
-    document.body.appendChild(a); a.click(); a.remove();
-    URL.revokeObjectURL(url);
+    downloadText(result.code, 'strategy-online.js', 'text/javascript;charset=utf-8');
   };
 
   const report = result?.report;

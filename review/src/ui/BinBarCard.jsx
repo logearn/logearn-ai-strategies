@@ -6,6 +6,7 @@ import { buildBins, parseBreakpoints, quantileEdges, buildBinBarAiReport } from 
 import { recommendBreakpoints, mineBreakpointsOOS, calibrateOOSMining } from '../lib/analytics.js';
 import { themeColors } from '../lib/scatterFigure.js';
 import { getFeature } from '../lib/data.js';
+import { downloadText } from '../lib/download.js';
 import { useGroupedFieldOptions, renderFieldOption, fieldFilterOption } from './fieldOptions.jsx';
 import FieldNameWithDesc from './FieldNameWithDesc.jsx';
 import FieldPickerModal from './FieldPickerModal.jsx';
@@ -93,12 +94,7 @@ export default function BinBarCard({ rows, fields, light }) {
     } : null;
     const md = buildBinBarAiReport(R, rows, M);
     if (!md) return;
-    const blob = new Blob([md], { type: 'text/markdown;charset=utf-8;' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `分箱分析_${binField}_${new Date().toISOString().slice(0, 10)}.md`;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(a.href);
+    downloadText(md, `分箱分析_${binField}_${new Date().toISOString().slice(0, 10)}.md`, 'text/markdown;charset=utf-8;');
   }
 
   const columns = [

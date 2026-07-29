@@ -4,18 +4,17 @@
 // 唯独"新建了一个还没放任何批次的空文件夹"这种，没有批次引用它，得单独记一份名单，否则刷新就没了。
 // 用 localStorage 存这份空文件夹名单（跟具体后端无关，轻量），跟 labels.js 一个路子。
 
+import { readJsonLS, writeJsonLS } from './localStorageStore.js';
+
 const STORAGE_KEY = 'review_data_folders_v1';
 
 export function loadFolders() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr.filter(x => typeof x === 'string') : [];
-  } catch { return []; }
+  const arr = readJsonLS(STORAGE_KEY, []);
+  return Array.isArray(arr) ? arr.filter(x => typeof x === 'string') : [];
 }
 
 export function saveFolders(list) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify([...new Set(list)])); } catch { /* 隐私模式 */ }
+  writeJsonLS(STORAGE_KEY, [...new Set(list)]);
 }
 
 export function addFolder(list, name) {

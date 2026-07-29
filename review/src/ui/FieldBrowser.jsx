@@ -4,6 +4,7 @@ import { DownloadOutlined } from '@ant-design/icons';
 import { computeFieldGroups, GROUP_LABELS, GROUP_ORDER } from '../lib/fieldGroups.js';
 import { buildFieldDocs } from '../lib/fieldDocs.js';
 import { getFieldDesc } from '../lib/dictionary.js';
+import { downloadText } from '../lib/download.js';
 
 export default function FieldBrowser({ fields }) {
   const [q, setQ] = useState('');
@@ -13,12 +14,7 @@ export default function FieldBrowser({ fields }) {
 
   function exportDocs() {
     const { markdown, total, rawCount, madeCount } = buildFieldDocs(fields);
-    const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8;' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `字段说明_${total}字段_${new Date().toISOString().slice(0, 10)}.md`;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(a.href);
+    downloadText(markdown, `字段说明_${total}字段_${new Date().toISOString().slice(0, 10)}.md`, 'text/markdown;charset=utf-8;');
     message.success(`已导出 ${total} 个字段（原生 ${rawCount} / 组装 ${madeCount}）`);
   }
 

@@ -3,6 +3,8 @@
 // 不属于任何一份具体策略，不会随策略代码走，可以被发送到"策略"tab 变成任意一份正在编辑的
 // 策略里的一行打分因子 check。
 
+import { readJsonLS, writeJsonLS, readRawLS, writeRawLS } from './localStorageStore.js';
+
 const STORAGE_KEY = 'chart_camp_library_v1';
 const ACTIVE_GROUP_KEY = 'chart_camp_active_group_v1';
 
@@ -30,23 +32,20 @@ export function dedupeCampEntries(list) {
 }
 
 export function loadCampLibrary() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? dedupeCampEntries(arr) : [];
-  } catch { return []; }
+  const arr = readJsonLS(STORAGE_KEY, []);
+  return Array.isArray(arr) ? dedupeCampEntries(arr) : [];
 }
 
 export function saveCampLibrary(list) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch { /* 隐私模式 */ }
+  writeJsonLS(STORAGE_KEY, list);
 }
 
 // "新增归入哪个分组"是个跨会话的偏好——图表里收藏新因子时默认落进这个组，单独存一个 key。
 export function loadCampActiveGroup() {
-  try { return localStorage.getItem(ACTIVE_GROUP_KEY) || DEFAULT_CAMP_GROUP; } catch { return DEFAULT_CAMP_GROUP; }
+  return readRawLS(ACTIVE_GROUP_KEY, DEFAULT_CAMP_GROUP) || DEFAULT_CAMP_GROUP;
 }
 export function saveCampActiveGroup(name) {
-  try { localStorage.setItem(ACTIVE_GROUP_KEY, name || DEFAULT_CAMP_GROUP); } catch { /* 隐私模式 */ }
+  writeRawLS(ACTIVE_GROUP_KEY, name || DEFAULT_CAMP_GROUP);
 }
 
 // 同一字段同一阵营再次收藏＝更新，不再插入新的一条——反复从图表收藏同一字段（比如换了个时间段
@@ -133,10 +132,11 @@ export const DEFAULT_CAMP_WIN_THRESHOLD = 2;
 const GROUP_THRESHOLDS_KEY = 'chart_camp_group_thresholds_v1';
 // 分组 → 高倍阈值 的映射，单独存一个 key（跨会话记住）。
 export function loadCampGroupThresholds() {
-  try { const raw = localStorage.getItem(GROUP_THRESHOLDS_KEY); const o = raw ? JSON.parse(raw) : {}; return o && typeof o === 'object' && !Array.isArray(o) ? o : {}; } catch { return {}; }
+  const o = readJsonLS(GROUP_THRESHOLDS_KEY, {});
+  return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
 }
 export function saveCampGroupThresholds(map) {
-  try { localStorage.setItem(GROUP_THRESHOLDS_KEY, JSON.stringify(map || {})); } catch { /* 隐私模式 */ }
+  writeJsonLS(GROUP_THRESHOLDS_KEY, map || {});
 }
 // 取某个分组的高倍阈值：没设过回落默认。
 export function campGroupThresholdOf(map, group) {

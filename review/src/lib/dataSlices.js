@@ -6,6 +6,7 @@
 // 样本，每条样本自带 strategyName，切片/归类/分析范围一律按样本自己的策略走，不看分析时的批次
 // 选择范围（那只决定了"这次分析纳入哪些数据"，不代表数据本身只属于一个策略）。
 import { UNNAMED } from './dataArchive.js';
+import { readJsonLS, writeJsonLS, readRawLS, writeRawLS } from './localStorageStore.js';
 
 const STORAGE_KEY = 'review_slice_categories_v1';
 const SEL_KEY = 'review_slice_sel_v1';
@@ -15,10 +16,10 @@ const DELETED_KEY = 'review_slice_deleted_v1';
 // 上次分析的作用域（策略/文件夹名，混合时 '__all__'）——持久化，启动时据此自动载入"已规划好的
 // 训练集/基准库"，不用用户再选批次点分析。
 export function loadSliceScope() {
-  try { return localStorage.getItem(SCOPE_KEY) || null; } catch { return null; }
+  return readRawLS(SCOPE_KEY, null);
 }
 export function saveSliceScope(key) {
-  try { if (key) localStorage.setItem(SCOPE_KEY, key); } catch { /* 隐私模式 */ }
+  if (key) writeRawLS(SCOPE_KEY, key);
 }
 
 export const CATEGORIES = { baseline: '基准库', train: '训练集' };
@@ -27,11 +28,11 @@ export const CATEGORIES = { baseline: '基准库', train: '训练集' };
 // 默认 mode:'none'（未选择）——这个管道以切片的基准库/训练集为主体，没显式选过分析范围时
 // 不该悄悄把"全部"（含未分配、未决定训练/基准的原始数据）喂给下游，逼用户先做一次选择。
 export function loadSliceSel() {
-  try { const o = JSON.parse(localStorage.getItem(SEL_KEY) || 'null'); return o && typeof o === 'object' && o.mode ? o : { mode: 'none' }; }
-  catch { return { mode: 'none' }; }
+  const o = readJsonLS(SEL_KEY, null);
+  return o && typeof o === 'object' && o.mode ? o : { mode: 'none' };
 }
 export function saveSliceSel(sel) {
-  try { localStorage.setItem(SEL_KEY, JSON.stringify(sel || { mode: 'none' })); } catch { /* 隐私模式 */ }
+  writeJsonLS(SEL_KEY, sel || { mode: 'none' });
 }
 export const UNKNOWN_DAY = '未知';
 
@@ -97,14 +98,11 @@ export function sliceKeyOf(strategyKey, day) {
 }
 
 export function loadSliceCategories() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const o = raw ? JSON.parse(raw) : {};
-    return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
-  } catch { return {}; }
+  const o = readJsonLS(STORAGE_KEY, {});
+  return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
 }
 export function saveSliceCategories(map) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(map || {})); } catch { /* 隐私模式 */ }
+  writeJsonLS(STORAGE_KEY, map || {});
 }
 
 // 某策略某天的类别：'baseline' | 'train' | null（未分配）。
@@ -129,14 +127,11 @@ export function assignDays(map, strategyKey, days, cat) {
 // 拿掉，不动底层已存批次；不持久化的话，刷新页面/重新点「分析」会重新从存储读全量数据，
 // 删掉的天又会回来。这份名单让重新分析/自动载入也能一直把它们过滤掉，直到手动恢复。
 export function loadDeletedDays() {
-  try {
-    const raw = localStorage.getItem(DELETED_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr.filter(x => typeof x === 'string') : [];
-  } catch { return []; }
+  const arr = readJsonLS(DELETED_KEY, []);
+  return Array.isArray(arr) ? arr.filter(x => typeof x === 'string') : [];
 }
 export function saveDeletedDays(list) {
-  try { localStorage.setItem(DELETED_KEY, JSON.stringify(list || [])); } catch { /* 隐私模式 */ }
+  writeJsonLS(DELETED_KEY, list || []);
 }
 
 // 按已删除名单过滤样本——每条样本按自己的 strategyOf/dayOf 算 key，命中就剔除。

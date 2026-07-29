@@ -3,18 +3,17 @@
 // 只存聚合后的统计量 + 这次用的策略代码，不存逐样本明细——明细本来就能从"策略版本库"里的
 // 代码原样重新跑一遍拿到，没必要把大量重复数据再搬进一个 localStorage key。
 
+import { readJsonLS, writeJsonLS } from './localStorageStore.js';
+
 const STORAGE_KEY = 'chart_backtest_reports_v1';
 
 export function loadBacktestReports() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch { return []; }
+  const arr = readJsonLS(STORAGE_KEY, []);
+  return Array.isArray(arr) ? arr : [];
 }
 
 export function saveBacktestReports(list) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch { /* 隐私模式 */ }
+  writeJsonLS(STORAGE_KEY, list);
 }
 
 // 本地日历日 YYYY-MM-DD——不用 toISOString()（那是 UTC，凌晨时段会跳到前一天，

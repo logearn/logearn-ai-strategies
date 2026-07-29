@@ -7,6 +7,8 @@
 // 标记按 CA（小写）存 localStorage，跨会话保留。降级是"改 returnMax"不是"删样本"——
 // 样本量 n 不变，只是它不再算作赢家；这样统计口径最干净。
 
+import { readJsonLS, writeJsonLS } from './localStorageStore.js';
+
 const STORAGE_KEY = 'chart_token_labels_v1';
 
 // junk 降级到的 returnMax：1.0 = 保本/白忙一场，明确不是赢家（> WIN_THRESHOLD=2 才算赢），
@@ -14,15 +16,12 @@ const STORAGE_KEY = 'chart_token_labels_v1';
 export const JUNK_RETURN = 1.0;
 
 export function loadLabels() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const obj = raw ? JSON.parse(raw) : {};
-    return obj && typeof obj === 'object' ? obj : {};
-  } catch { return {}; }
+  const obj = readJsonLS(STORAGE_KEY, {});
+  return obj && typeof obj === 'object' ? obj : {};
 }
 
 export function saveLabels(labels) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(labels)); } catch { /* 隐私模式 */ }
+  writeJsonLS(STORAGE_KEY, labels);
 }
 
 const norm = ca => String(ca || '').toLowerCase();

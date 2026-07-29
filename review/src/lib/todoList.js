@@ -4,19 +4,18 @@
 // 忽略清单单独落库：某天确实不打算补（比如那批数据本来就是坏的），忽略一次以后
 // 不用每次打开都看到同一条提醒；忽略是按日期记的，不是"删除"，随时能撤销。
 
+import { readJsonLS, writeJsonLS } from './localStorageStore.js';
+
 const TODO_KEY = 'chart_todo_list_v1';
 const IGNORED_DATES_KEY = 'chart_todo_ignored_dates_v1';
 
 export function loadTodos() {
-  try {
-    const raw = localStorage.getItem(TODO_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch { return []; }
+  const arr = readJsonLS(TODO_KEY, []);
+  return Array.isArray(arr) ? arr : [];
 }
 
 export function saveTodos(list) {
-  try { localStorage.setItem(TODO_KEY, JSON.stringify(list)); } catch { /* 隐私模式 */ }
+  writeJsonLS(TODO_KEY, list);
 }
 
 export function addTodo(list, text) {
@@ -40,15 +39,12 @@ export function removeTodo(list, id) {
 }
 
 export function loadIgnoredDates() {
-  try {
-    const raw = localStorage.getItem(IGNORED_DATES_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch { return []; }
+  const arr = readJsonLS(IGNORED_DATES_KEY, []);
+  return Array.isArray(arr) ? arr : [];
 }
 
 export function saveIgnoredDates(list) {
-  try { localStorage.setItem(IGNORED_DATES_KEY, JSON.stringify(list)); } catch { /* 隐私模式 */ }
+  writeJsonLS(IGNORED_DATES_KEY, list);
 }
 
 export function ignoreDate(list, date) {

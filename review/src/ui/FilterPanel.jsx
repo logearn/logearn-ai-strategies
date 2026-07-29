@@ -6,10 +6,8 @@ import { getFeature } from '../lib/data.js';
 import { formatNumberSmart, logearnUrl } from '../lib/utils.js';
 import { useGroupedFieldOptions, renderFieldOption, fieldFilterOption } from './fieldOptions.jsx';
 import FieldPickerModal from './FieldPickerModal.jsx';
-
-const PRESET_KEY = 'chart_filter_presets_v2';
-const loadPresets = () => { try { return JSON.parse(localStorage.getItem(PRESET_KEY)) || {}; } catch { return {}; } };
-const savePresets = p => { try { localStorage.setItem(PRESET_KEY, JSON.stringify(p)); } catch { /* 隐私模式 */ } };
+import { copyText } from '../lib/clipboard.js';
+import { loadFilterPresets as loadPresets, saveFilterPresets as savePresets } from '../lib/filterPresets.js';
 
 // 数据完备性检测：这三个顶层节点都是"整段可能整体缺失"的外部数据源（不是某个字段偶尔是 0/null），
 // gmgn 约四成快照没有、holders/chip_analysis 也可能因为抓取失败整段缺失——缺失时下面依赖它们的
@@ -108,9 +106,10 @@ export default function FilterPanel({ rows, fields, onActiveRows }) {
           <Button icon={<PlusOutlined />} onClick={() => setConds(cs => [...cs, { field: undefined, op: '>=', threshold: '' }])}>
             添加条件</Button>
           <Button type="primary" onClick={run} disabled={!rows.length}>筛选 CA</Button>
-          <Button disabled={!result?.rows.length} onClick={() => {
-            navigator.clipboard?.writeText((result?.rows || []).map(r => r.tokenAddress).filter(Boolean).join('\n'));
-            message.success(`已复制 ${result.rows.length} 个 CA`);
+          <Button disabled={!result?.rows.length} onClick={async () => {
+            const ok = await copyText((result?.rows || []).map(r => r.tokenAddress).filter(Boolean).join('\n'));
+            if (ok) message.success(`已复制 ${result.rows.length} 个 CA`);
+            else message.error('复制失败');
           }}>复制 CA</Button>
           <Button danger onClick={clear}>清除</Button>
         </Space>
@@ -141,9 +140,10 @@ export default function FilterPanel({ rows, fields, onActiveRows }) {
             {requiredNodes.map(n => (
               <Tag key={n}>{COMPLETENESS_NODES.find(x => x.value === n)?.label.split('（')[0] || n} 缺 {completeness.missingBy[n]}</Tag>
             ))}
-            <Button size="small" disabled={!completeness.incomplete} onClick={() => {
-              navigator.clipboard?.writeText(completeness.incompleteRows.map(r => r.tokenAddress).filter(Boolean).join('\n'));
-              message.success(`已复制 ${completeness.incompleteRows.length} 个缺失样本的 CA`);
+            <Button size="small" disabled={!completeness.incomplete} onClick={async () => {
+              const ok = await copyText(completeness.incompleteRows.map(r => r.tokenAddress).filter(Boolean).join('\n'));
+              if (ok) message.success(`已复制 ${completeness.incompleteRows.length} 个缺失样本的 CA`);
+              else message.error('复制失败');
             }}>复制缺失 CA</Button>
             {!completenessApplied
               ? <Button size="small" type="primary" disabled={!completeness.incomplete}

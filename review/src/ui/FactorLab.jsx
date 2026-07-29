@@ -20,6 +20,8 @@ import { replaceScoreRowsInAllChecks } from '../lib/campLibrary.js';
 import { loadFactorPoolState, saveFactorPoolState, clearFactorPoolState } from '../lib/factorPoolStore.js';
 import { buildCandidateExportTsv } from '../lib/factorScanExport.js';
 import { buildBacktestReport, buildWalkForwardReport, buildBaselineVsTrainReport, buildRecommendPathReport } from '../lib/backtestReportExport.js';
+import { downloadJson } from '../lib/download.js';
+import { copyText } from '../lib/clipboard.js';
 import ImportStrategyCard from './factorLab/ImportStrategyCard.jsx';
 import FactorSopCard from './factorLab/FactorSopCard.jsx';
 import MissedRowsCard from './factorLab/MissedRowsCard.jsx';
@@ -233,10 +235,9 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
       .sort((a, b) => Number(b.row.returnMax) - Number(a.row.returnMax));
   }, [backtest, cutoff, threshold]);
   async function copyMissedCAs() {
-    try {
-      await navigator.clipboard.writeText(missedRows.map(s => s.row.tokenAddress).filter(Boolean).join('\n'));
-      message.success(`已复制 ${missedRows.length} 个 CA，可贴到「找因子」散点图的查找CA框里高亮`);
-    } catch { message.error('复制失败，请手动从表格里复制'); }
+    const ok = await copyText(missedRows.map(s => s.row.tokenAddress).filter(Boolean).join('\n'));
+    if (ok) message.success(`已复制 ${missedRows.length} 个 CA，可贴到「找因子」散点图的查找CA框里高亮`);
+    else message.error('复制失败，请手动从表格里复制');
   }
 
   // 采用因子推荐：把推荐路径上的 {field,camp} 并入勾选并重建因子池（跟勾候选一个效果）。
@@ -316,8 +317,9 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
     if (recommendResult?.path?.length) sections.push(buildRecommendPathReport(recommendResult.path, { threshold }));
 
     const report = sections.join('\n\n---\n\n');
-    try { await navigator.clipboard.writeText(report); message.success('完整报告已复制（markdown），直接粘给 AI 即可'); }
-    catch { message.error('复制失败'); }
+    const ok = await copyText(report);
+    if (ok) message.success('完整报告已复制（markdown），直接粘给 AI 即可');
+    else message.error('复制失败');
   }
   // 导出"精简样本"+当前因子池/候选/配置成一份 JSON——不是给人看的报告，是给"直接在 Node 里
   // import factorLab.js 重放同一套函数"用的数据快照。只挑 scoreRows/recommendFactorPath/
@@ -341,12 +343,7 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
         evil: scan.visibleEvilCandidates || [],
       },
     };
-    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `factorlab_raw_${rows.length}行_${new Date().toISOString().slice(0, 10)}.json`;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(a.href);
+    downloadJson(payload, `factorlab_raw_${rows.length}行_${new Date().toISOString().slice(0, 10)}.json`, { pretty: false });
     message.success(`已导出 ${rows.length} 行精简数据（仅 id/symbol/tokenAddress/swapBeginTime/returnMax/features + 因子池/候选），可直接喂给 Node 脚本用 factorLab.js 原函数在内存中验证`);
   }
 

@@ -3,6 +3,7 @@ import { Modal, Button, Input, Card, Tag, Tooltip, Space, Empty, message } from 
 import { AppstoreOutlined, CopyOutlined, PlusOutlined } from '@ant-design/icons';
 import { computeFieldGroups, GROUP_LABELS, GROUP_ORDER } from '../lib/fieldGroups.js';
 import { getFieldDesc } from '../lib/dictionary.js';
+import { copyText } from '../lib/clipboard.js';
 
 // 分组字段看板。200+ 个字段光靠下拉联想很难"逛"——
 // 这里把 8 个主题分组平铺出来，可以整组加、也可以点单个字段加。
@@ -47,9 +48,10 @@ export default function FieldPickerModal({
             <Card key={key} size="small" title={<span style={{ fontSize: 13 }}>{GROUP_LABELS[key]}（{list.length}）</span>}
               extra={<Space size={4}>
                 <Tooltip title="复制该组全部字段名，每行一个">
-                  <Button size="small" type="text" icon={<CopyOutlined />} onClick={() => {
-                    navigator.clipboard?.writeText(list.join('\n'));
-                    message.success(`已复制 ${list.length} 个字段名`);
+                  <Button size="small" type="text" icon={<CopyOutlined />} onClick={async () => {
+                    const ok = await copyText(list.join('\n'));
+                    if (ok) message.success(`已复制 ${list.length} 个字段名`);
+                    else message.error('复制失败');
                   }} />
                 </Tooltip>
                 {multiple && (

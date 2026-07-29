@@ -5,16 +5,7 @@ import { suggestFromReportMetrics } from '../../lib/strategyReplayLogic.js';
 import { buildDailyReportMarkdown, buildDailyReportsMarkdown } from '../../lib/backtestReportExport.js';
 import PlotlyChart from '../PlotlyChart.jsx';
 import { plotColors } from '../../theme.js';
-
-// 下载一份 markdown 文本为 .md 文件——跟项目里其它导出（黑名单/字段说明/分箱报告）同一套 Blob 写法。
-function downloadMarkdown(filename, text) {
-  const blob = new Blob([text], { type: 'text/markdown;charset=utf-8;' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = filename;
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  URL.revokeObjectURL(a.href);
-}
+import { downloadText } from '../../lib/download.js';
 
 const kindTag = kind => (kind === 'optimized'
   ? <Tag color="purple">优化</Tag> : <Tag>日报</Tag>);
@@ -50,8 +41,8 @@ export default function BacktestReports({ light, reportsVersion }) {
     ? suggestFromReportMetrics(selected[0].metrics, selected[selected.length - 1].metrics)
     : null;
 
-  const exportOne = r => downloadMarkdown(`回测报告_${r.date}_${r.kind === 'optimized' ? '优化' : '日报'}_${r.id.slice(0, 8)}.md`, buildDailyReportMarkdown(r));
-  const exportAll = () => downloadMarkdown(`回测报告汇总_${reports.length}份_${todayDateStr()}.md`, buildDailyReportsMarkdown(reports));
+  const exportOne = r => downloadText(buildDailyReportMarkdown(r), `回测报告_${r.date}_${r.kind === 'optimized' ? '优化' : '日报'}_${r.id.slice(0, 8)}.md`, 'text/markdown;charset=utf-8;');
+  const exportAll = () => downloadText(buildDailyReportsMarkdown(reports), `回测报告汇总_${reports.length}份_${todayDateStr()}.md`, 'text/markdown;charset=utf-8;');
 
   const compareFig = (() => {
     if (selected.length < 2) return null;

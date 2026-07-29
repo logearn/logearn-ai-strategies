@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { downloadText, downloadJson } from '../lib/download.js';
 
 // 固定在页面最下方的轻量性能监控条：FPS + JS堆内存 + 主线程长任务(>50ms)记录。
 // 动机：因子推荐1去掉 candLimit=50 截断后贪心搜索变重，"删除因子后自动重算"这个隐藏逻辑在
@@ -92,11 +93,10 @@ export default function PerfMonitor() {
     const stamp = new Date();
     const pad = n => String(n).padStart(2, '0');
     const fname = `perf-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}${pad(stamp.getSeconds())}.${fmt}`;
-    let blob;
     if (fmt === 'csv') {
       const rows = [['time', 'duration_ms'],
         ...longTasks.map(t => [new Date(t.time).toISOString(), t.duration.toFixed(1)])];
-      blob = new Blob(['﻿' + rows.map(r => r.join(',')).join('\n')], { type: 'text/csv;charset=utf-8' });
+      downloadText('﻿' + rows.map(r => r.join(',')).join('\n'), fname, 'text/csv;charset=utf-8');
     } else {
       const payload = {
         exportedAt: stamp.toISOString(),
@@ -104,13 +104,8 @@ export default function PerfMonitor() {
         recentWindowMs: 10000, recentCount: recent.length, worstRecentMs: worstRecent,
         longTasks: longTasks.map(t => ({ time: new Date(t.time).toISOString(), durationMs: t.duration })),
       };
-      blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      downloadJson(payload, fname);
     }
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = fname;
-    a.click();
-    URL.revokeObjectURL(url);
   };
 
   return (

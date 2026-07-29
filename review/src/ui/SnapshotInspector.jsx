@@ -9,6 +9,8 @@ import { themeColors } from '../lib/scatterFigure.js';
 import { useGroupedFieldOptions, renderFieldOption, fieldFilterOption } from './fieldOptions.jsx';
 import { getLabel } from '../lib/labels.js';
 import { dayOf } from '../lib/dataSlices.js';
+import { downloadJson } from '../lib/download.js';
+import { copyText } from '../lib/clipboard.js';
 
 // 快照数据速查：输入 CA 直接看这条样本的原始 JSON。
 // 用途——分析里看到某个字段值奇怪时，回原始数据核对是"算错了"还是"数据本来就这样"。
@@ -144,17 +146,13 @@ export default function SnapshotInspector({ rows, labels = {}, onLabel, light })
     };
   }, [row, q, searchMode]);
 
-  const copy = obj => {
-    navigator.clipboard?.writeText(JSON.stringify(obj, null, 2));
-    message.success('已复制 JSON');
+  const copy = async obj => {
+    const ok = await copyText(JSON.stringify(obj, null, 2));
+    if (ok) message.success('已复制 JSON');
+    else message.error('复制失败');
   };
   const download = (obj, name) => {
-    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `${name}_${row.symbol || row.tokenAddress}.json`;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(a.href);
+    downloadJson(obj, `${name}_${row.symbol || row.tokenAddress}.json`);
   };
 
   const ctxData = filtered ? filtered.ctx : row?.rawCtx;
@@ -306,7 +304,11 @@ export default function SnapshotInspector({ rows, labels = {}, onLabel, light })
                   </Space>
                   {holderSolFig
                     ? <PlotlyChart ref={solPlotRef} traces={holderSolFig.traces} layout={holderSolFig.layout} height={380}
-                        onPointClick={addr => { navigator.clipboard?.writeText(addr); message.success('已复制持有人地址：' + addr); }} />
+                        onPointClick={async addr => {
+                          const ok = await copyText(addr);
+                          if (ok) message.success('已复制持有人地址：' + addr);
+                          else message.error('复制失败');
+                        }} />
                     : <Typography.Text type="secondary">开启对数 Y 轴后没有可显示的正数余额</Typography.Text>}
                 </>)}
               </> },

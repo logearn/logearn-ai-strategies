@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { Typography, Alert, Row, Col, Statistic, Table, Checkbox, Card, Space, InputNumber, Button, App as AntApp } from 'antd';
 import PlotlyChart from '../PlotlyChart.jsx';
+import { copyText } from '../../lib/clipboard.js';
 
 // "总分 vs 收益"整块：score-return 相关性统计 + 散点图 + 分位桶胜率表 + 样本外验证。
 // 不依赖 scoreAgg（那个要求打分池非空才非 null）——只要 checks 里能找到"总分"这一行就展示，
@@ -22,10 +23,9 @@ export default function ScoreReturnPanel({
       .sort((a, b) => b.ret - a.ret);
   }, [scoreReturnPairs, minReturn, maxScore]);
   async function copyFilteredCAs() {
-    try {
-      await navigator.clipboard.writeText(filteredPairs.map(p => p.addr).filter(Boolean).join('\n'));
-      message.success(`已复制 ${filteredPairs.length} 个 CA`);
-    } catch { message.error('复制失败，请手动从表格里复制'); }
+    const ok = await copyText(filteredPairs.map(p => p.addr).filter(Boolean).join('\n'));
+    if (ok) message.success(`已复制 ${filteredPairs.length} 个 CA`);
+    else message.error('复制失败，请手动从表格里复制');
   }
   if (!scoreReturnStats) return null;
   return (

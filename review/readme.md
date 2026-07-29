@@ -647,3 +647,91 @@ ctx 路径，直接取值）、`derived`（字段名在 `FIELD_TO_BLOCK` 里，�
 kline_bars），跑 `generateOnlineCode` 对 20+ 个新搬字段逐一核对——`chip_analysis.
 price_concentration_hhi`/`mcap_to_max_up_ratio`/`max_up_speed_pct_per_min`/
 `v_breakout_volume_recent_breakout_ratio` 等值与手算完全一致，`unresolved` 为空。
+
+## 15. 死代码清理：custom-fields.js 老版面板管理代码 + utils.js 两个零调用函数（2026-07-29）
+
+### 15.1 起因
+
+对 `src/lib`/`src/ui` 做整体重构扫描时发现：`custom-fields.js` 是从 `js/custom-fields.js`
+机械移植来的，里面除了公式编译执行 + 聚合函数库这部分仍在被 `data.js`/`customFieldsRuntime.js`
+实际使用外，还带着一整套"老版面板管理代码"（增删字段、导入导出配置、字段依赖分析）——这部分
+依赖老版 `ui.js` 的模块级全局变量（`matchedRows`/`allNumericKeys`/`renderCustomFieldList`/
+`updateScatterSelects`/`refreshAnalysisViews`/`showToast`/`showConfirm`/浏览器 `prompt()`），
+React 化时从未被迁移接入，`customFieldsRuntime.js` 早已用"定义作为入参"的纯函数版本
+（`applyDefs`/`testDef`/`validateName`）取代了它。逐个 grep 确认零调用方后，这部分代码不只是
+"暂时没用"，调用了就会直接 `ReferenceError`——纯粹的死重量，容易误导读者以为它是活的。
+
+### 15.2 删除范围
+
+`custom-fields.js` 删除：`applyCustomFields`（被 `customFieldsRuntime.js` 的 `applyDefs`
+取代）、`customFieldStats`、`removeCustomFieldValues`、`refreshAfterCustomFieldChange`、
+`extractFieldRefs`/`computeCustomFieldDependencies`（字段依赖分析，从未接入任何 UI）、
+`editingCustomFieldIdx`、`validateCustomFieldName`（被 `customFieldsRuntime.js` 的
+`validateName` 取代）、`promptImportConflict`/`importCustomFieldsFromFile`（导入导出配置，
+从未接入 UI）、`saveCustomFields`（写入路径已由 `customFieldsRuntime.js` 的 `saveDefs`
+接管）、`CUSTOM_FIELDS_CONFIG_VERSION`、`CUSTOM_FIELD_TEMPLATES`。连带清掉因此变成死代码的
+顶部 import（`DERIVED_KEYS`/`SIGNAL_KEYS`/`readJson` 来自 `data.js`、`FIELD_DESC` 来自
+`dictionary.js`、`formatNumberSmart` 来自 `utils.js`——后者其实一开始就没被用到）。保留：
+`customFields` 模块状态 + `loadCustomFields`（`data.js` 的 `isAssembledField` 要查、
+`customFieldsRuntime.js` 的 `saveDefs` 保存后要用它同步模块状态）、`compileCustomField`/
+`invokeCustomField`/`customRowMeta`/`buildZscoreFn`（公式编译执行链路，`customFieldsRuntime.js`
+直接引用）、以及聚合/公共函数库全体（`countWhere`/`avgField`/`sumField`/`maxField`/`minField`/
+`giniCoefficient`/`safeDiv`/`pct`/`clamp`/`log1p`及其 `_FN_NAMES`/`_FNS` 常量——这些是用户
+写自定义字段公式时能直接调用的运行时工具箱，不是死代码）。文件从 382 行降到约 210 行。
+
+`utils.js` 删除两个零调用方的函数：`withLoading`（依赖不存在的 `showLoading`/`hideLoading`
+全局函数，调用即崩）、`csvEscape`（纯函数但确认全项目无引用）。
+
+### 15.3 验证
+
+`node tests/run-tests.js` 595/595 通过（这次清理删的都是零测试覆盖的死代码，测试数不变）；
+`npx vite build` 通过。
+
+## 16. 抽公共工具：文件下载 + 剪贴板复制 + localStorage 读写（2026-07-29）
+
+### 16.1 起因
+
+整体重构扫描发现三类样板代码在多个组件/lib 文件里各自手写、逐字重复：`new Blob→
+createObjectURL→临时<a>→点击→清理` 这套文件下载流程在 8 个组件里各写一遍，写法还互相不一致
+（有的不 append 到 DOM、有的用 `a.remove()` 有的用 `removeChild`——`BacktestReports.jsx` 甚至
+已经在注释里承认"跟项目里其它导出同一套 Blob 写法"却没有真的抽出来）；`navigator.clipboard.
+writeText` 包 try/catch 弹 antd message 这套在 8 处组件里重复，其中几处用可选链裸调用不处理
+失败，复制真失败了也照样弹"已复制"；`localStorage.getItem/setItem` + `JSON.parse/stringify` +
+try/catch（隐私模式兜底）这套在 12 个 lib 文件、17 个 key 上重复，部分注释还写着"跟 labels.js /
+excludedTokens.js 一个路子"——即已经意识到在重复，但没有收口。
+
+### 16.2 改法
+
+新增三个纯工具模块，只收公共的取值/异常吞掉这层机制，各 store 自己的形状校验（是不是数组/
+字段够不够）留在各自文件里，不强行塞进一个过度泛化的工厂函数：
+
+- **`lib/download.js`**：`downloadBlob(content, filename, mimeType)` + 两个便捷封装
+  `downloadText`/`downloadJson`。8 处调用点（`FieldBrowser.jsx`/`BinBarCard.jsx`/
+  `SnapshotInspector.jsx`/`LabelPanel.jsx`/`PerfMonitor.jsx`/`FactorLab.jsx`/
+  `strategyReplay/BacktestReports.jsx`/`strategyReplay/OnlineExportPanel.jsx`）全部改用它；
+  `BacktestReports.jsx` 里那个已经自认重复的本地 `downloadMarkdown` 直接删掉。
+- **`lib/clipboard.js`**：`copyText(text)` 只负责复制本身（成功返回 true/失败返回 false），
+  成功/失败提示文案留给调用方——各处提示语义不同（"已复制 JSON"/"已复制 N 个 CA"等），
+  不能强行统一成一句话。8 处调用点改用它，顺带修正了几处"复制失败也照样弹成功"的小毛病
+  （`SnapshotInspector.jsx`/`FieldPickerModal.jsx`/`FilterPanel.jsx` 原来用
+  `navigator.clipboard?.writeText(...)` 裸调用不管结果）。
+- **`lib/localStorageStore.js`**：`readJsonLS`/`writeJsonLS`/`readRawLS`/`writeRawLS`/
+  `removeLS` 五个原语。改造了 `labels.js`/`dataFolders.js`/`excludedTokens.js`/
+  `factorExclusions.js`/`removedFactors.js`/`backtestReports.js`/`strategyVersions.js`/
+  `tableHiddenFields.js`/`factorPoolStore.js`/`todoList.js`（2 个 key）/`dataSlices.js`
+  （4 个 key）/`campLibrary.js`（3 个 key）共 12 个文件、17 处读写。另外把 `FilterPanel.jsx`
+  里内联的筛选预设持久化（`loadPresets`/`savePresets`）挪成独立的 `lib/filterPresets.js`，
+  跟项目里其它持久化状态（因子池/已删因子/已排除因子等都各自有 lib 模块）的惯例对齐——
+  之前这是唯一一处内联在组件里的持久化状态。
+
+没动 `custom-fields.js`/`customFieldsRuntime.js` 里的 localStorage 调用——前者刚在第15节清理过，
+后者的 `loadDefs`/`saveDefs` 逻辑和错误处理跟其它 store 已经不完全一样（`saveDefs` 保存后要连带
+调 `loadCustomFields()` 同步模块状态），不值得为了统一而改，改动风险大于收益。
+
+### 16.3 验证
+
+`node tests/run-tests.js` 595/595 通过（纯提取重构，行为不变，测试数不变）；`npx vite build`
+通过；dev server 里过一遍页面加载，控制台无新增报错（原有的 antd `Space.direction` 过时警告
+是既有噪声，跟这次改动无关）。导出/复制类按钮大多要求先通过原生文件选择框加载真实数据才能
+触发（跟前几节记录的限制一样），这次没能在浏览器里逐个点击实测下载/复制成功——改动本身是
+纯函数级别的行为等价替换（每处调用点逐个核对过参数/mimeType 跟原写法一致），风险可控。

@@ -1,8 +1,9 @@
 // 自定义字段的纯运行时。
 //
-// custom-fields.js 里的 applyCustomFields 依赖模块级的 customFields 数组和 customFieldStats，
-// React 组件没法直接改这些（import 绑定是只读的）。这里提供一份"定义作为入参"的等价实现，
-// 组件持有定义、这里只负责算，算完的统计一并返回。
+// custom-fields.js 老版本的 applyCustomFields 依赖模块级的 customFields 数组做增删改
+// （import 绑定是只读的，React 组件没法直接改这些，那份实现已随其它面板管理代码一起删除，
+// 2026-07-29）。这里提供一份"定义作为入参"的等价实现，组件持有定义、这里只负责算，
+// 算完的统计一并返回。
 //
 // 但有一处必须同步回模块状态：data.js 的 isAssembledField 会查 custom-fields.js 的
 // customFields 来判断某字段是不是自定义字段（决定它在字段浏览器里的分组）。

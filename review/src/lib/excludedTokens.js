@@ -5,20 +5,19 @@
 // 按 CA（小写）存 localStorage，跨会话保留；连 symbol 一起存一份快照——排除之后这条样本就不在
 // 工作集里了，回头在管理面板里看"删的是哪个"不能再指望从当前 rows 里查回来。
 
+import { readJsonLS, writeJsonLS } from './localStorageStore.js';
+
 const STORAGE_KEY = 'chart_excluded_tokens_v1';
 
 const norm = ca => String(ca || '').toLowerCase();
 
 export function loadExcludedTokens() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch { return []; }
+  const arr = readJsonLS(STORAGE_KEY, []);
+  return Array.isArray(arr) ? arr : [];
 }
 
 export function saveExcludedTokens(list) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch { /* 隐私模式 */ }
+  writeJsonLS(STORAGE_KEY, list);
 }
 
 export function excludeToken(list, { ca, symbol }) {

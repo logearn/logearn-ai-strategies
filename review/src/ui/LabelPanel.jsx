@@ -3,6 +3,7 @@ import { Card, Table, Tag, Button, Space, Typography, Empty, message, Popconfirm
 import { DownloadOutlined, ClearOutlined } from '@ant-design/icons';
 import { junkList, goodList } from '../lib/labels.js';
 import { logearnUrl } from '../lib/utils.js';
+import { downloadText } from '../lib/download.js';
 
 // 人工标注管理：列出所有已标记的代币，支持黑名单导出；下面另有一块"已删除样本"——
 // 那是彻底从工作集拿掉的（跟标垃圾不是一回事，标垃圾只降级 returnMax，样本还在），
@@ -23,12 +24,7 @@ export default function LabelPanel({ rows, labels, onLabel, onClearAll, excluded
   function exportBlacklist() {
     if (!junk.length) { message.warning('还没有标记为垃圾的代币'); return; }
     const text = junk.join('\n');
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8;' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `黑名单_${junk.length}个_${new Date().toISOString().slice(0, 10)}.txt`;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(a.href);
+    downloadText(text, `黑名单_${junk.length}个_${new Date().toISOString().slice(0, 10)}.txt`);
     message.success(`已导出 ${junk.length} 个黑名单 CA`);
   }
 

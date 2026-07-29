@@ -1,23 +1,8 @@
-// ⚠️ 由 js/utils.js 机械移植而来：逻辑一行未改，只在文件首尾加了 import / export。
-// 122 个既有测试全部改为从这里 import，测试通过即证明移植是忠实的。
+// ⚠️ 由 js/utils.js 机械移植而来，逻辑基本未改（122 个既有测试全部改为从这里 import，
+// 测试通过即证明移植是忠实的），只删掉了两个零调用方且依赖旧版 ui.js 全局函数
+// （showLoading/hideLoading）的死函数：withLoading、csvEscape（2026-07-29）。
 
 // ========== 通用纯函数工具（无 DOM 依赖，无状态） ==========
-
-async function withLoading(text, fn) {
-  showLoading(text);
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-  try {
-    return await fn();
-  } finally {
-    hideLoading();
-  }
-}
-
-function csvEscape(v) {
-  const s = v === null || v === undefined ? '' : String(v);
-  if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
-  return s;
-}
 
 // 更直观的数值展示：普通范围（如百分比、倍数）用定点小数，只有极小/极大的值才退化成科学计数法，
 // 避免像 gmgn.stat.top_bundler_trader_percentage=7.98 这种值被显示成 "7.980e+0" 造成"数值有问题"的误解
@@ -422,7 +407,6 @@ export {
   compareGeneric,
   computeClipRange,
   computeROC,
-  csvEscape,
   downsampleQuantiles,
   erf,
   formatNumberSmart,
@@ -440,5 +424,4 @@ export {
   tukeyFence,
   twoProportionTestP,
   wilsonInterval,
-  withLoading,
 };

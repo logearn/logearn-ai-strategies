@@ -3,18 +3,17 @@
 // "存为新版本"只在你觉得这版调好了、想留个存档/方便切换回去时才点。
 // 同名允许重复保存（不强制唯一），保留完整历史而不是"新的覆盖旧的"。
 
+import { readJsonLS, writeJsonLS } from './localStorageStore.js';
+
 const STORAGE_KEY = 'chart_strategy_versions_v1';
 
 export function loadStrategyVersions() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch { return []; }
+  const arr = readJsonLS(STORAGE_KEY, []);
+  return Array.isArray(arr) ? arr : [];
 }
 
 export function saveStrategyVersions(list) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch { /* 隐私模式 */ }
+  writeJsonLS(STORAGE_KEY, list);
 }
 
 // 从策略代码里抓一个版本号做默认名字建议——约定见 code-score.js 的 VERSION = '...' 这行；

@@ -2,18 +2,17 @@
 // 出现，不用每次重新扫描都再把同一批字段挑出去一遍。按 camp+field 记——同一字段完全可能
 // 适合勇者阵营（比如高倍盘常见的取值区间）但不适合邪恶阵营，两边独立判定、互不影响。
 
+import { readJsonLS, writeJsonLS } from './localStorageStore.js';
+
 const STORAGE_KEY = 'chart_factor_exclusions_v1';
 
 export function loadFactorExclusions() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch { return []; }
+  const arr = readJsonLS(STORAGE_KEY, []);
+  return Array.isArray(arr) ? arr : [];
 }
 
 export function saveFactorExclusions(list) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch { /* 隐私模式 */ }
+  writeJsonLS(STORAGE_KEY, list);
 }
 
 export function excludeFactor(list, { camp, field }) {

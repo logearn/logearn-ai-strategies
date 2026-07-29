@@ -4,18 +4,17 @@
 // 按 localStorage 存，跟 labels.js / excludedTokens.js 一个路子。不跟具体某份策略绑定——
 // 存的是 check 行原文，加回来时插进当前策略的数组即可（只要还是 ALL_CHECKS / checks 架构）。
 
+import { readJsonLS, writeJsonLS } from './localStorageStore.js';
+
 const STORAGE_KEY = 'chart_removed_factors_v1';
 
 export function loadRemovedFactors() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch { return []; }
+  const arr = readJsonLS(STORAGE_KEY, []);
+  return Array.isArray(arr) ? arr : [];
 }
 
 export function saveRemovedFactors(list) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch { /* 隐私模式 */ }
+  writeJsonLS(STORAGE_KEY, list);
 }
 
 // 记一条被删的因子。同名的旧记录先去掉再插到最前——同一个因子反复删/加时不堆积重复条目，

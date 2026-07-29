@@ -831,3 +831,89 @@ cutoff 滑块/时间外推详情面板的渲染结果——风险集中在"prop 
 19 个 prop 逐个跟原变量名核对过，且 build 不报 `is not defined`/`is not a function`
 这类运行时才会暴露的引用错误（React 组件里未定义变量在纯渲染路径下会在 build 阶段被
 当成全局引用放过，需要格外靠这次逐项核对而非只靠 build 通过）。
+
+## 20. 拆"上帝组件"第四步：DataLoader.jsx 抽出 useArchiveManager（进行中，见20.4待办）
+
+### 20.1 跟前三步不一样在哪
+
+前三步（第17~19节）都是"从一个大文件里搬一块自包含的 JSX/子组件出去"，风险集中在"prop
+传漏"这一类问题。`DataLoader.jsx`（改前806行）不一样：它是三件**互相牵扯**的事混一个文件——
+①文件上传解析（`files`/`analyze()`）②存储后端+批次/文件夹归档管理（`backend`/`batches`/
+`folders`/...）③时间切片（`allRows`/`sliceCats`/`sliceSel`/...），`analyze()` 这个函数本身
+要跨读①②③三块状态，不是"挑一块搬走"能解决的，得先按 `ui/factorLab/useFactorScan.js` 的
+先例拆成 hook，把状态管理和渲染分开，同时保留 `analyze()` 这个跨三块的"胶水函数"在主组件里。
+
+### 20.2 这次做了什么：`useArchiveManager`
+
+新增 `ui/dataLoader/useArchiveManager.js`，把②（存储后端+批次/文件夹归档管理）整块搬进去——
+这是三块里状态耦合最少、最适合先拆的一块（时间切片虽然也依赖 batches/store 做自动载入，
+但只读不改；上传解析`analyze()`才是真正双向依赖②③的那个，见下节待办）。搬的内容：
+- 状态：`batches`/`storeOk`/`backfilling`/`backend`/`fsDirName`/`fsPendingAuth`/`folders`/
+  `selectedKeys`/`folderModal`
+- 派生值：`store`（按 backend 选 fsStore/idbStore）/`savedCalls`/`savedSnaps`/`groups`/
+  `multiStrategy`/`needsBackfill`/`batchKeyToId`/`selectedBatchIds`/`selectionGroupLabel`/
+  `treeData`
+- 操作：`refreshBatches`/`handlePickDirectory`/`handleAuthorize`/`handleForgetDirectory`/
+  `moveBatchesToFolder`/`createFolder`/`renameFolderTo`/`deleteFolder`/`submitFolderModal`/
+  `deleteBatchIds`/`handleBackfill`
+
+关键设计点：**hook 返回值的 key 名跟 `DataLoader.jsx` 原来的本地变量名完全一致**——JSX
+渲染部分（原第503~806行）因此**一行没改**，只是把上面这些声明换成一次
+`const {...} = useArchiveManager({ onStatus: setStatus })`。这是刻意延续第17~19节"改动面
+最小化"的做法：JSX 越不用碰，出错面越小。唯一的跨概念耦合是 `handlePickDirectory`/
+`handleAuthorize`/`handleBackfill` 内部要在失败/完成时报一条状态——不是把 `status`
+状态也搬进 hook（那会让 hook 管上传解析该管的东西），而是让 hook 接收一个 `onStatus`
+回调，`DataLoader.jsx` 传 `setStatus` 进去，两边只通过这一个回调耦合。
+
+`DataLoader.jsx` 原本 `groupBatches`/`deriveBatchStrategy`/`UNNAMED`/`loadFolders`等
+导入随对应逻辑一起搬空，顶部 import 相应清理；`groupKeyOf`/`UNKNOWN_ID`/`fsStore`
+因为在剩下的 `analyze()`/`autoLoad()`/JSX（`fsStore.isSupported()`）里还有独立用途，
+保留在 `DataLoader.jsx`。`MOVE_OUT`/`storageLabel` 两个原来定义在 `DataLoader.jsx`
+顶部的模块级常量/函数搬进 hook 模块导出，`DataLoader.jsx` 改成从 hook 模块 import
+（而不是各自留一份），因为一个只服务归档逻辑、一个是単纯格式化，都没有理由留在两处。
+`DataLoader.jsx` 从 806 行降到 641 行。
+
+### 20.3 验证
+
+`node tests/run-tests.js` 595/595 通过；`npx vite build` 通过；额外做了两层核对（这次没有
+现成测试覆盖这个组件，比前三步更依赖手工核对）：① 写了个 node 脚本对 hook 返回的 32 个
+key 逐个 grep 原 JSX 里的引用次数，确认全部 ≥1 次被用到（`createFolder`/`renameFolderTo`/
+`batchKeyToId` 三个显示只有 1 次——即只在解构语句本身出现，回查发现它们原本就只被
+`submitFolderModal`/`selectedBatchIds` 内部调用、从未被 JSX 直接引用，这三个随手一起
+搬进 hook 后已经是 hook 内部实现细节，不需要在 `DataLoader.jsx` 再解构出来，删掉了这三个
+死绑定）；② 在浏览器里实际加载页面截图确认「数据源」卡片正常渲染（上传按钮/分析按钮/
+选择本地文件夹按钮都在，没有报错边界/白屏）——但因为本地没有已存批次数据，没能实际点开
+「数据源管理」展开归档树、建文件夹、勾批次这些交互路径，这部分只靠上面的 grep 核对
++ build 通过，没有端到端点击验证。dev server 控制台里的 `Failed to reload DataLoader.jsx`
+跟第18~19节记录的同一个"长期运行 dev server 旧模块图"问题同源（同一次 `WeightSuggestionPreview`
+残留触发的级联），`npx vite build` 全新进程不受影响。
+
+### 20.4 待办：时间切片还没拆
+
+`DataLoader.jsx` 剩下的 641 行里，时间切片（`allRows`/`sliceKey`/`sliceCats`/`sliceSel`/
+`sliceSelectedDays`/`deletedDays`/`rangeStart`/`rangeEnd` 及 `emitRows`/`autoLoad`/
+`sliceSummary`/`sliceTreeData`/`dayKeyMap`/`daysFromKeys`/`rowsOfKeys`/`assignSliceDays`/
+`assignSelectedDays`/`deleteDays`/`deleteSelectedDays`/`restoreDeletedDay`/`assignRange`/
+`assignAllDays`/`changeSliceSel`/`selectDays`/`effectiveCount`，约200行）还没拆，是下一步
+目标。跟 `useArchiveManager` 不同，这块**不能照搬同一套手法直接抽**，原因：
+- `emitRows`（分析完成后的收尾：过滤已删天数、记作用域、发下游）被 `analyze()`
+  （留在主组件，上传解析概念）和 `autoLoad()`（自身也该进这个 hook）两处调用，
+  `analyze()` 传入 `rawRows`+`key` 两个参数即可，不需要读取 `analyze()` 内部状态，
+  接口是干净的，可以整体搬。
+- 但 `autoLoad()` 需要 `batches`+`store`（来自 `useArchiveManager`）——即将新增的
+  `useTimeSlices` hook 需要接收 `batches`/`store` 作为参数（或者 `DataLoader.jsx`
+  把这两样当参数传给它），不能像 `useArchiveManager` 那样零依赖独立。
+- `onArchiveChange` 这个 effect（第57~63行，把 `allRows`/`sliceCats` 上抛给 App 供
+  FactorLab 用）要跟着 `allRows`/`sliceCats` 一起搬进新 hook。
+- `showArchive` 这个纯 UI 折叠开关虽然初始值读 `loadSliceScope()`（时间切片的持久化
+  状态），但语义上是"数据源管理面板要不要默认展开"，跟归档管理（`useArchiveManager`）
+  关系更近；先留在 `DataLoader.jsx` 主体，不强行归进任一个 hook。
+
+建议的下一步做法：新增 `ui/dataLoader/useTimeSlices({ batches, store, onRows })`，
+返回值 key 名同样跟 `DataLoader.jsx` 现有本地变量名保持一致（复用第20.2节这条纪律），
+JSX（第661~800行左右的"时间切片"那一整块）不用改。搬完后 `DataLoader.jsx` 应该只剩
+`analyze()`（真正的胶水函数，读两个 hook 的返回值 + 自己的 `files`/`uploadKey`/`status`/
+`busy`/`pct`/`includeSaved`/`persist`）和 JSX。做完这一步后 `DataLoader.jsx` 大概能降到
+400行上下（上传解析约150行 + JSX约250行）。风险点跟这次一样：**逐个 grep 核对 hook
+返回值有没有被 JSX/analyze() 完整覆盖，不能只看 build 通过**（build 不报未定义变量的
+运行时引用错误，第19.2节已经记过这个坑）。

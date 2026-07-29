@@ -301,7 +301,8 @@ export const MERGED_SAMPLE_CTX: any = {
       "history_start_time": 1781993400,  // 休眠阶段的开始和结束时间
       "history_end_time": 1782048900,
       "history_kline_count": 35, //本次休眠阶段一共涉及到了多少根K线
-      "volume_ratio": 12.310779, // 当前苏醒交易量是平均休眠交易量的多少倍，直接当倍数用就行（比如 12.31 表示 12.31x，对应 content 文案里的"12.31x"，不用再乘 100）
+      "volume_ratio": 12.310779, // 当前苏醒交易量是平均休眠交易量的多少倍，直接当倍数用就行（比如 12.31 表示 12.31x，不用再乘 100）。本条样本自己就能验算：current_volume/avg_history_volume = 73.887262466/6.001835 = 12.3108
+      // ⚠️ 别照 content 文案解析这个值：下面那条 content 里写的是"放量12.31%"（百分号），属平台侧措辞，跟字段的倍数口径对不上，以字段数值为准
       "current_volume": 73.887262466, // 当前苏醒时候的交易量，单位 【sol/bnb】
       "signalTime": 1782049463, //当前苏醒信号时间
       "type": "breakout_volume_10x",

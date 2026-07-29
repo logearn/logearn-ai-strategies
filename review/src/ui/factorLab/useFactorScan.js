@@ -162,7 +162,11 @@ export function useFactorScan({ rows, scopedFields, fieldScope, threshold, score
     const selKeys = new Set([...heroSel.map(f => 'hero:' + f), ...evilSel.map(f => 'evil:' + f)]);
     // 因子不主动删就不丢：保留 ① 不在本次扫描范围的已有因子（另一字段范围，跨范围共存）；
     // ② 仍勾选、但本次没能重建的因子（如这次没挖出区间）——都不丢。只有【取消勾选】的才真正移除。
-    const preserved = preserveExisting ? factors.filter(f => {
+    // 这里必须用**入参** prevFactors，不能用闭包里的 factors（2026-07-29 统一）。
+    // 上面 prevMap 用的是 prevFactors、这里原来用的是 factors——当前所有调用方传的恰好都是同一个
+    // 对象，所以一直没炸；但只要有人传一个不同的 prevFactors（比如"从策略导入"想基于另一份池子重建），
+    // preserved（保留哪些旧因子）和 merged（继承哪些手工编辑）就来自两份不同的池子，会静默丢因子。
+    const preserved = preserveExisting ? prevFactors.filter(f => {
       const key = f.camp + ':' + f.field;
       if (derivedKeys.has(key)) return false;         // 已用本次扫描重建
       if (!scannedFields.has(f.field)) return true;   // 另一字段范围 → 原样保留

@@ -59,9 +59,13 @@ function parseCheckNumber(v) {
 
 // 从"期望"文字推断方向：'< 2.5' → 越小越好；'> 30' → 越大越好。
 // 区间（'20~30'）和等值（'== 0'）没有单一切点，不给推荐。
-
-// 从"期望"文字推断方向：'< 2.5' → 越小越好；'> 30' → 越大越好。
-// 区间（'20~30'）和等值（'== 0'）没有单一切点，不给推荐。
+//
+// 【当前没有生产调用方】它和下面的 scanCheckThreshold 是一对，服务的是已经删掉的"阈值扫描"面板
+// （见本文件头部注释：那批读全局状态的函数留在 js/charts.js 原处，对应面板陆续下线）。
+// 保留而不删的理由：两个都是纯函数、有单测覆盖（parseCheckDirection 在 lib-analytics.test.js），
+// 且"给某条 check 推荐一个更好的阈值"这个能力大概率还会以别的形式回来。
+// 若日后确认不会再用，连同 scanCheckThreshold、对应单测和 export 一起删干净——
+// 不要留成"代码在、没人调、也没人敢删"的状态。（2026-07-29 审计标注）
 function parseCheckDirection(expect) {
   const e = String(expect || '').trim();
   if (/~/.test(e) || /==/.test(e)) return null;
@@ -227,10 +231,11 @@ function compileStrategy(src) {
   return { fn, capturedDecl };
 }
 
-// 单行回放。返回 { passed, checks, logs, error, usedPaths }
-
 // 为一条 check 扫描候选阈值：在两侧都保留足够样本的前提下，找"通过侧胜率最高"的切点。
-// 返回 { rows, best, curr }，rows 是每个候选阈值的通过数/胜率/中位数，供表格展示。
+// 返回 { rows, best, baseWin, total }，rows 是每个候选阈值的通过数/胜率/中位数，供表格展示。
+// 同 parseCheckDirection：当前无生产调用方（"阈值扫描"面板已下线），保留理由见那里的注释。
+// 注：上面那行孤零零的「单行回放。返回 {...}」注释是机械抽取时留下的碎片（它描述的是
+// runStrategyOnRow，那个函数在别处），2026-07-29 一并清掉，别再照着它找函数。
 function scanCheckThreshold(all, direction) {
   const pts = all.map(a => ({ v: parseCheckNumber(a.val), r: a.ret }))
                  .filter(p => Number.isFinite(p.v) && isFiniteNumber(p.r));

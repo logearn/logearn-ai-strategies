@@ -1136,3 +1136,228 @@ antd 的 `message` 在 `DataLoader.jsx` 里也全部失去了唯一用途，一�
 `top100_calls.json`/`worst100_calls.json` 只有 calls、没有配套 snapshots，`buildRows` 跑不起来。
 考虑到每个块都验证过是逐字节搬移、且循环体里没有残留死变量，风险很低，但如果用户手头有
 真实数据，值得点一次「分析」确认字段值跟改动前一致。
+
+---
+
+## 23. 全项目审计修复批次：P0×5 / P1×6 / P2×5（2026-07-29）
+
+### 23.1 这一批是怎么来的、验收基线
+
+来源是一次**只读全量审计**（`src/lib`、`src/ui`、根目录各策略 js、`CLAUDE.md`、`tests`），
+产出执行清单 [审计修复计划.md](../审计修复计划.md)（根目录），每条带「问题 / 位置 / 改法 / 验收」。
+分三档：**P0 = 已复现的错数/挂死/静默丢数据**（改动小、立即修）；**P1 = 潜伏炸弹、竞态、方法论缺口**；
+**P2 = 死代码、文档矛盾、仓库卫生**。
+
+- 测试：**626 → 646 全绿**（只增不减；其中约 15 条是专门守住本轮 bug 的回归线）
+- `node tests/lint-strategies.js`：**1 error / 1 warn → 0 / 0**（那条 error 是误报，见 23.4）
+- P0 五条**每条都做了「把修复回退掉 → 新测试必须变红」的反向验证**，没有一条是"写完测试就绿"的
+
+**这批里 3 个坑是"第一版改法自己写错、被新测试当场抓出来的"**（23.2 的 worker 判据、
+23.2 的 `Number('')`、23.4 的正则字面量）。记在这里是想说明：这轮的测试不是补文档，是真的在干活。
+
+### 23.2 P0：五条已经在出错的
+
+**① AUC 方向常量 `'low'` ≠ `'lower'`，整个邪恶阵营的 CI 被镜像**
+（[utils.js](src/lib/utils.js) + [auc.js](src/lib/auc.js)）
+
+项目里存在**两套方向词汇**：`utils` 内部用 `'higher'/'lower'`，而 `auc.js`／UI／持久化的因子池用
+`'high'/'low'`。`auc.js` 产出 `'low'` 时点估计按它翻转成 `1-aucHigh`，但 `rankAuc` 里判的是
+`direction === 'lower'`，`'low'` 落进 else → **bootstrap 全程按正向算**。于是点估计翻转了、CI 没翻转，
+两者永远差一次镜像：所有"值小更好"的字段 CI 落在 0.5 以下，`proAnalytics` 的 `aucVerdict`
+把真正有效的因子标成「反向有效」——**文案意思完全相反**。实测 `auc=0.7984 / ci=[0.144,0.269]`，
+点估计落在自己的 CI 之外。
+
+`significant`（CI 不跨 0.5）和 `pApprox`（用半宽算）恰好不受影响，因为镜像关于 0.5 对称——
+这也是它藏了这么久的原因：最显眼的两个判定列都是对的。
+
+**改法：不统一词汇，在 utils 边界归一**——加 `isLowerDirection(d)` 同时认 `'lower'|'low'`，
+`rankAuc`/`computeROC` 都走它，两处调用方一个字没改。**不改词汇是刻意的**：`direction` 会随因子池
+存进 localStorage，改词汇会让存量数据的方向整体反转。
+
+**② 两处 worker 缺 `error` 监听 → 扫描永久挂死**（[workerPool.js](src/ui/factorLab/workerPool.js)）
+
+`scanCandidatesWithWorkers` 和 `evaluateCandidatesWithWorkers` 只挂了 `message`（同文件另外两处
+是有 `error` 的）。worker 加载失败／OOM／结构化克隆抛错时不会有 message 回包 → `next()` 永不推进 →
+Promise **永不 resolve**，UI 永远「扫描中…」；而且 `useFactorScan` 里那个"回退主线程串行"的 catch
+**永远进不去**——不是 reject，是 hang。
+
+改法：两处补 `error` 监听（terminate 该 worker、`dead++`、推进收尾），**全部 worker 都异常退出且还有
+批次没回包时整体 reject**，让上层 fallback 生效。
+
+> **实现时踩的坑**：第一版判据写的是 `bi < batches.length`——`bi` 是**派发游标**，派发那一刻就已经加过了，
+> 于是"派发出去、worker 当场炸了"被误判成"跑完了"，照样 resolve。改成数**实际回包的批次** `doneBatches`
+> （成功回包和该批报错都算"有结论"）。这条是新测试当场抓出来的。
+
+**③ 候选导出 TSV 的「CI下/CI上」两列恒为 `-`**（[factorScanExport.js](src/lib/factorScanExport.js)）
+
+写的是 `Array.isArray(c.ci) ? c.ci[0] : '-'`，但 `bootstrapAucCI` 返回的是 `{lo, hi}` **对象**，
+`factorLab.js` 原样透传 → `Array.isArray` 永远 false。而这个导出存在的**全部意义**就是补齐 UI
+藏起来的「方向 / coverage / **CI**」，结果 CI 从来没有过值。抽 `ciBounds(ci)`，`{lo,hi}` 与 `[lo,hi]` 都认。
+
+**④ 测试盲区：两条测试的 fixture / 取样正好把 ①③ 掩盖住了**
+
+这条单独列出来，因为它比前三条更值得记：
+- export 测试的 fixture 写的是 `ci: [0.61, 0.67]`（**数组**），生产是 `{lo,hi}` → `Array.isArray`
+  在测试里为真、生产里恒假；而且只断言了表头含 'CI下'/'CI上'，**没有一条检查值**。
+- auc 测试的 CI 守门用例三个 seed **全走 `high` 分支**（随机数据 AUC 贴着 0.5）；唯一构造出强 `low`
+  方向的用例只断言 `direction` 和 `auc`，**一个字没碰 `ci`**。
+
+两条用例的盲区**正好互补**，所以两个 bug 各自活了很久。改法：fixture 换成生产真实形状 `{lo,hi}` +
+补值断言；auc 补 `low` 方向的 CI 包含性断言（强信号、弱信号 n=300 各一条，后者贴近真实候选强度）。
+
+> 教训是**"fixture 的形状要照抄生产"**——这次是 `ci`，下次可能是别的。
+> `tests/online-export-coverage.test.js` 那种静态扫描式守门（见 §14.2）值得推广到所有
+> "两处必须保持同步"的地方，本轮的 `direction` 常量和 `ci` 数据形状都属于这类。
+
+**⑤ `1.5段策略` 四道 gmgn 风控闸门「缺失即放行」**（[1.5段策略/code.js](../1.5段策略/code.js)）
+
+前10持仓／创建者持仓／内鬼占比／开发团队持仓四个字段全写 `(x ?? 0) * 100`，判定又都是 `< LIMIT`
+→ **缺失必然通过**。而 `CLAUDE.md` 写明 gmgn 数据约四成缺失，也就是**约四成的币这四道风控静默全部放行**，
+回测里完全看不出来。同文件其它字段用的都是保守默认（`shit_volume ?? 999`、`new_volume ?? 999`）。
+
+改法：抽 `gmgnPct(v)`，**三层兜底缺一不可**，这点是实测出来的：
+
+- `?? 999` 只挡 `undefined`/`null`，挡不住空字符串（`'' ?? 999` 得到 `''`，再 `*100` 就是 0）；
+- **`Number('')` 和 `Number(null)` 都等于 0** —— 所以光靠 `Number + isFinite` 一样会被判成"0% 持仓"放行。
+  **第一版就是这么写的，跑六种输入的对照表当场露馅**；
+- gmgn 这几个字段有时是字符串数字 `'0.154'`，所以也不能直接 `typeof === 'number'` 判。
+
+最终：先显式判 `undefined/null/''` → 999，再 `Number` + `isFinite` → 否则 999。跟 `auc.js` 的
+`collectAucSamples` 同一套口径。顺带订正三处 expect 文案（`'20~30'`→`'15~30'`、`'> 60'`→`'< 60'` 方向写反、
+创建者持仓写死的 `'<1'` 而常量早就是 `0.5`），四条 expect 一并改成**直接引用常量**，以后不会再飘。
+
+### 23.3 P1：还没炸但会炸的
+
+**⑥ IndexedDB 连接只开不关**（[dataStore.js](src/lib/dataStore.js)）：全文件 7 处 `openDb()`、0 处
+`close()`（同目录 `fsStore.js` 是有 close 的，所以不是不知道这个 API）。现在不炸，但 `DB_VER` 一升级，
+这些常驻连接会让新页面的 `onupgradeneeded` 被 blocked，而这里没有 `onblocked` 处理——表现就是
+**"打不开数据、也不报错"**，极难排查。改成模块内缓存单个 db promise：`onversionchange` 主动让路、
+`onclose` 清缓存、**打开失败也要清缓存**（否则一次失败被永久缓存，环境恢复后仍然拿到同一个 rejected promise）。
+
+**⑦ `Math.max(...array)` 三处潜伏 RangeError**（[compare.js](src/lib/compare.js) ×2、
+[strategyReplayLogic.js](src/lib/strategyReplayLogic.js) ×1）：同类坑 `factorLab.js` 的
+`sweepScoreCutoffs` 已经踩过、修过并写了注释，这三处没同步。约 10 万样本触发。全部改 `reduce`。
+
+**⑧ 扫描／边际ρ 不可取消，旧结果覆盖新结果**（[useFactorScan.js](src/ui/factorLab/useFactorScan.js)）：
+底层 `workerPool` 一直支持 `opts.signal`，**但两个调用方都没传**，也没有 runId stale 判定。
+扫描要跑几十秒，期间改筛选再点一次 → 先发后到时旧候选表覆盖新的；而紧跟其后的 `setScanThreshold(threshold)`
+记的是**回调那一刻的最新阈值**，于是 `staleScan` 判定判不出过期——界面显示一张
+**"看起来是新的、其实来自旧数据"的候选表，这比直接报错危险得多**。
+
+改法：两个入口各持一个 AbortController（新调用先 abort 旧的）+ 自增 runId。写 state 前判 stale，
+**四个位置都要判**：进度回调（否则旧轮次把新轮次的进度条来回拉）、worker 失败后的兜底串行入口
+（已过期就连兜底都不必跑）、结果写入、`finally` 里的 `setBusy(false)`（旧轮次结束时新轮次还在跑，
+它把按钮解开就成了"看着已结束、其实还在算"）。
+
+**⑨ held-out 边际ρ 的区间窗口仍挖自全样本** → 见 **§9.1**（已单独成节）。结论：结构性泄漏确实存在，
+但纯噪声 40 组对照实测没测出统计显著的偏差（53% vs 50%），**本轮只订正文档措辞、不动实现**，
+真要做的做法也记在 §9.1 里了。
+
+**⑩ `verifyParity` 单向自检：review 缺失时无条件判 `ok`**（[onlineExport.js](src/lib/onlineExport.js)）：
+原来是 `if (rMiss) return { status: 'ok' }`——**review 侧算不出值时，无论线上算出什么都判「一致」**，
+这条方向 100% 漏检。它是有实际代价的：线上派生块在某个 ctx 上算出 review 的 `buildRows` 不会产生的值
+（比如两边门槛没对齐，review 因 `MIN_KLINE_BARS_FOR_VOLUME` 这类下限跳过了、线上内联块没跳），
+那么因子的满分区间若覆盖到这个值，**线上给分、回测记 0 分**——同一个 cutoff 在两边含义就不同了，
+而这套自检存在的全部理由就是防这个。
+
+改法：新增 `missing_review` 状态**单独统计、不并进 `mismatches`**，`OnlineExportPanel` 用黄色
+「仅线上有值」Tag 展示。**刻意不让它把报告判红**：review 缺失的原因往往是这条样本本来就没这个字段。
+状态抬升有优先级——只在还是 `'ok'` 时抬成 `missing_review`，真问题（mismatch/missing_online/nonnumeric）不能被盖掉。
+
+**⑪ `assignFoldsByToken` 按组轮转不看组大小**（[factorLab.js](src/lib/factorLab.js)）：
+`pos % K` 只保证每折拿到差不多**多少个 token**，不管每个 token 带几条信号。meme 场景里这个差别很大——
+热门币一天几十条信号、长尾币一两条。某一折可能吃到远超 1/K 的样本，另一折少到被 `heldOutFactorCurve`
+的 `test.length < 5` **整折丢掉** → 各 k 的 `nFolds` 不齐 → 1-SE 用的是 `testStd/√nFolds`，
+分母不同的两个 k 根本不可比 → **选出的 k\*（推荐因子数）跟着偏**。
+
+改法：LPT 装箱（按组大小降序，每组放进当前累计样本最少的折），只多一次排序，仍然完全确定性。
+**排序必须稳定**：先按组大小降序、同大小时按洗牌后的下标——直接对 `groupKeys` 排序会让同大小的组
+退回 Map 插入顺序，白费上面那次种子洗牌。倾斜数据实测：`[7,46,7,45,45]` → `[40,40,40,15,15]`。
+
+### 23.4 P2：清理与文档
+
+**⑫ `rebuildFactors` 同时用参数和闭包**（[useFactorScan.js](src/ui/factorLab/useFactorScan.js)）：
+`prevMap` 用入参 `prevFactors`、`preserved` 用闭包 `factors`。当前所有调用方传的恰好是同一个对象所以没炸，
+但只要有人传一个不同的（比如"从策略导入"想基于另一份池子重建），`preserved` 和 `merged` 就来自两份不同的池子
+→ **静默丢因子**。统一用入参。
+
+**⑬⑯ `stripComments` 不认正则字面量 → 抽成共用模块 + 策略 lint 改成剥注释后再跑**
+（新增 [stripComments.js](src/lib/stripComments.js)）
+
+这两条是同一个根因，一起说。原来的扫描器在 `onlineExport.js` 里，只认字符串定界符（`' " \``），不认
+`/.../` 正则——而 `CLAUDE.md` 明确建议 `off_meta` 这类字段用正则匹配，**策略里出现正则是预期内的**。
+两个方向都会错，都实测复现过：
+
+- **多提取**：`/don't/` 里那个单引号让扫描器以为进了字符串，后面的注释就不再被识别 →
+  `extractUsedFields` 把**只在注释里出现过的字段**当成真字段 → 生成的上线代码多一个用不上的 const，
+  `verifyParity` 还会去自检一个策略里根本不存在的字段。
+- **少提取**：`/https:\/\//.test(x) && f('shit_volume') > 0` 末尾那对 `//` 被当成行注释起点，
+  **同一行后面的 `f('字段')` 整段被吞** → 上线代码少一个 const，**对应因子恒 null（回测有分、线上没有）**。
+
+改法：按"上一个有意义的字符"判断 `/` 是除号还是正则开头（前一个非空白字符是标识符/数字/`)`/`]` → 除号，
+否则 → 正则），再补一张关键字表（`return /re/`、`typeof /re/` 这类）。这是 JS 词法层面本来就无法只靠
+局部字符解决的老问题，用的是业界通用启发式；**判断错了也不会崩**——正则不能跨行，扫到换行就收手，
+最坏退化成原来的行为。
+
+同一个函数还有第二个用户：`checkStrategySpec`（[strategySpec.js](src/lib/strategySpec.js)）的规则全是正则匹配，
+**原来直接跑在带注释的源码上**。于是 `node tests/lint-strategies.js` 唯一的 error 级输出是
+`1.5段策略/code-score.js 用了 f('字段') 但没有 f 垫片`——而那个文件里三处 `f('` **全在注释里**，
+其中一处恰恰是在说明"本策略不调用 `f('字段')`，所以不需要垫片"。后果有两层：
+① 唯一的 error 是假的、退出码 1，挂 CI 就是长红，**人会习惯性忽略真违规**；
+② 这条规则是 `fixable`，UI 上点「修正」会**插入一段根本不需要的垫片**。
+
+改法：`checkStrategySpec` 先剥注释再跑规则，`test` 和 `extra` 走**同一份**剥过的副本
+（否则会出现"没报违规却列出了细节"这种自相矛盾）。**注意只剥注释、不能连字符串一起剥**——
+`f('字段')` 的字段名本身就是字符串字面量。
+
+**⑭ 死代码标注（不删）**：`parseCheckDirection` / `scanCheckThreshold`（[proAnalytics.js](src/lib/proAnalytics.js)）
+已无生产调用方（服务的是已下线的"阈值扫描"面板），但都是纯函数、有单测覆盖，**保留并加注释说明状态**，
+同时写明"若日后确认不会再用，连同单测和 export 一起删干净——不要留成『代码在、没人调、也没人敢删』"。
+顺带清掉一处机械抽取留下的孤儿注释（`// 单行回放。返回 {...}`，它描述的 `runStrategyOnRow` 在别处）
+和一段复制了两遍的函数头注释。
+
+**⑮ 仓库卫生**：`.gitignore` 从 1 行补到 18 行（`.DS_Store`、`.claude/`、`review_副本/`、
+`root@167.99.73.172/`、手工导出的 `top100_calls.json`/`worst100_calls.json`）。
+**只忽略、没有删除任何目录**——删除不可逆，那两个是人工留的备份不是构建产物，等用户自己决定。
+
+**⑰ `强势盘策略/code-score.js` 的 25 字符截断重名**（[强势盘策略/code-score.js](../强势盘策略/code-score.js)）：
+`ALL_CHECKS` 里 8 个不同因子的 name 全被截成 `'v_breakout_volume_re'`，而 **review 侧是按 name 聚合的**
+（`aggregateScoreStats`）→ 八个因子在统计里被合并成一个，「差此一项 / 依赖此项」全部失真。
+25 行 name 改回全字段名。
+
+### 23.5 测试改动清单（626 → 646）
+
+| 文件 | 改动 |
+|---|---|
+| `tests/worker-pool.test.js` **新增** | 4 条 async：全死→reject、部分死→其余跑完、边际ρ 同上、正常路径不串阵营。用假 Worker 精确控制失败时机 + 2 秒 `Promise.race` 超时兜底（不然失败表现就是测试本身 hang）。**反向验证：摘掉 `error` 监听后 3 条直接 TIMEOUT** |
+| `tests/strip-comments.test.js` **新增** | 9 条：剥注释 5 条（含正则带单引号／带转义斜杠／除号不误判／`return`·`typeof` 后是正则）、`extractUsedFields` 2 条端到端、`checkStrategySpec` 2 条（注释里的 `f('x')` 不该报违规、真调用且无垫片仍要报） |
+| `tests/auc.test.js` | 原「反向可分」用例补 CI 断言，另加一条弱 `low` 信号用例（n=300，贴近真实候选强度） |
+| `tests/factor-scan-export.test.js` | fixture 换成生产真实形状 `{lo,hi}`；3 条断言——CI 两列真填上值、老数组格式向后兼容、`ci:null` 落成 `-` 不抛错 |
+| `tests/factorlab-fixes.test.js` | 加「组大小极度倾斜」用例（3 个热门币各 40 条 + 30 个长尾各 1 条）。**原有那条"均衡"用例每个 token 只有 1 条信号，轮转和装箱结果完全一样，测不出区别**——这也是 ⑪ 一直没被发现的原因 |
+| `tests/run-tests.js` | 挂上两个新文件；`worker-pool` 走 `await runWorkerPool(testAsync)`（同 §上面记过的教训：async 用例用同步 `test()` 调会被记成"通过"却根本没跑完） |
+
+### 23.6 明确不改的部分（避免下次重复审）
+
+- **`pApprox` 用 CI 半宽反推 p 值**（`auc.js`）：方法上确实是近似（隐含 bootstrap 分布对称正态），
+  但它只用于 BH 排序和一个展示用判定列，改成精确检验要引入更重的计算。**记录为已知取舍。**
+- **`scoreRow` 的 `opts` / `buildFactors` 的 `opts.shape`**：审计报告把它列成死参数，但代码里有明确注释
+  说明是**有意保留的 plumbing**（"真要再加第二种口径，先在 `onlineExport` 里实现对应分支"）——
+  属于已记录的取舍，不是遗漏，**不动**。
+- §8.7 已自行记录的那批已知未修项（`recommendFactorPath` 用 test 段贪心、两阵营 score 不同量纲、
+  两套 train/test 切分口径、`bootstrapAucCI` 共用种子）本轮不动。
+- **工程判断做得好、不要动**：`PlotlyChart.jsx` 清监听器、`PerfMonitor.jsx` 的 effect cleanup、
+  `onlineExport` 逐字段 parity 自检设计、`scanIntervalCore` 用置换检验对付 look-elsewhere。
+
+### 23.7 收尾：`CLAUDE.md` 的 `volume_ratio` 单位自相矛盾（已订正）
+
+[CLAUDE.md](../CLAUDE.md) 里 `breakout_volume_10x_list.volume_ratio` 的注释断言
+"直接当倍数用就行（比如 12.31 表示 12.31x，**对应 content 文案里的 12.31x**）"，
+但**同一段** `content` 样本原文写的是「休眠代币突然放量 **12.31%** 至 $5.25K」。两处必有一处是错的。
+
+**先把问题缩小了**：同一条样本里 `current_volume / avg_history_volume = 73.887262466 / 6.001835 = 12.3108`，
+跟 `volume_ratio: 12.310779` 逐位对上——**数值语义没有歧义，就是倍数**，拿它做阈值的策略一个都不受影响，
+所谓"差 100 倍"的风险不存在。剩下的纯粹是文档措辞。
+
+**用户拍板的改法：只改注释、不断言平台文案。** 注释里删掉"对应 content 文案里的 12.31x"这句断言，
+改成写上验算式（让下次看的人自己就能确认口径），并加一行警告：content 文案写的是"12.31%"，
+属平台侧措辞，**别照文案解析这个值，以字段数值为准**。这样两处不再互相打架，也不需要去核实平台真实推送。

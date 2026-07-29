@@ -1,1 +1,18 @@
 **/data/
+
+# macOS 目录元数据，跟代码无关
+.DS_Store
+**/.DS_Store
+
+# Claude Code 的本地配置/会话目录（settings.local.json 里全是本机绝对路径，不该进仓库）
+.claude/
+**/.claude/
+
+# 历史副本与从服务器拉回来的快照——留着方便对照，但不进版本库。
+# 2026-07-29 审计确认：这两个都不是构建产物，是人工留的备份，所以【只忽略、不删除】。
+review_副本/
+root@167.99.73.172/
+
+# 手工导出的样本数据（几十 MB，随时可以重新导）
+top100_calls.json
+worst100_calls.json

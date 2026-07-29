@@ -7,6 +7,8 @@
 // 打分/硬否决口径统一，避免反复踩的坑（f 未定义、VETO_NAMES 扫掉打分项、score>=score、
 // 分母不夹正、占位权重、重复计分…）。
 
+import { stripComments } from './stripComments.js';
+
 // 标准 f 兼容垫片：策略用了 f('字段') 时必须在顶部放它，线上（只有 ctx、没有 f）才不会报错。
 // 这是「模板骨架 / 一键修正 / 强势盘·1.5段 顶部」的唯一真源——改这里即可同步所有出处。
 export const F_SHIM = `// ===== f 兼容垫片（standalone）：让含 f('字段') 的打分因子在线上（只有 ctx、没有 f）也能跑 =====
@@ -145,13 +147,22 @@ export function dupCheckNames(code) {
 // 校验一段策略代码，返回命中的违规列表（已按 error 在前排序）。
 export function checkStrategySpec(code) {
   const src = String(code || '');
+  // 规则全是正则匹配，必须跑在**剥掉注释**的副本上（2026-07-29 修）。
+  // 原来直接拿原始源码跑，于是 1.5段策略/code-score.js 被报"用了 f('字段') 但没有 f 垫片"——
+  // 那个文件里三处 f(' 全在注释里，其中一处恰恰是在说明"本策略不调用 f('字段')，所以不需要垫片"。
+  // 后果：① `node tests/lint-strategies.js` 唯一的 error 级输出是假的、退出码 1，挂 CI 就是长红，
+  // 人会习惯性忽略真违规；② 这条规则 fixable，UI 上点「修正」会插入一段根本不需要的垫片。
+  // 注意只剥注释、**不能连字符串一起剥**——f('字段') 的字段名本身就是字符串字面量。
+  const scan = stripComments(src);
   const out = [];
   for (const r of RULES) {
-    if (!r.test(src)) continue;
+    if (!r.test(scan)) continue;
     out.push({
       id: r.id, level: r.level, title: r.title, detail: r.detail,
       fixable: !!r.fixable,
-      extra: r.extra ? r.extra(src) : null,
+      // extra 也走剥注释后的副本：它是给违规补细节的（比如列出重名的 check name），
+      // 跟 test 必须看同一份文本，否则会出现"没报违规却列出了细节"这种自相矛盾
+      extra: r.extra ? r.extra(scan) : null,
     });
   }
   return out.sort((a, b) => (a.level === b.level ? 0 : a.level === 'error' ? -1 : 1));

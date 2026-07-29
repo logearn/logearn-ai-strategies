@@ -59,6 +59,7 @@ import { run as runFactorRecommend } from './factor-recommend.test.js';
 import { run as runFactorLabFixes } from './factorlab-fixes.test.js';
 import { run as runFactorRecommendWorker } from './factor-recommend-worker.test.js';
 import { run as runWorkerPool } from './worker-pool.test.js';
+import { run as runStripComments } from './strip-comments.test.js';
 
 // 旧测试全部写成 sandbox.foo(...)，这里把四个模块的导出合并成同名对象，
 // 这样 1400 行测试正文一个字都不用改。
@@ -1659,6 +1660,7 @@ runRhoOptimize(test);
 runBacktestReport(test);
 runFactorRecommend(test);
 runFactorLabFixes(test);
+runStripComments(test);
 // 2026-07-28 修复：这里必须 await + 用 testAsync（跟上面几百个 buildRows 测试同一个模式）——
 // factor-recommend-worker.test.js 的 run() 内部 test(name, async fn) 是异步的，之前用同步
 // test() 调用只会走到第一个 await 就同步返回，断言失败会变成脚本已经打印完总数之后才触发的

@@ -18,6 +18,7 @@
 import { getFeature } from './data.js';
 import { resolveCtxAccessor } from './factorLab.js';
 import { makeFrozenDate } from './proAnalytics.js';
+import { stripComments } from './stripComments.js';
 
 // 自检数值容差：同一份算法在 review（buildRows）和线上（垫片）两次浮点重算之间的正常抖动，
 // 相对误差超过这个值就判为"口径不一致"报警。1e-9 足够严（远小于任何真实算法差异），又能容忍
@@ -827,28 +828,9 @@ const FIELD_TO_BLOCK = (() => {
   return m;
 })();
 
-// 剔除注释（// 行注释 + /* */ 块注释），避免注释里写的 f('字段') 示例被误当成真用到的字段。
-// 用最小字符扫描器识别字符串（'、"、`）里的 // 不算注释，只对提取用的临时副本做，不影响产出代码。
-function stripComments(src) {
-  let out = '';
-  let i = 0;
-  const n = src.length;
-  let quote = null; // 当前所在字符串的定界符
-  while (i < n) {
-    const c = src[i], d = src[i + 1];
-    if (quote) {
-      out += c;
-      if (c === '\\') { out += d ?? ''; i += 2; continue; } // 转义，整体跳过下一个字符
-      if (c === quote) quote = null;
-      i++; continue;
-    }
-    if (c === '"' || c === "'" || c === '`') { quote = c; out += c; i++; continue; }
-    if (c === '/' && d === '/') { while (i < n && src[i] !== '\n') i++; continue; }        // 行注释
-    if (c === '/' && d === '*') { i += 2; while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++; i += 2; continue; } // 块注释
-    out += c; i++;
-  }
-  return out;
-}
+// 剔除注释的扫描器已抽到 src/lib/stripComments.js 共用（策略规范 lint 也要用同一份，
+// 而且它原来压根没剥注释导致误报；顺带修了"不认正则字面量"这个真实缺陷，见该文件头注释）。
+// 只对提取用的临时副本做，不影响产出代码。
 
 // 删掉源码里遗留的 f 垫片块（历史策略顶部可能有一段 var f=(typeof f...)；native 输出不需要，
 // 且所有 f('字段') 都会被重写成 native 取值，f 根本没人调用）。按 banner 界定整段剥掉。

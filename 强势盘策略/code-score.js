@@ -202,23 +202,23 @@ const ALL_CHECKS = [
 
   ['open_to_buy_duration', f('open_to_buy_duration'), 3, -Infinity, -Infinity, 150, 150, null, '-Infinity~150'],
 
-  ['v_breakout_volume_re', f('v_breakout_volume_recent_below_cost_line_elapsed_min'), 1, -Infinity, -Infinity, 10, 10, null, '-Infinity~10'],
+  ['v_breakout_volume_recent_below_cost_line_elapsed_min', f('v_breakout_volume_recent_below_cost_line_elapsed_min'), 1, -Infinity, -Infinity, 10, 10, null, '-Infinity~10'],
 
-  ['v_breakout_volume_re', f('v_breakout_volume_recent_break_cost_line_min'), 10, -Infinity, -Infinity, 5, 5, null, '-Infinity~5'],
+  ['v_breakout_volume_recent_break_cost_line_min', f('v_breakout_volume_recent_break_cost_line_min'), 10, -Infinity, -Infinity, 5, 5, null, '-Infinity~5'],
 
-  ['v_breakout_volume_re', f('v_breakout_volume_recent_drawdown_speed_pct_per_min'), 10, -Infinity, -Infinity, 40, 40, null, '-Infinity~40'],
+  ['v_breakout_volume_recent_drawdown_speed_pct_per_min', f('v_breakout_volume_recent_drawdown_speed_pct_per_min'), 10, -Infinity, -Infinity, 40, 40, null, '-Infinity~40'],
 
-  ['v_breakout_volume_re', f('v_breakout_volume_recent_low_cost_line_distance_pct'), 10, -40, -40, 50, 50, null, '-40~50'],
+  ['v_breakout_volume_recent_low_cost_line_distance_pct', f('v_breakout_volume_recent_low_cost_line_distance_pct'), 10, -40, -40, 50, 50, null, '-40~50'],
 
-  ['v_breakout_volume_re', f('v_breakout_volume_recent_prior_count'), 10, -Infinity, -Infinity, 4, 4, null, '-Infinity~4'],
+  ['v_breakout_volume_recent_prior_count', f('v_breakout_volume_recent_prior_count'), 10, -Infinity, -Infinity, 4, 4, null, '-Infinity~4'],
 
-  ['v_breakout_volume_si', f('v_breakout_volume_signal_count'), 1, -Infinity, -Infinity, 4, 4, null, '-Infinity~4'],
+  ['v_breakout_volume_signal_count', f('v_breakout_volume_signal_count'), 1, -Infinity, -Infinity, 4, 4, null, '-Infinity~4'],
 
-  ['v_breakout_volume_re', f('v_breakout_volume_recent_signal_from_top_min'), 10, -Infinity, -Infinity, 100, 100, null, '-Infinity~100'],
+  ['v_breakout_volume_recent_signal_from_top_min', f('v_breakout_volume_recent_signal_from_top_min'), 10, -Infinity, -Infinity, 100, 100, null, '-Infinity~100'],
 
-  ['v_breakout_volume_re', f('v_breakout_volume_recent_retracement_pct'), 10, -Infinity, -Infinity, 65, 65, null, '-Infinity~65'],
+  ['v_breakout_volume_recent_retracement_pct', f('v_breakout_volume_recent_retracement_pct'), 10, -Infinity, -Infinity, 65, 65, null, '-Infinity~65'],
 
-  ['v_breakout_volume_re', f('v_breakout_volume_recent_rebound_from_low_pct'), 10, -Infinity, -Infinity, 100, 100, null, '-Infinity~100'],
+  ['v_breakout_volume_recent_rebound_from_low_pct', f('v_breakout_volume_recent_rebound_from_low_pct'), 10, -Infinity, -Infinity, 100, 100, null, '-Infinity~100'],
 
   ['frequent_volume', f('frequent_volume'), 12, 10, 10, 54.2027, 54.2027, null, '10~54.2027'],
 
@@ -230,40 +230,40 @@ const ALL_CHECKS = [
 
   ['smart_volume', f('smart_volume'), 8, 2, 2, Infinity, Infinity, null, '2~Infinity'],
 
-  ['chip_analysis.above_', f('chip_analysis.above_below_ratio'), 7, -Infinity, -Infinity, 1.2, 1.2, null, '-Infinity~1.2'],
+  ['chip_analysis.above_below_ratio', f('chip_analysis.above_below_ratio'), 7, -Infinity, -Infinity, 1.2, 1.2, null, '-Infinity~1.2'],
 
-  ['chip_analysis.top5_h', f('chip_analysis.top5_hold_percent'), 3, 9, 9, 30, 30, null, '9~30'],
+  ['chip_analysis.top5_hold_percent', f('chip_analysis.top5_hold_percent'), 3, 9, 9, 30, 30, null, '9~30'],
 
-  ['chip_analysis.top5_t', f('chip_analysis.top5_transfer_in_ratio'), 1, -Infinity, -Infinity, 40, 40, null, '-Infinity~40'],
+  ['chip_analysis.top5_transfer_in_ratio', f('chip_analysis.top5_transfer_in_ratio'), 1, -Infinity, -Infinity, 40, 40, null, '-Infinity~40'],
 
-  ['chip_analysis.total_', f('chip_analysis.total_holding_percent'), 1, 60, 60, Infinity, Infinity, null, '60~Infinity'],
+  ['chip_analysis.total_holding_percent', f('chip_analysis.total_holding_percent'), 1, 60, 60, Infinity, Infinity, null, '60~Infinity'],
 
-  ['gmgn.dev.creator_ope', f('gmgn.dev.creator_open_count'), 3, -Infinity, -Infinity, 250, 250, null, '-Infinity~250'],
+  ['gmgn.dev.creator_open_count', f('gmgn.dev.creator_open_count'), 3, -Infinity, -Infinity, 250, 250, null, '-Infinity~250'],
 
-  ['gmgn.dev.top_10_hold', f('gmgn.dev.top_10_holder_rate'), 6, 15, 15, 30, 30, null, '15~30'],
+  ['gmgn.dev.top_10_holder_rate', f('gmgn.dev.top_10_holder_rate'), 6, 15, 15, 30, 30, null, '15~30'],
 
-  ['gmgn.dev.twitter_cre', f('gmgn.dev.twitter_create_token_count'), 3, -Infinity, -Infinity, 1000, 1000, null, '-Infinity~1000'],
+  ['gmgn.dev.twitter_create_token_count', f('gmgn.dev.twitter_create_token_count'), 3, -Infinity, -Infinity, 1000, 1000, null, '-Infinity~1000'],
 
-  ['gmgn.dev.twitter_del', f('gmgn.dev.twitter_del_post_token_count'), 1, 500, 500, Infinity, Infinity, null, '500~Infinity'],
+  ['gmgn.dev.twitter_del_post_token_count', f('gmgn.dev.twitter_del_post_token_count'), 1, 500, 500, Infinity, Infinity, null, '500~Infinity'],
 
-  ['gmgn.dev.twitter_nam', f('gmgn.dev.twitter_name_change_count'), 5, 50, 50, Infinity, Infinity, null, '50~Infinity'],
+  ['gmgn.dev.twitter_name_change_count', f('gmgn.dev.twitter_name_change_count'), 5, 50, 50, Infinity, Infinity, null, '50~Infinity'],
 
-  ['gmgn.stat.bot_degen_', f('gmgn.stat.bot_degen_rate'), 6, 30, 30, 70, 70, null, '30~70'],
+  ['gmgn.stat.bot_degen_rate', f('gmgn.stat.bot_degen_rate'), 6, 30, 30, 70, 70, null, '30~70'],
 
-  ['gmgn.stat.creator_ho', f('gmgn.stat.creator_hold_rate'), 1, -Infinity, -Infinity, 0.2, 0.2, null, '-Infinity~0.2'],
+  ['gmgn.stat.creator_hold_rate', f('gmgn.stat.creator_hold_rate'), 1, -Infinity, -Infinity, 0.2, 0.2, null, '-Infinity~0.2'],
 
-  ['gmgn.stat.dev_team_h', f('gmgn.stat.dev_team_hold_rate'), 2, -Infinity, -Infinity, 20, 20, null, '-Infinity~20'],
+  ['gmgn.stat.dev_team_hold_rate', f('gmgn.stat.dev_team_hold_rate'), 2, -Infinity, -Infinity, 20, 20, null, '-Infinity~20'],
 
-  ['gmgn.stat.fresh_wall', f('gmgn.stat.fresh_wallet_rate'), 1, -Infinity, -Infinity, 20, 20, null, '-Infinity~20'],
+  ['gmgn.stat.fresh_wallet_rate', f('gmgn.stat.fresh_wallet_rate'), 1, -Infinity, -Infinity, 20, 20, null, '-Infinity~20'],
 
-  ['gmgn.stat.top70_snip', f('gmgn.stat.top70_sniper_hold_rate'), 1, -Infinity, -Infinity, 40, 40, null, '-Infinity~40'],
+  ['gmgn.stat.top70_sniper_hold_rate', f('gmgn.stat.top70_sniper_hold_rate'), 1, -Infinity, -Infinity, 40, 40, null, '-Infinity~40'],
 
   // 去重：gmgn.stat.top_10_holder_rate 与上面 gmgn.dev.top_10_holder_rate 同值同区间（都 15~30），
   //       gmgn.stat.top_bot_degen_percentage 与上面 gmgn.stat.bot_degen_rate 同值同区间（都 30~70）——
   //       同一信号别投两票，各保留上面 dev/rate 那一条，这两条删掉。
-  ['gmgn.stat.top_bundle', f('gmgn.stat.top_bundler_trader_percentage'), 6, 15, 15, 55, 55, null, '15~55'],
+  ['gmgn.stat.top_bundler_trader_percentage', f('gmgn.stat.top_bundler_trader_percentage'), 6, 15, 15, 55, 55, null, '15~55'],
 
-  ['gmgn.stat.top_entrap', f('gmgn.stat.top_entrapment_trader_percentage'), 3, -Infinity, -Infinity, 11, 11, null, '-Infinity~11'],
+  ['gmgn.stat.top_entrapment_trader_percentage', f('gmgn.stat.top_entrapment_trader_percentage'), 3, -Infinity, -Infinity, 11, 11, null, '-Infinity~11'],
 
   ['平台', ALLOW_PLATFORMS.indexOf(logearn.platform) !== -1 ? 1 : 0, 1, 1, 1, 1, 1,
     String(logearn.platform), '白名单(含four.meme)'],

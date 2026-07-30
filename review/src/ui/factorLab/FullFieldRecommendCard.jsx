@@ -1,5 +1,6 @@
 import React, { useMemo, useRef, useState } from 'react';
 import { Card, Button, Space, Tag, Alert, Typography, Tooltip, Checkbox, InputNumber, Progress } from 'antd';
+import { splitPathByNoiseFloor } from '../../lib/factorDiagnostics.js';
 import { runRecommendInWorker } from './workerPool.js';
 import { recommendFromAllFields, normalizeCampFields } from '../../lib/fullFieldRecommend.js';
 
@@ -119,12 +120,31 @@ export default function FullFieldRecommendCard({ rows, fields, factors, threshol
             : (
               <>
                 <Space wrap size={4} style={{ marginBottom: 6 }}>
-                  {path.map((p, i) => (
+                  {/* 建议采纳前 N 步（噪声地板现算），跟标签的灰化联动 */}
+                  {(() => {
+                    const nf = splitPathByNoiseFloor(path, result.nTest);
+                    if (nf.unknown || !path.length) return null;
+                    return <div style={{ width: '100%', fontSize: 12, marginBottom: 4 }}>
+                      {nf.adoptCount === 0
+                        ? <span style={{ color: '#ff4d4f' }}>🚫 <b>整条路径都在噪声里</b>（第 1 步 Δρ {fmt(path[0].deltaTest)} 已低于地板 {fmt(nf.floor)}），别采用</span>
+                        : <span>📏 建议只采纳<b>前 {nf.adoptCount} 步</b>
+                            {nf.noise.length > 0
+                              ? <span style={{ color: 'var(--text-muted)' }}>　后 {nf.noise.length} 步（灰掉的）Δρ 低于噪声地板 {fmt(nf.floor)}，跟随机分不开</span>
+                              : <span style={{ color: 'var(--text-muted)' }}>　全部都高于噪声地板 {fmt(nf.floor)}</span>}
+                          </span>}
+                    </div>;
+                  })()}
+                  {path.map((p, i) => {
+                    // 噪声地板（同 FactorRecommendCard，见那里的注释）：低于地板的步骤灰掉，
+                    // 不能只在文案里说一句——12 个长得一样的标签摆在一起，本身就是误导。
+                    const nf = splitPathByNoiseFloor(path, result.nTest);
+                    const inNoise = !nf.unknown && i >= nf.adoptCount;
+                    return (
                     <React.Fragment key={p.camp + ':' + p.field}>
                       {i > 0 && <span style={{ color: 'var(--text-muted)' }}>→</span>}
-                      <Tooltip title={`只采用到这一步（前 ${i + 1} 个合并进池、按区间自动配权）　held-out Δρ ${fmt(p.deltaTest)}　样本内 Δρ ${fmt(p.deltaIn)}${p.overfit ? '　⚠️ 样本内涨得多、验证段跟不上，疑似过拟合' : ''}${p.testZigzag ? `　held-out 分档倒挂 ${p.testZigzag.inversionCount} 处` : ''}`}>
-                        <Tag color={p.overfit ? 'warning' : (p.camp === 'evil' ? 'red' : 'green')}
-                          style={{ cursor: 'pointer', margin: 0 }}
+                      <Tooltip title={`${inNoise ? '⚠️ 已低于噪声地板，跟随机分不开——不建议采纳到这里　' : ''}只采用到这一步（前 ${i + 1} 个合并进池、按区间自动配权）　held-out Δρ ${fmt(p.deltaTest)}　样本内 Δρ ${fmt(p.deltaIn)}${p.overfit ? '　⚠️ 样本内涨得多、验证段跟不上，疑似过拟合' : ''}${p.testZigzag ? `　held-out 分档倒挂 ${p.testZigzag.inversionCount} 处` : ''}`}>
+                        <Tag color={inNoise ? 'default' : (p.overfit ? 'warning' : (p.camp === 'evil' ? 'red' : 'green'))}
+                          style={{ cursor: 'pointer', margin: 0, opacity: inNoise ? 0.45 : 1 }}
                           onClick={() => onAdopt?.(path.slice(0, i + 1).map(x => ({ field: x.field, camp: x.camp })))}>
                           {p.camp === 'evil' ? '☠' : '🛡'} <code style={{ fontSize: 11 }}>{p.field}</code>
                           <span style={{ marginLeft: 4, color: p.deltaTest > 0 ? 'var(--ok,#30d158)' : 'var(--text-muted)' }}>{fmt(p.deltaTest)}</span>
@@ -132,8 +152,8 @@ export default function FullFieldRecommendCard({ rows, fields, factors, threshol
                           {p.testZigzag?.inversionCount > 0 && <span style={{ marginLeft: 4 }}>🌀{p.testZigzag.inversionCount}</span>}
                         </Tag>
                       </Tooltip>
-                    </React.Fragment>
-                  ))}
+                    </React.Fragment>);
+                  })}
                 </Space>
                 <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                   精配权后：全样本 ρ {fmt(result.rhoBefore)} → <b>{fmt(result.rhoAfter)}</b>

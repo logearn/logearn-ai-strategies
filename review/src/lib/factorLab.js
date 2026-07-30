@@ -897,10 +897,57 @@ function buildWithBase(baseFactors, rowsForBuild, candidates, addSpecs, threshol
 // 返回 { path:[{field,camp,deltaTest,deltaIn,testRho,inRho,overfit}], baseTestRho, nTrain, nTest,
 //        crossCampBlocked:[{field,camp,deltaTest,blockedBy}] }。crossCampBlocked = 被同字段跨阵营
 // 闸门拦下的候选（见 opts.allowCrossCamp）；只保留占位因子最终真的留在路径里的那些。
+// ---------- 第二个贪心目标：顶档 lift（readme 第 44 节） ----------
+// 北极星是 ρ，但决策变量是 cutoff —— ρ 由全体样本（79% 的普通盘）驱动，实盘只买顶部薄片。
+// 43 轮是活证据：ρ 掉 0.024，而 lift@cutoff / 基线库四天 / 顶档反而全面变好。
+// 也就是说【按 ρ 贪心推出来的因子，天生不是给 cutoff 用的】，得有第二条路径并列给人看。
+//
+// 放在 factorLab.js（而不是 factorDiagnostics.js）只有一个原因：贪心跑在 Worker 里，
+// 函数过不了 structuredClone，所以目标只能以字符串 opts.objective 传进去、在这一侧解析。
+// factorDiagnostics 已经 import 了本文件，反向 import 会成循环依赖。那边 re-export 了一份。
+export function makeTopLiftScorer(opts = {}) {
+  const { topFrac = 0.3, winThreshold = WIN_THRESHOLD, minTop = 20 } = opts;
+  const fn = (rowsSet, factorSet, missingPolicy) => {
+    if (!factorSet?.length || !rowsSet?.length) return NaN;
+    // 纯邪恶池分数恒 0（第 33 节），"顶部薄片"无从谈起——返回 NaN 让贪心跳过，不是返回 0
+    if (heroWeightSum(factorSet) <= 0) return NaN;
+    const scored = scoreRows(rowsSet, factorSet, { missingPolicy });
+    const base = baseStats(rowsSet, winThreshold);
+    if (!(base.baseRate > 0)) return NaN;
+    const k = Math.max(minTop, Math.round(rowsSet.length * topFrac));
+    if (k >= rowsSet.length) return NaN;   // 取不出"顶部"就没有意义
+    // 同分边界要整块带上：这套分数天然有大块并列（真实数据里到过 27%），
+    // 按下标 slice 会在饱和块中间随机切一刀，目标函数就变成了跟切点有关的抖动值。
+    const sorted = scored.slice().sort((a, b) => b.score - a.score);
+    const cutScore = sorted[k - 1].score;
+    const top = sorted.filter(s => s.score >= cutScore - 1e-9);
+    const pos = top.filter(s => Number(s.row.returnMax) > winThreshold).length;
+    return (pos / top.length) / base.baseRate;
+  };
+  // ρ 的增量量级是 0.003、lift 是 0.05——换目标必须一起换 minGain，否则下限形同虚设
+  fn.suggestedMinGain = 0.02;
+  fn.objective = 'topLift';
+  fn.topFrac = topFrac;
+  return fn;
+}
+
+// objective 字符串 → { scoreFn, minGain }。Worker 边界只能传字符串，见上。
+// 未知/缺省一律回到 ρ（默认口径），不静默换目标。
+export function resolveObjective(objective, { threshold = WIN_THRESHOLD, minGain } = {}) {
+  if (objective === 'topLift') {
+    const fn = makeTopLiftScorer({ winThreshold: threshold });
+    return { scoreFn: fn, minGain: Number.isFinite(minGain) ? minGain : fn.suggestedMinGain, objective: 'topLift' };
+  }
+  return { scoreFn: scorePoolRho, minGain: Number.isFinite(minGain) ? minGain : 0.003, objective: 'rho' };
+}
+
 export function recommendFactorPath(rows, startFactors, candidates, opts = {}) {
   const { threshold = WIN_THRESHOLD, missingPolicy = 'zero', shape = 'trap',
-    maxSteps = 6, minGain = 0.003, trainRatio = 0.7, timeField = 'swapBeginTime',
-    splitMethod = 'time', candLimit = Infinity, batchSize = 10, scoreFn = scorePoolRho,
+    maxSteps = 6, minGain: minGainOpt, trainRatio = 0.7, timeField = 'swapBeginTime',
+    splitMethod = 'time', candLimit = Infinity, batchSize = 10, scoreFn: scoreFnOpt,
+    // objective：'rho'（默认，北极星）| 'topLift'（顶档 lift，贴实盘 cutoff）。
+    // 显式传 scoreFn 仍然优先——既有调用方（测试/heldOutFactorCurve）不受影响。
+    objective = 'rho',
     blacklist = [],
     // ↓ 三个搜索增强（2026-07-29 加）。默认值就是加它们之前的行为——不传任何一个，这条贪心
     // 逐字段、逐平局都跟原来一致（既有测试守着这份等价性）。开关而不是替换，是因为原来那条
@@ -921,6 +968,9 @@ export function recommendFactorPath(rows, startFactors, candidates, opts = {}) {
     // 真需要"低扣分/高加分"这种跨零的双向形状，应当人工在因子池里配，不该由贪心悄悄凑出来。
     allowCrossCamp = false,
     beamWidth = 1, backward = false, monotoneGate = false, gateTopK = 20 } = opts;
+  const resolved = resolveObjective(objective, { threshold, minGain: minGainOpt });
+  const scoreFn = scoreFnOpt || resolved.scoreFn;
+  const minGain = Number.isFinite(minGainOpt) ? minGainOpt : resolved.minGain;
   let stopReason = null;
   // 被同字段跨阵营闸门拦下的候选（本来 deltaTest 够格，只因为同字段的另一个阵营已在路径里）。
   // 记下来往上抛，否则闸门生效与否对使用者完全不可见——那就跟原来的静默行为一样糟。
@@ -1097,6 +1147,8 @@ export function recommendFactorPath(rows, startFactors, candidates, opts = {}) {
   const finalFields = new Set([...startFields, ...path.map(p => p.field)]);
   return { path, baseTestRho: path.length ? bestBeam.testRho : baseTestRho0,
     nTrain: train.length, nTest: test.length, stopReason,
+    // 带回目标口径：path 里的 deltaTest 是 Δρ 还是 Δlift，取决于它，UI 不能猜
+    objective: scoreFnOpt ? (scoreFnOpt.objective || 'custom') : resolved.objective,
     crossCampBlocked: crossCampBlocked.filter(b => finalFields.has(b.field)),
     beamWidth, backward, monotoneGate };
 
@@ -1152,7 +1204,12 @@ export function recommendFactorPool(rows, candidates, opts = {}) {
     // 都拦不住。说明 minGain 只是个"别把 0 也算进来"的地板，**它不是过拟合防线**；真正认得出
     // 这种字段的是每步的 overfit 标记（deltaIn 0.249 vs deltaTest 0.009）和影子权重校验。
     // 既然拦不住，就没有理由为它放宽——保持原值。
-    maxSteps = 12, minGain = 0.003, maxRounds = 40,
+    maxSteps = 12, minGain, maxRounds = 40,
+    // objective：'rho'（默认）| 'topLift'。透传给 recommendFactorPath 决定贪心优化什么。
+    // ⚠️ 只影响【选字段】那一步；收尾的精配权/影子权重/K折曲线仍然全部按 ρ 算——
+    // 那三件套的判据（1-SE、train/test ρ 落差）都是围绕 ρ 定的，混着换会得到一份自相矛盾的报告。
+    // 所以 topLift 路径的定位是"给 ρ 路径做对照"，不是替代它。
+    objective = 'rho',
     trainRatio = 0.7, timeField = 'swapBeginTime', splitMethod = 'time',
     startFactors: startPool = [], blacklist = [],
     // 三个搜索增强原样透传给 recommendFactorPath（默认值=不开，见那里的说明）。收尾三件套
@@ -1164,7 +1221,7 @@ export function recommendFactorPool(rows, candidates, opts = {}) {
 
   // ① 选字段：held-out 贪心。边界在 train 段推、增量在 test 段读，只收验证段真涨的候选。
   const sel = recommendFactorPath(rows, startPool, candidates,
-    { threshold, missingPolicy, shape, maxSteps, minGain, trainRatio, timeField, splitMethod, blacklist,
+    { threshold, missingPolicy, shape, maxSteps, minGain, trainRatio, timeField, splitMethod, blacklist, objective,
       allowCrossCamp, beamWidth, backward, monotoneGate, gateTopK });
   const path = sel.path || [];
   if (!path.length) {
@@ -1417,7 +1474,10 @@ export function heroWeightSum(factors) {
   return (factors || []).reduce((a, f) => a + (f.camp === 'evil' ? 0 : (Number(f.weight) || 0)), 0);
 }
 
-function getFeatureValue(row, field) {
+// 导出给 factorDiagnostics.js 用：它要按【单个样本】判断某字段是不是缺失（不只是缺失率），
+// 才能算出"这批缺失样本被打到了哪一档、白得/白失多少分"。口径必须跟 scoreRow 完全一致，
+// 所以只能共用这一份，不能在诊断侧照着 missingRate 再写一遍近似的判断。
+export function getFeatureValue(row, field) {
   const raw = getFeature(row, field);
   if (raw === undefined || raw === null || raw === '') return NaN;
   return Number(raw);

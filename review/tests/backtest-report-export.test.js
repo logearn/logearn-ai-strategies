@@ -1,5 +1,7 @@
 import assert from 'node:assert';
-import { buildBacktestReport, buildWalkForwardReport, buildBaselineVsTrainReport } from '../src/lib/backtestReportExport.js';
+import { buildBacktestReport, buildWalkForwardReport, buildBaselineVsTrainReport,
+  buildRecommendPathReport } from '../src/lib/backtestReportExport.js';
+import { backtestFactors } from '../src/lib/factorLab.js';
 
 const input = {
   config: { sampleN: 422, threshold: 5, cutoff: 80, missingPolicy: 'zero', scoreShape: 'trap', fieldScope: 'original' },
@@ -417,5 +419,90 @@ export function run(test) {
     assert.doesNotThrow(() => { r = buildBacktestReport({ ...empty, northStar }); });
     assert.ok(!r.includes('没有勇者因子'), '空池是"还没建因子"，不是"缺勇者阵营"，别误报');
     assert.ok(!/NaN|Infinity/.test(r.split('## 3.')[0]), '第 2 节不该漏出 NaN/Infinity');
+  });
+
+  // ---------- 因子体检并进报告（readme 第 44 节） ----------
+  // 这几条守的是"报告要给结论、不是给素材"：以前这些数字全靠人拿五份表交叉手算。
+  test('buildBacktestReport: 因子池表补摆幅/满命中/有效n 三列', () => {
+    const rows = [];
+    for (let i = 0; i < 100; i++) rows.push({ returnMax: i < 20 ? 5 : 1, features: { x: i < 90 ? 5 : 0 } });
+    const factors = [{ field: 'x', camp: 'hero', weight: 50, lo0: 0.5, lo1: 0.5, hi1: Infinity, hi0: Infinity }];
+    const r = buildBacktestReport({ config: { threshold: 3, cutoff: 50 }, base: { n: 100, pos: 20, baseRate: 0.2 },
+      factors, rows });
+    assert.ok(r.includes('摆幅'), '表头要有摆幅列');
+    assert.ok(r.includes('满命中'), '表头要有满命中列');
+    assert.ok(r.includes('有效n'), '表头要有有效n列');
+    assert.ok(r.includes('+100.0'), '单勇者因子摆幅 = 权重/Σ勇者×100 = 100');
+    assert.ok(r.includes('90%'), '90% 的样本满命中');
+    assert.ok(r.includes('⚠️'), '≥90% 满命中要标记');
+    assert.ok(r.includes('优先考虑删掉'), '标记了就要给出图例说明');
+  });
+
+  test('buildBacktestReport: 没有 rows 时三列退回 "-"，不凭空造数、也不报警', () => {
+    const r = buildBacktestReport({ config: { threshold: 3, cutoff: 50 }, base: { n: 10, pos: 2, baseRate: 0.2 },
+      factors: [{ field: 'x', camp: 'hero', weight: 50 }] });
+    assert.ok(r.includes('摆幅'), '表头照常有（口径要稳定）');
+    assert.ok(!r.includes('⚠️'), '算不出来就不能报警');
+  });
+
+  test('buildBacktestReport: 8.5 节报出顶档反转与邪恶缺失白得分', () => {
+    const rows = [];
+    // 高分段（x 命中 + e 缺失 → 躲掉扣分）表现反而差 → 顶档反转 + 缺失白得分
+    for (let i = 0; i < 100; i++) rows.push({ returnMax: i < 30 ? 5 : 1, features: { x: 1, e: 0 } });
+    for (let i = 0; i < 100; i++) rows.push({ returnMax: i < 10 ? 5 : 1, features: { x: 1 } });
+    const factors = [
+      { field: 'x', camp: 'hero', weight: 50, lo0: 0, lo1: 0, hi1: Infinity, hi0: Infinity },
+      { field: 'e', camp: 'evil', weight: 50, lo0: -Infinity, lo1: -Infinity, hi1: 1, hi0: 1 },
+    ];
+    const bt = backtestFactors(rows, factors, 3);
+    const r = buildBacktestReport({ config: { threshold: 3, cutoff: 50 },
+      base: bt.base, factors, rows, backtest: bt, deciles: bt.deciles, sweep: bt.sweep.points });
+    assert.ok(r.includes('因子体检'), '8.5 节要出现');
+    assert.ok(r.includes('低于基准'), '顶档 lift<1 要明说');
+    assert.ok(r.includes('白得'), '邪恶缺失要说成"白得分"，不是"缺失率 x%"');
+    assert.ok(r.includes('分位'), '要报出缺失样本被打到了哪个分位');
+  });
+
+  test('buildBacktestReport: cutoff 扫描补倍数中位列 + 临界大鱼告警', () => {
+    const rows = [];
+    for (let i = 0; i < 100; i++) rows.push({ returnMax: 1 + i / 50, features: { x: i }, symbol: 'S' + i });
+    // 临界分下方塞一条超大倍数
+    rows.push({ returnMax: 208.35, features: { x: 48 }, symbol: 'looong' });
+    const factors = [{ field: 'x', camp: 'hero', weight: 100, lo0: 0, lo1: 100, hi1: Infinity, hi0: Infinity }];
+    const bt = backtestFactors(rows, factors, 3);
+    const cut = bt.scored.find(s => s.row.symbol === 'looong').score + 1;
+    const r = buildBacktestReport({ config: { threshold: 3, cutoff: cut }, base: bt.base, factors, rows,
+      backtest: bt, sweep: bt.sweep.points, deciles: bt.deciles });
+    assert.ok(r.includes('倍数中位'), 'cutoff 扫描表要有倍数中位列');
+    assert.ok(r.includes('looong'), '差几分没进的大鱼必须点名——lift 结构上看不见它');
+    assert.ok(r.includes('208.35x'));
+  });
+
+  test('buildRecommendPathReport: 按噪声地板给出"建议采纳前 N 步"', () => {
+    const path = [0.153, 0.110, 0.063, 0.044].map((d, i) => ({
+      field: 'f' + i, camp: 'hero', deltaTest: d, deltaIn: d,
+      testBuckets: [{ lo: 0, hi: 1, n: 10, pos: 2, hiRate: 0.2 }],
+    }));
+    const r = buildRecommendPathReport(path, { threshold: 3, nTest: 218 });
+    assert.ok(r.includes('建议只采纳前 2 步'), `地板 0.068 → 前 2 步。实际报告：${r.slice(0, 400)}`);
+    assert.ok(r.includes('噪声地板'));
+  });
+
+  test('buildRecommendPathReport: 第一步就在噪声里要明确说整条别用', () => {
+    const path = [{ field: 'a', camp: 'hero', deltaTest: 0.01, deltaIn: 0.01 }];
+    const r = buildRecommendPathReport(path, { threshold: 3, nTest: 218 });
+    assert.ok(r.includes('整条路径都在噪声里'));
+  });
+
+  test('buildRecommendPathReport: 没有 nTest 时不瞎猜地板（旧调用方不受影响）', () => {
+    const r = buildRecommendPathReport([{ field: 'a', camp: 'hero', deltaTest: 0.5, deltaIn: 0.5 }], { threshold: 3 });
+    assert.ok(!r.includes('噪声地板'), '算不出地板就不能编一个出来');
+  });
+
+  test('buildRecommendPathReport: 非 ρ 目标要声明，否则读的人会把 Δlift 当 Δρ', () => {
+    const path = [{ field: 'a', camp: 'hero', deltaTest: 0.3, deltaIn: 0.3 }];
+    const r = buildRecommendPathReport(path, { threshold: 3, objective: 'topLift' });
+    assert.ok(r.includes('顶档 lift'));
+    assert.ok(r.includes('不可比'));
   });
 }

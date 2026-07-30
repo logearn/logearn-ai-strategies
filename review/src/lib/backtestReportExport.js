@@ -1,4 +1,6 @@
 import { heroWeightSum, fieldScopeLabel } from './factorLab.js';
+import { factorInfluence, topBinHealth, missingImpact, weightEvidenceAlignment,
+  enrichSweepWithReturns, nearCutoffOutliers, splitPathByNoiseFloor } from './factorDiagnostics.js';
 
 // 回测报告导出：把因子池 + 回测 + OOS + 北极星（默认ρ，筛垃圾类策略例外走分层增益）+ 漏网之鱼等，
 // 拼成一份【喂给 AI 调试】的 markdown。
@@ -41,7 +43,10 @@ function mdTable(headers, rows) {
 //   missed: [{ ca, symbol, score, ret }],   // 漏网之鱼（score<cutoff 但 >阈值）
 // }
 export function buildBacktestReport(input) {
-  const { config: c = {}, base = {}, factors = [], corr = [], northStar, rhoOpt, tierGainOpt, bucketRhoOpt, current = {}, sweep = [], deciles = [], oos, missed = [] } = input || {};
+  const { config: c = {}, base = {}, factors = [], corr = [], northStar, rhoOpt, tierGainOpt, bucketRhoOpt, current = {}, sweep = [], deciles = [], oos, missed = [],
+    // 因子体检要按【样本】重算（摆幅/满命中/缺失落在哪一档），聚合好的 deciles/sweep 不够用。
+    // 全部走这里的默认值，别在函数体里写 input.xxx —— input 本身可能是 undefined（测试覆盖了这条）。
+    rows = [], backtest = null, recommendPath = null } = input || {};
   const L = [];
 
   L.push(`# 打分策略回测报告`);
@@ -56,13 +61,33 @@ export function buildBacktestReport(input) {
   L.push('');
 
   L.push(`## 2. 因子池（${factors.length} 个）`);
+  // 摆幅 / 满命中 / 有效n 三列（readme 第 44 节）：光看「权重」判断不了影响力——
+  // 它是原始配比，真正的推动力是 权重/Σ勇者×100，而 Σ勇者 不在这张表里。
+  // 42 轮就是这么漏掉的：权重 36.8 的因子摆幅 45.0（全池最大）、held-out Δρ 却是全池最小。
+  const infl = rows.length ? factorInfluence(rows, factors) : [];
+  const inflOf = f => infl.find(i => i.field === f.field && i.camp === f.camp);
   L.push(mdTable(
-    ['字段', '阵营', '权重', 'lo0', 'lo1', 'hi1', 'hi0', 'AUC', '缺失率'],
-    factors.map(f => [
-      f.field, f.camp === 'evil' ? '邪恶' : '勇者', num(f.weight, 1),
-      bnd(f.lo0), bnd(f.lo1), bnd(f.hi1), bnd(f.hi0),
-      Number.isFinite(f.auc) ? f.auc.toFixed(3) : '-', pct(f.missRate),
-    ])));
+    ['字段', '阵营', '权重', '摆幅', '满命中', '有效n', 'lo0', 'lo1', 'hi1', 'hi0', 'AUC', '缺失率'],
+    factors.map(f => {
+      const i = inflOf(f);
+      return [
+        f.field, f.camp === 'evil' ? '邪恶' : '勇者', num(f.weight, 1),
+        i && Number.isFinite(i.swing) ? (i.swing > 0 ? '+' : '') + num(i.swing, 1) : '-',
+        i && Number.isFinite(i.modalShare) ? (i.modalShare * 100).toFixed(0) + '%' + (i.nearDegenerate ? ' ⚠️' : '') : '-',   // ⚠️ 只在真的 ≥90% 时才出，见下方图例的条件输出
+        i && Number.isFinite(i.effectiveN) ? String(i.effectiveN) : '-',
+        bnd(f.lo0), bnd(f.lo1), bnd(f.hi1), bnd(f.hi0),
+        Number.isFinite(f.auc) ? f.auc.toFixed(3) : '-', pct(f.missRate),
+      ];
+    })));
+  L.push('');
+  L.push(`> 摆幅 = 权重/Σ勇者×100 = 这个因子最多能把总分推动多少（勇者向上、邪恶向下），**这才是真实影响力**；`);
+  L.push(`> 满命中 = 有多大比例的样本拿到同一个命中度；有效n = n×(1−满命中) = 它真正在区分的样本数。`);
+  L.push(`> **三个要一起看**：摆幅 45 但只对 70 个样本说话，和摆幅 20 却对 500 个说话，是两回事。`);
+  // 图例里的告警符号【只在真有因子命中时才输出】。写成无条件的静态图例会让"整份报告里出现 ⚠️"
+  // 恒为真——既有测试正是拿这个当"没有凭空报警"的判据，静态图例会把那条不变量废掉。
+  if (infl.some(i => i.nearDegenerate)) {
+    L.push(`> ⚠️ = 满命中 ≥90%：这个因子对绝大多数样本一视同仁，摆幅再大也是白推，**优先考虑删掉或换维度不同的字段**。`);
+  }
   L.push('');
   // 分母写清楚是「Σ勇者权重」，并说明它就是满分上限：2026-07-29 起 review 的 scoreRow 跟策略
   // 模板逐位对齐（都是 `wsum += Math.max(0, weight)` 的语义），cutoff 两边通用，不再需要换算。
@@ -144,9 +169,33 @@ export function buildBacktestReport(input) {
   L.push('');
 
   L.push(`## 6. Cutoff 扫描`);
-  L.push(mdTable(
-    ['cut', '触发', '命中率', '捕获率', 'lift'],
-    sweep.map(p => [p.cut, p.triggered, pct(p.hitRate), pct(p.capture), num(p.lift)])));
+  // 补一列「触发集倍数中位」（readme 43.5）：lift 按 ">阈值与否" 二元计数，一个 208x 和一个
+  // 3.1x 在它眼里完全等重。真实事故——最大赢家 208.35x 得分 83.3，被 lift 最优的 cutoff=84
+  // 差 0.7 分挡在外面，而这张表当时只有 lift 一列，完全看不出来。
+  // 有 scored 才算得出来；没有就退回旧五列（既有调用方/测试不受影响）。
+  const sweepRich = backtest?.scored?.length
+    ? enrichSweepWithReturns({ points: sweep }, backtest.scored).points : null;
+  L.push(sweepRich
+    ? mdTable(['cut', '触发', '命中率', '捕获率', 'lift', '倍数中位'],
+        sweepRich.map(p => [p.cut, p.triggered, pct(p.hitRate), pct(p.capture), num(p.lift),
+          Number.isFinite(p.medRet) ? num(p.medRet, 2) + 'x' : '-']))
+    : mdTable(['cut', '触发', '命中率', '捕获率', 'lift'],
+        sweep.map(p => [p.cut, p.triggered, pct(p.hitRate), pct(p.capture), num(p.lift)])));
+  if (sweepRich) {
+    L.push('');
+    L.push(`> 「倍数中位」= 该档触发集的 returnMax 中位数。**lift 和它经常给出不同的最优档** ——`);
+    L.push(`> lift 只数"是不是 >${c.threshold}x"，倍数中位才反映典型收益。定 cutoff 时两列一起看。`);
+  }
+  // 临界分下方的大鱼：差几分没进触发集、但倍数很大的样本。lift 结构上看不见它们。
+  if (backtest?.scored?.length) {
+    const whales = nearCutoffOutliers(backtest.scored, c.cutoff, { window: 3, minMultiple: 10 });
+    if (whales.length) {
+      L.push('');
+      L.push(`> 🐋 **当前 cutoff=${c.cutoff} 下方 3 分之内，有 ${whales.length} 个 ≥10x 被挡在外面**：`
+        + whales.map(w => `${w.symbol} ${num(w.returnMax, 2)}x（${num(w.score, 1)} 分，差 ${num(w.gap, 1)}）`).join('、')
+        + ` —— 往下松一两档 lift 通常只掉 0.03~0.05，对照上面的倍数中位再定。`);
+    }
+  }
   L.push('');
 
   L.push(`## 7. 分段表（按总分十分位，低→高）`);
@@ -201,6 +250,40 @@ export function buildBacktestReport(input) {
   } else L.push(oos?.error ? `（${oos.error}）` : `（未跑时间外推验证）`);
   L.push('');
 
+  // ---- 因子体检：把手算的三件事写进报告（readme 第 44 节） ----
+  L.push(`## 8.5 因子体检（顶档 / 缺失按阵营 / 权重↔证据）`);
+  const health = backtest ? topBinHealth(backtest, c.threshold) : null;
+  if (health) {
+    const tb = health.topBin;
+    L.push(`- **顶档**（分数 ${num(tb?.scoreLo, 1)}~${num(tb?.scoreHi, 1)}，n=${tb?.n ?? '-'}）：高倍率 ${pct(tb?.hiRate)}、lift **${num(tb?.lift, 2)}**${health.topBinBelowBase ? ' ⛔ **低于基准，分数最高的那批样本表现不如不筛**' : ' ✅'}`);
+    if (health.highCutWarning) {
+      L.push(`- ⛔ **高分段反转**：cutoff=${health.highCutWarning.cut} 时触发 ${health.highCutWarning.triggered} 个，lift 只有 **${num(health.highCutWarning.lift, 2)}** —— 阈值往上拉反而更差，这一段别用。`);
+    }
+    if (health.saturation) {
+      L.push(`- **同分饱和**：${health.saturation.n} 个样本（${pct(health.saturation.share)}）都是 ${num(health.saturation.score, 1)} 分，块内高倍率 ${pct(health.saturation.hiRate)}、lift ${num(health.saturation.lift, 2)}，横跨约 ${health.saturation.spansBins} 个十分位（这几档之间的差异是随机切分的产物）。`);
+    }
+  }
+  const miss = rows.length ? missingImpact(rows, factors, c.threshold) : [];
+  const missBonus = miss.filter(m => m.direction === 'bonus');
+  if (missBonus.length) {
+    L.push(`- ⛔ **邪恶因子的缺失样本在白得分**（缺失记 0 分 = 躲掉扣分 = 奖励，跟勇者阵营方向相反）：`);
+    for (const m of missBonus) {
+      L.push(`  - \`${m.field}\`：${m.missingN} 个缺失（${pct(m.missingRate)}）白得 **${num(m.points, 1)} 分**，分数中位排在全样本 **${pct(m.medScorePct)}** 分位，这批样本自己的高倍率 ${pct(m.hiRate)}（lift ${num(m.lift, 2)}）`);
+    }
+    L.push(`  > 分位越高 + lift 越接近 1 = **顶档被"我们对它一无所知"的样本占据，等于不筛**。42 轮的事故就是这个形状。`);
+  } else if (miss.length) {
+    L.push(`- 池里有缺失的都是勇者因子（缺失 = 拿不到加分 = 惩罚，方向保守）：${miss.map(m => `\`${m.field}\` ${m.missingN} 个/分位 ${pct(m.medScorePct)}`).join('　')}`);
+  }
+  if (recommendPath?.length && infl.length) {
+    const al = weightEvidenceAlignment(infl, recommendPath);
+    if (al.rows.length >= 2) {
+      L.push(al.inversions > 0
+        ? `- ⚠️ **权重跟证据没对齐**：${al.inversions} 处倒挂（摆幅更大的因子 held-out Δρ 反而更小），秩相关 ρ=${num(al.rankRho, 2)}。最刺眼：\`${al.worst.heavy.field}\`（摆幅 ${num(al.worst.heavy.swingAbs, 1)} / Δρ ${num(al.worst.heavy.deltaTest, 3)}）vs \`${al.worst.strong.field}\`（摆幅 ${num(al.worst.strong.swingAbs, 1)} / Δρ ${num(al.worst.strong.deltaTest, 3)}）`
+        : `- ✅ 权重与证据对齐：摆幅排序跟 held-out Δρ 排序一致（0 处倒挂，秩相关 ρ=${num(al.rankRho, 2)}）`);
+    }
+  }
+  L.push('');
+
   L.push(`## 9. 漏网之鱼（score<${c.cutoff} 但实际 >${c.threshold}x，共 ${missed.length} 个，列前 20）`);
   if (missed.length) {
     L.push(mdTable(
@@ -215,6 +298,8 @@ export function buildBacktestReport(input) {
     `2. **弱因子权重过高**：看第 2 节，AUC 低(接近0.5)的因子却拿高权重 = 风险；对照第 4 节 ρ最优是否把权重堆到弱因子上。`,
     `3. **分数饱和**：直接看第 4 节「同分饱和」那一行——最大同分块占比 ≥10% 就该处理（它同时压 ρ 和第 7 节对应分段的可读性）。饱和在顶部(如 100~100)=顶部区分不了，加邪恶因子拉开；饱和在中部=那批样本在所有因子上都落同一档，得换维度不同的因子，不是调权重能解决的。`,
     `4. **单调性**：第 7 节高倍率/倍数中位是否随分段上升；顶段反而低多半是饱和噪声，不是信号。`,
+    `4.5 **顶档体检**：直接看第 8.5 节。顶档 lift<1 = "越高分越差"的顶部反转（真实踩过），两个最常见的成因：① 邪恶因子的缺失样本被顶上来（缺失记0在邪恶阵营下是奖励）；② 所有因子都是同一种单边斜坡、核心区各自盖住大半样本，于是只能识别底部识别不了顶部——后者调权重没用，得加维度不同的因子。`,
+    `4.6 **lift 看不见倍数大小**：lift 按">阈值与否"二元计数，一个 208x 和一个 3.1x 完全等重。定 cutoff 时**必须同时看第 7 节「倍数中位」那一列**，两个口径给出的最佳段经常不是同一段（真实案例：最大赢家 208x 差 0.7 分没进触发集）。`,
     `5. **ρ vs lift@cutoff 打架**：第 4 节 ρ 涨但第 8 节 val lift 跌 = ρ(全体单调)好但顶部薄片(实盘买的)没守住；实盘看 lift@cutoff。`,
     `6. **样本量**：验证段触发数小(<60)时所有 OOS 数字噪声大，别据此反复手调权重。`,
   ].join('\n'));
@@ -260,6 +345,23 @@ export function buildRecommendPathReport(path, meta = {}) {
     L.push(`> ⚠️ **同一字段在本路径里出现了多次**：${dupFields.map(f => `\`${f}\``).join('、')}`
       + ` —— 勇者版与邪恶版同时进池，"值高加分"和"值低扣分"同时成立，无法向实盘复刻，且勇者版计入 Σ勇者 分母、邪恶版不计入。`);
   }
+  // 噪声地板（readme 第 44 节）：12 步平铺、排版一模一样，读报告的人得自己拿一条线去卡。
+  // 地板 = 该 test 段上 spearman ρ 的标准误 1/√(n−3)，随样本量现算（写死 0.064 只对 n≈218 成立）。
+  // 必须按【前缀】切：第 5 步的 Δρ 是"在前 4 步基础上"的增量，摘掉第 3 步之后它就不成立了。
+  if (path?.length && Number.isFinite(meta.nTest)) {
+    const nf = splitPathByNoiseFloor(path, meta.nTest);
+    if (!nf.unknown) {
+      L.push(nf.adoptCount === 0
+        ? `> 🚫 **整条路径都在噪声里**：第 1 步的 held-out Δρ ${num(path[0].deltaTest, 3)} 就已低于噪声地板 **${num(nf.floor, 3)}**（test 段 n=${meta.nTest} 时 ρ 的标准误 1/√(n−3)）。这批候选没有一个站得住，别采用。`
+        : `> 📏 **建议只采纳前 ${nf.adoptCount} 步**（噪声地板 ${num(nf.floor, 3)}，按 test 段 n=${meta.nTest} 现算）`
+          + (nf.noise.length
+            ? `：从第 ${nf.adoptCount + 1} 步（Δρ ${num(nf.noise[0].deltaTest, 3)}）起已低于地板，后面 ${nf.noise.length} 步跟随机噪声分不开。`
+            : `：全部 ${nf.adoptCount} 步都高于地板。`));
+    }
+  }
+  if (meta.objective && meta.objective !== 'rho') {
+    L.push(`> ⚖️ **本路径的目标函数是「${meta.objective === 'topLift' ? '顶档 lift' : meta.objective}」，不是 ρ** —— 下面每步的 Δ 是该目标的增量，量级跟 Δρ 不可比。`);
+  }
   L.push('');
   if (!path?.length) { L.push(`（路径为空，无步骤可诊断）`); return L.join('\n'); }
 
@@ -270,11 +372,15 @@ export function buildRecommendPathReport(path, meta = {}) {
       ['样本内(全量)', p.inBuckets, p.inZigzag],
     ]) {
       if (!buckets) { L.push(`- ${label}：档数不足，未计算`); continue; }
-      L.push(`- ${label}：${buckets.length} 档，打架 **${zigzag.inversionCount}** 处，最大单档回落 **${pct(zigzag.worstDrop)}**`);
+      // zigzag 跟 buckets 是 recommendFactorPath 一起塞进来的，但这里原来只守了 buckets。
+      // 导出器崩掉的代价是整份报告都拿不到，比缺一行锯齿统计严重得多——两个都守。
+      L.push(zigzag
+        ? `- ${label}：${buckets.length} 档，打架 **${zigzag.inversionCount}** 处，最大单档回落 **${pct(zigzag.worstDrop)}**`
+        : `- ${label}：${buckets.length} 档（本条路径没带锯齿统计）`);
       L.push(mdTable(
         ['档', '分数区间', 'n', '命中率'],
         buckets.map((b, bi) => [bi + 1, `${num(b.loScore, 1)}~${num(b.hiScore, 1)}`, b.n, pct(b.hitRate)])));
-      if (zigzag.inversions.length) {
+      if (zigzag?.inversions?.length) {
         L.push(`  打架明细：` + zigzag.inversions.map(iv =>
           `第${iv.fromIdx + 1}→${iv.toIdx + 1}档(分数${num(iv.scoreRange[0], 1)}~${num(iv.scoreRange[1], 1)}) ${pct(iv.fromHitRate)}→${pct(iv.toHitRate)}(回落${pct(iv.drop)})`
         ).join('；'));

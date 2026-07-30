@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Card, Button, Segmented, Tag, Typography, Space, Tooltip, Alert, Checkbox, Popconfirm } from 'antd';
+import { splitPathByNoiseFloor } from '../../lib/factorDiagnostics.js';
 import { recommendFactorPool } from '../../lib/factorLab.js';
 import { runRecommendInWorker } from './workerPool.js';
 
@@ -41,6 +42,10 @@ export default function FactorRecommendCard({ rows, factors, candidates, thresho
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const [staleFactorsAt, setStaleFactorsAt] = useState(null); // 结果算出来之后 factors 又变了
+  // 第二目标（顶档 lift）的对照路径。跟主结果分开存：北极星仍然是 ρ，这条只是【对照】，
+  // 不能让它悄悄变成默认答案（readme 第 44 节：ρ 路径和 cutoff 决策已经打过三轮架）。
+  const [altResult, setAltResult] = useState(null);
+  const [altBusy, setAltBusy] = useState(false);
   const runCtrl = useRef(null);
 
   const canRun = Array.isArray(candidates) && candidates.length > 0 && rows.length > 0;
@@ -74,10 +79,34 @@ export default function FactorRecommendCard({ rows, factors, candidates, thresho
       }
       if (runCtrl.current !== ac || ac.signal.aborted) return;
       setResult({ ...res, mode: m, factorsSignature: poolSignature(factors) });
+      // 主路径重算了，旧的对照路径不再对应同一份输入——直接丢掉，别让两条不同来源的结果并排显示
+      setAltResult(null);
       setStaleFactorsAt(null);
     } finally {
       if (runCtrl.current === ac) setBusy(false);
     }
+  };
+
+  // 按【顶档 lift】再搜一条路径做对照。用同一份候选/同一个起点，只换目标函数——
+  // 两条路径选出来的字段重合度，本身就是"ρ 和实盘决策是不是一回事"的直接证据。
+  const runAlt = async () => {
+    if (!canRun) return;
+    setAltBusy(true);
+    await new Promise(r => setTimeout(r, 0));
+    try {
+      const start = mode === 'combo' ? factors : [];
+      const scopedCandidates = heroOnly ? candidates.filter(c => c.camp !== 'evil') : candidates;
+      const bl = blacklist.map(b => ({ camp: b.camp, field: b.field }));
+      const opts = { threshold, missingPolicy, shape: scoreShape, startFactors: start,
+        blacklist: bl, objective: 'topLift' };
+      let res;
+      try {
+        res = await runRecommendInWorker('recommend', { rows, candidates: scopedCandidates, opts }, {});
+      } catch (e) {
+        res = recommendFactorPool(rows, scopedCandidates, opts);
+      }
+      setAltResult(res);
+    } finally { setAltBusy(false); }
   };
 
   // combo 模式下，结果算出来之后因子池又变了（删因子/改权重/加因子）——只提示"可能过期"，
@@ -135,13 +164,45 @@ export default function FactorRecommendCard({ rows, factors, candidates, thresho
               : '没挖到能提升验证段 ρ 的组合。'} />
           : (
             <>
+              {/* 噪声地板分割（readme 第 44 节）：以前 12 步平铺、排版一模一样，用户得自己
+                  拿 0.064 去卡哪几步算数。地板 = 该 test 集上 spearman ρ 的标准误 1/√(n−3)，
+                  随样本量现算（写死 0.064 只对 n≈218 成立）。
+                  必须按【前缀】切：第 5 步的 Δρ 是"在前 4 步基础上"的增量，摘掉第 3 步之后
+                  那个数就不成立了，所以不能逐步过滤、更不能跳过噪声步去捡后面某个高的。 */}
+              {(() => {
+                const nf = splitPathByNoiseFloor(path, result.nTest);
+                if (nf.unknown) return null;
+                return nf.adoptCount === 0 ? (
+                  <Alert style={{ marginBottom: 8 }} type="error" showIcon
+                    message={<span style={{ fontSize: 12 }}>
+                      🚫 <b>整条路径都在噪声里</b>：第 1 步的 held-out Δρ {fmt(path[0]?.deltaTest)} 就已经低于
+                      噪声地板 <b>{fmt(nf.floor)}</b>（= test 段 n={result.nTest} 时 ρ 的标准误 1/√(n−3)）。
+                      这批候选没有一个站得住，别采用——换字段范围或先扩样本。
+                    </span>} />
+                ) : (
+                  <Alert style={{ marginBottom: 8 }} type={nf.noise.length ? 'info' : 'success'} showIcon
+                    message={<span style={{ fontSize: 12 }}>
+                      📏 建议只采纳<b>前 {nf.adoptCount} 步</b>
+                      {nf.noise.length > 0
+                        ? <>：从第 {nf.adoptCount + 1} 步（{fmt(nf.noise[0].deltaTest)}）起，held-out Δρ 已低于噪声地板 <b>{fmt(nf.floor)}</b>，
+                            后面 {nf.noise.length} 步（下方<b>灰掉</b>的那些）跟随机噪声分不开。</>
+                        : <>：全部 {nf.adoptCount} 步的 held-out Δρ 都高于噪声地板 {fmt(nf.floor)}。</>}
+                      <span style={{ color: 'var(--text-muted)' }}>
+                        　地板按 test 段 n={result.nTest} 现算，不是写死的常数。
+                      </span>
+                    </span>} />
+                );
+              })()}
               <Space wrap size={4} style={{ marginBottom: 6 }}>
-                {path.map((p, i) => (
+                {path.map((p, i) => {
+                  const nf = splitPathByNoiseFloor(path, result.nTest);
+                  const inNoise = !nf.unknown && i >= nf.adoptCount;
+                  return (
                   <React.Fragment key={p.camp + ':' + p.field}>
                     {i > 0 && <span style={{ color: 'var(--text-muted)' }}>→</span>}
-                    <Tooltip title={`只采用到这一步（把前 ${i + 1} 个合并进池，按区间自动配权——想要精配好的权重请用下面的采用按钮）　held-out Δρ ${fmt(p.deltaTest)}　样本内 Δρ ${fmt(p.deltaIn)}${p.overfit ? '　⚠️ 样本内涨得多、验证段跟不上，疑似过拟合' : ''}${p.testZigzag ? `　held-out 分档打架 ${p.testZigzag.inversionCount} 处（最大回落 ${(p.testZigzag.worstDrop * 100).toFixed(1)}%）` : ''}`}>
-                      <Tag color={p.overfit ? 'warning' : (p.camp === 'evil' ? 'red' : 'green')}
-                        style={{ cursor: 'pointer', margin: 0 }}
+                    <Tooltip title={`${inNoise ? '⚠️ 这一步已低于噪声地板，跟随机分不开——不建议采纳到这里　' : ''}只采用到这一步（把前 ${i + 1} 个合并进池，按区间自动配权——想要精配好的权重请用下面的采用按钮）　held-out Δρ ${fmt(p.deltaTest)}　样本内 Δρ ${fmt(p.deltaIn)}${p.overfit ? '　⚠️ 样本内涨得多、验证段跟不上，疑似过拟合' : ''}${p.testZigzag ? `　held-out 分档打架 ${p.testZigzag.inversionCount} 处（最大回落 ${(p.testZigzag.worstDrop * 100).toFixed(1)}%）` : ''}`}>
+                      <Tag color={inNoise ? 'default' : (p.overfit ? 'warning' : (p.camp === 'evil' ? 'red' : 'green'))}
+                        style={{ cursor: 'pointer', margin: 0, opacity: inNoise ? 0.45 : 1 }}
                         onClick={() => onAdopt(path.slice(0, i + 1).map(x => ({ field: x.field, camp: x.camp })))}>
                         {p.camp === 'evil' ? '☠' : '🛡'} <code style={{ fontSize: 11 }}>{p.field}</code>
                         <span style={{ marginLeft: 4, color: p.deltaTest > 0 ? 'var(--ok,#30d158)' : 'var(--text-muted)' }}>{fmt(p.deltaTest)}</span>
@@ -159,9 +220,46 @@ export default function FactorRecommendCard({ rows, factors, candidates, thresho
                         )}
                       </Tag>
                     </Tooltip>
-                  </React.Fragment>
-                ))}
+                  </React.Fragment>);
+                })}
               </Space>
+              {/* 第二目标对照（readme 第 44 节）：北极星是 ρ，但决策变量是 cutoff。
+                  ρ 由全体样本（79% 的普通盘）驱动，实盘只买顶部薄片，两者已经打过三轮架
+                  （43 轮 ρ 掉 0.024 而 lift@cutoff / 顶档 / 基线库四天全面变好）。
+                  所以给一条按【顶档 lift】搜出来的路径并排放着——重合的字段最可信，
+                  只在一条路径里出现的，说明它只服务其中一个口径。 */}
+              <div style={{ marginBottom: 8 }}>
+                <Space wrap size={6}>
+                  <Tooltip title="用同一份候选、同一个起点，只把贪心的目标函数从 ρ 换成【顶部 30% 薄片的 lift】再搜一条。北极星仍然是 ρ，这条是对照，不会替换主结果。">
+                    <Button size="small" loading={altBusy} onClick={runAlt}>
+                      ⚖️ 按「顶档 lift」再搜一条做对照
+                    </Button>
+                  </Tooltip>
+                  {altResult && !altResult.error && (altResult.path || []).length > 0 && (() => {
+                    const alt = altResult.path;
+                    const mainKeys = new Set(path.map(p => p.camp + ':' + p.field));
+                    const both = alt.filter(p => mainKeys.has(p.camp + ':' + p.field));
+                    return <span style={{ fontSize: 12 }}>
+                      {alt.map((p, i) => (
+                        <Tag key={p.camp + ':' + p.field} style={{ margin: '0 4px 0 0' }}
+                          color={mainKeys.has(p.camp + ':' + p.field) ? 'blue' : 'default'}>
+                          {p.camp === 'evil' ? '☠' : '🛡'} <code style={{ fontSize: 11 }}>{p.field}</code>
+                          <span style={{ marginLeft: 4 }}>Δlift {Number.isFinite(p.deltaTest) ? (p.deltaTest >= 0 ? '+' : '') + p.deltaTest.toFixed(2) : '-'}</span>
+                        </Tag>
+                      ))}
+                      <span style={{ color: 'var(--text-muted)' }}>
+                        　<b>{both.length}/{alt.length}</b> 个跟 ρ 路径重合（蓝色）
+                        {both.length === 0 && <b style={{ color: '#fa8c16' }}> —— 零重合：ρ 和实盘决策在这批数据上指向完全不同的字段</b>}
+                      </span>
+                    </span>;
+                  })()}
+                  {altResult && (altResult.error || !(altResult.path || []).length) && (
+                    <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                      按顶档 lift 没搜出路径（{altResult.error || '没有候选能让顶部薄片的 lift 再提升'}）
+                    </span>
+                  )}
+                </Space>
+              </div>
               <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                 标签数字 = 加进去后<b>验证段</b> ρ 的增量(held-out Δρ)；点某一步 = 只把它和之前的合并进池（按区间自动配权）。
                 ⚠️=样本内涨但验证段跟不上(过拟合)，🌀N=held-out 分档命中率打架 N 处（曲线倒挂，秩相关感受不到但眼睛能看出来）——别选。

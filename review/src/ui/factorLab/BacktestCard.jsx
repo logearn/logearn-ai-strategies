@@ -1,6 +1,7 @@
 import React from 'react';
 import { Card, Space, Slider, InputNumber, Tooltip, Button, Alert, Row, Col, Statistic, Typography, Table, Tag, Checkbox } from 'antd';
 import PlotlyChart from '../PlotlyChart.jsx';
+import { topBinHealth, enrichSweepWithReturns, nearCutoffOutliers } from '../../lib/factorDiagnostics.js';
 
 const fmtPct = v => (Number.isFinite(v) ? (v * 100).toFixed(1) + '%' : '-');
 // 纯函数，跟 FactorLab.jsx 里那份定义一致——那边还有别的调用点（时间外推逐段扫描）用得上，
@@ -89,6 +90,49 @@ export default function BacktestCard({
         }
         return null;
       })()}
+      {/* 顶档体检（readme 第 44 节）：42/43 两轮最重要的发现都在这里，但以前要人把第 7 节
+          （十分位）和第 6 节（cutoff 扫描）交叉着看才能发现。三件事一次算完常驻显示：
+          顶档 lift 是不是 <1（"越高分越差"的顶部反转）· 同分饱和块多大、块内 lift 多少 ·
+          高分段里有没有 lift<1 的档位。 */}
+      {(() => {
+        const h = topBinHealth(backtest, threshold);
+        if (!h) return null;
+        const bad = h.topBinBelowBase || h.highCutWarning;
+        if (!bad && !h.saturated) {
+          return <Alert style={{ marginBottom: 12 }} type="success" showIcon
+            message={<span style={{ fontSize: 12 }}>
+              ✓ 顶档体检：最高分那一档 lift {h.topBin ? h.topBin.lift.toFixed(2) : '-'}（≥1），
+              高分段没有 lift&lt;1 的档位，最大同分块只占 {(h.saturation ? h.saturation.share * 100 : 0).toFixed(1)}%。
+            </span>} />;
+        }
+        return <Alert style={{ marginBottom: 12 }} type={bad ? 'error' : 'warning'} showIcon
+          message={<span style={{ fontSize: 12 }}>
+            {bad ? '🔻 顶档有问题：分数最高的那批样本没有超额收益' : '🧱 顶部区分不了：同分饱和'}
+          </span>}
+          description={<div style={{ fontSize: 12 }}>
+            {h.topBin && <div>
+              · <b>最高分档</b>（{h.topBin.scoreLo.toFixed(1)}~{h.topBin.scoreHi.toFixed(1)}，n={h.topBin.n}）
+              高倍率 {fmtPct(h.topBin.hiRate)}、lift <b style={{ color: h.topBin.lift < 1 ? '#ff4d4f' : 'inherit' }}>
+                {h.topBin.lift.toFixed(2)}</b>
+              {h.topBinBelowBase && <b style={{ color: '#ff4d4f' }}> —— 低于基准，等于不筛还更差</b>}
+            </div>}
+            {h.highCutWarning && <div>
+              · <b>高分段反转</b>：cutoff={h.highCutWarning.cut} 时触发 {h.highCutWarning.triggered} 个，
+              lift 只有 <b style={{ color: '#ff4d4f' }}>{h.highCutWarning.lift.toFixed(2)}</b>
+              　<span style={{ color: 'var(--text-muted)' }}>把阈值往上拉反而更差 → 别用这一段</span>
+            </div>}
+            {h.saturation && h.saturated && <div>
+              · <b>同分饱和</b>：{h.saturation.n} 个样本（{fmtPct(h.saturation.share)}）都是 {h.saturation.score.toFixed(1)} 分，
+              块内高倍率 {fmtPct(h.saturation.hiRate)}、lift {h.saturation.lift.toFixed(2)}，横跨约 {h.saturation.spansBins} 个十分位
+              　<span style={{ color: 'var(--text-muted)' }}>这几档之间的差异是随机切分的产物，别据此判单调性</span>
+            </div>}
+            <div style={{ marginTop: 4, color: 'var(--text-muted)' }}>
+              顶档塌陷最常见的两个成因：① <b>邪恶因子的缺失样本被顶上来</b>（缺失记 0 分 = 躲掉扣分 = 白得分，
+              见因子体检卡片的"缺失按阵营"）；② <b>所有因子都是同一种单边斜坡</b>，核心区各自盖住大半样本，
+              于是池子只能识别底部、识别不了顶部。后者调权重没用，得加维度不同的因子。
+            </div>
+          </div>} />;
+      })()}
       {(() => { const p = sweepAt(backtest, cutoff); return (
         <Row gutter={24} style={{ marginBottom: 12 }}>
           <Col><Statistic title="触发数" value={p.triggered} suffix={`/ ${base.n}`} /></Col>
@@ -104,6 +148,32 @@ export default function BacktestCard({
         </Typography.Text>
         <PlotlyChart traces={scoreScatterFigure.traces} layout={scoreScatterFigure.layout} height={380} />
       </>)}
+      {/* lift 的固有盲区（readme 43.5）：它按 ">阈值与否" 二元计数，**一个 208x 和一个 3.1x
+          完全等重**。43 轮真实案例——全样本最大赢家 208.35x 得分 83.3，被 cutoff=84 差 0.7 分
+          挡在外面，而扫描表上 84 那一行只显示"lift 1.28 最高"，完全看不出这件事。
+          所以临界分下方的大倍数样本必须单独列出来，由人决定要不要为它松一档。 */}
+      {(() => {
+        const near = nearCutoffOutliers(backtest.scored, cutoff, { window: 3, minMultiple: 10 });
+        if (!near.length) return null;
+        return <Alert style={{ marginBottom: 12 }} type="warning" showIcon
+          message={<span style={{ fontSize: 12 }}>
+            🐋 当前 cutoff={cutoff} 下方 3 分之内，有 {near.length} 个 ≥10x 的大鱼被挡在外面
+          </span>}
+          description={<div style={{ fontSize: 12 }}>
+            {near.map(o => (
+              <div key={o.tokenAddress || o.symbol} style={{ paddingLeft: 8 }}>
+                · <b>{o.symbol}</b>　<b style={{ color: '#fa8c16' }}>{o.returnMax.toFixed(2)}x</b>
+                　得分 {o.score.toFixed(1)}
+                <span style={{ color: 'var(--text-muted)' }}>（差 {o.gap.toFixed(1)} 分）</span>
+              </div>
+            ))}
+            <div style={{ marginTop: 4, color: 'var(--text-muted)' }}>
+              <b>lift 看不见它们</b>：lift 只数"是不是 &gt;{threshold}x"，一个 208x 和一个 {threshold + 0.1}x 在它眼里一样重，
+              但在实盘 PnL 里前者顶后者几十单。往下松一两档 lift 通常只掉 0.03~0.05，
+              <b>对照下面十分位表的「倍数中位」那一列</b>再决定 —— 两个口径给出的最佳段经常不是同一段。
+            </div>
+          </div>} />;
+      })()}
       <Table style={{ marginTop: 12 }} size="small" rowKey="bin" columns={decileColumns}
         dataSource={backtest.deciles} pagination={false} scroll={{ x: 700 }} />
       <div style={{ marginTop: 16 }}>

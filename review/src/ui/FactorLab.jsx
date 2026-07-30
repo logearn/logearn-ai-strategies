@@ -14,6 +14,7 @@ import {
   missingRate, permutationPValue, resolveCtxAccessor,
   findDegenerateFactors, DEGENERATE_HIT_SHARE, heroWeightSum, estimateTieRhoCost, FIELD_SCOPE_LABEL,
 } from '../lib/factorLab.js';
+import { factorInfluence } from '../lib/factorDiagnostics.js';
 import { filterExcluded } from '../lib/factorExclusions.js';
 import { auditMcapCoupling } from '../lib/fieldAudit.js';
 import { FIELD_TO_BLOCK } from '../lib/onlineExport.js';
@@ -33,6 +34,7 @@ import PlanArenaCard from './factorLab/PlanArenaCard.jsx';
 import CompareHardGateCard from './factorLab/CompareHardGateCard.jsx';
 import BaselineVsTrainCard from './factorLab/BaselineVsTrainCard.jsx';
 import BacktestCard from './factorLab/BacktestCard.jsx';
+import FactorDiagnosticsCard from './factorLab/FactorDiagnosticsCard.jsx';
 import { useFactorScan } from './factorLab/useFactorScan.js';
 
 // 字段范围三档：original=只扫原字段（能进生成代码）；assembled=只扫组装/派生字段（仅供探索）；
@@ -334,9 +336,15 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
     sections.push(buildBacktestReport({
       config: { sampleN: rows.length, threshold, cutoff, missingPolicy, scoreShape, fieldScope },
       base,
+      // 原始样本也传进去：报告里的因子体检（摆幅/满命中/有效n、顶档、缺失按阵营）要按【样本】重算，
+      // 不能只靠已经聚合好的 deciles/sweep——那两份丢掉了"哪些样本缺失、命中度分布长什么样"。
+      rows, backtest,
       factors: factors.map(f => ({ field: f.field, camp: f.camp, weight: f.weight,
         lo0: f.lo0, lo1: f.lo1, hi1: f.hi1, hi0: f.hi0, auc: f.auc, missRate: missingRate(rows, f.field) })),
       corr: factorCorr,
+      // 推荐路径（若跑过）：报告判「权重↔证据是否对齐」要用它的 held-out Δρ 当证据。
+      // 拿 AUC 冒充证据是错的（36.4 第 4 条：候选的 AUC 置信区间几乎全跨 0.5）。
+      recommendPath: recommendResult?.path,
       northStar,
       rhoOpt,
       current: { triggered: p.triggered, hitRate: p.hitRate, capture: p.capture, lift: p.lift },
@@ -354,7 +362,9 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
 
     if (recommendResult?.path?.length) {
       sections.push(buildRecommendPathReport(recommendResult.path,
-        { threshold, blacklist: scan.blacklistSorted, crossCampBlocked: recommendResult.crossCampBlocked }));
+        { threshold, blacklist: scan.blacklistSorted, crossCampBlocked: recommendResult.crossCampBlocked,
+          // nTest / objective：报告要据此算噪声地板、并声明每步的 Δ 到底是 Δρ 还是别的目标
+          nTest: recommendResult.nTest, objective: recommendResult.objective }));
     }
 
     const report = sections.join('\n\n---\n\n');
@@ -757,6 +767,11 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
       onChange={v => editFactor(f.field, f.camp, { [key]: v == null ? (openIsNeg ? -Infinity : Infinity) : v })} />
   );
   const weightSum = factors.reduce((a, f) => a + f.weight, 0);
+  // 因子影响力（摆幅/满命中/有效n）——因子表那三列和下面的诊断卡片共用这一份，别各算各的。
+  const influences = useMemo(() => factorInfluence(rows, factors), [rows, factors]);
+  const influenceMap = useMemo(
+    () => new Map(influences.map(i => [i.camp + ':' + i.field, i])), [influences]);
+  const infOf = f => influenceMap.get(f.camp + ':' + f.field);
   const factorColumns = [
     { title: '字段', dataIndex: 'field', width: 200, fixed: 'left',
       render: v => <Tooltip title={getFieldDesc(v)}><code style={{ fontSize: 11 }}>{v}</code></Tooltip> },
@@ -775,6 +790,35 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
     { title: '权重', width: 100, render: (_, f) => (
       <InputNumber size="small" style={{ width: 80 }} min={0} step={0.1} value={f.weight}
         onChange={v => editFactor(f.field, f.camp, { weight: v ?? 0 })} />) },
+    // ↓ 三列诊断（readme 第 44 节）。权重那一列会误导：它是原始配比，真正决定"这个因子能把
+    // 分数推多远"的是【摆幅】= 权重/Σ勇者×100，而 Σ勇者 不在同一张表里，光看权重算不出来。
+    // 42 轮真实案例：above_below_ratio 权重 36.8 → 摆幅 45.0（全池最大），held-out Δρ 却只有
+    // 0.023（全池最小）；同时它 90% 的样本满命中，只对 10% 的样本说话。这三件事以前全靠手算。
+    { title: <Tooltip title="摆幅 = 权重 / Σ勇者权重 × 100 —— 这个因子最多能把总分推动多少分。勇者往上、邪恶往下。这才是真实影响力，权重只是原始配比。">摆幅</Tooltip>,
+      width: 88, align: 'right', sorter: (a, b) => (infOf(a)?.swingAbs ?? 0) - (infOf(b)?.swingAbs ?? 0),
+      render: (_, f) => {
+        const i = infOf(f);
+        if (!i || !Number.isFinite(i.swing)) return <span style={{ color: 'var(--text-muted)' }}>-</span>;
+        // 单个因子的摆幅超过满分的三分之一 = 它一个人主导了分数轴，值得看一眼证据够不够硬
+        const heavy = i.swingAbs >= 33.3;
+        return <b style={{ color: i.swing < 0 ? '#ff4d4f' : (heavy ? '#fa8c16' : 'inherit') }}>
+          {i.swing > 0 ? '+' : ''}{i.swing.toFixed(1)}</b>;
+      } },
+    { title: <Tooltip title="满命中占比（modalShare）：有多大比例的样本拿到【同一个】命中度。越接近 100% 说明这个因子对越多样本一视同仁，摆幅再大也是白推。≥90% 会标黄，≥99% 建因子时就已经被自动拦下。">满命中</Tooltip>,
+      width: 82, align: 'right', sorter: (a, b) => (infOf(a)?.modalShare ?? 0) - (infOf(b)?.modalShare ?? 0),
+      render: (_, f) => {
+        const i = infOf(f);
+        if (!i || !Number.isFinite(i.modalShare)) return '-';
+        return <span style={{ color: i.nearDegenerate ? '#fa8c16' : 'inherit', fontWeight: i.nearDegenerate ? 700 : 400 }}>
+          {(i.modalShare * 100).toFixed(0)}%</span>;
+      } },
+    { title: <Tooltip title="有效区分样本数 = n × (1 − 满命中占比)：这个因子真正在区分的样本有多少个。它跟摆幅一起看才有意义——摆幅 45 但只对 70 个样本说话，和摆幅 20 却对 500 个样本说话，是两回事。">有效 n</Tooltip>,
+      width: 78, align: 'right', sorter: (a, b) => (infOf(a)?.effectiveN ?? 0) - (infOf(b)?.effectiveN ?? 0),
+      render: (_, f) => {
+        const i = infOf(f);
+        return Number.isFinite(i?.effectiveN)
+          ? <span style={{ color: 'var(--text-muted)' }}>{i.effectiveN}</span> : '-';
+      } },
     { title: 'AUC', width: 70, align: 'right', render: (_, f) => Number.isFinite(f.auc) ? f.auc.toFixed(3) : '-' },
     { title: '缺失率', width: 80, align: 'right', render: (_, f) => fmtPct(f.missRate) },
     { title: '', width: 60, render: (_, f) => (
@@ -1382,8 +1426,15 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
           {/* rowKey 用 camp+field 复合键：同一字段理论上可以被两个阵营各选一次（不建议但不禁止），
               纯按 field 当 key 会撞车，导致 AntD/React 拿错行的渲染状态 */}
           <Table size="small" rowKey={f => f.camp + ':' + f.field} columns={factorColumns} dataSource={factors}
-            scroll={{ x: 1080 }} pagination={false} />
+            scroll={{ x: 1400 }} pagination={false} />
         </Card>)}
+
+      {/* 3.5 因子体检：权重↔证据对齐 / 缺失按阵营 / 留一法。挂在因子表【下面】而不是回测里——
+          这三件事都是"要不要改因子池"的输入，回测是改完之后才看的。 */}
+      {factors.length > 0 && (
+        <FactorDiagnosticsCard rows={rows} factors={factors} influences={influences}
+          threshold={threshold} recommendPath={recommendResult?.path} onRemoveFactor={removeFactor} />
+      )}
 
       {/* 4. 回测 */}
       {backtest && (

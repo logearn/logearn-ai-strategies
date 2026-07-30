@@ -8,10 +8,13 @@ import { compileStrategy, runStrategyOnRow, parseFactorCheck } from '../lib/proA
 import {
   FACTOR_WIN_THRESHOLDS, DEFAULT_FACTOR_WIN_THRESHOLD,
   autoWeights, optimizeWeightsForRho, baseStats, backtestFactors, runWalkForwardBacktest, assessSplitDecay,
+  assessCutoffInert,
   compareGroupsAgainstBaseline, compareWithHardGate,
-  classifyFieldOrigin, factorCorrelations, recommendCutoff,
+  classifyFieldOrigin, factorCorrelations, recommendCutoff, scorePoolRho,
   missingRate, permutationPValue, resolveCtxAccessor,
+  findDegenerateFactors, DEGENERATE_HIT_SHARE, heroWeightSum, estimateTieRhoCost, FIELD_SCOPE_LABEL,
 } from '../lib/factorLab.js';
+import { filterExcluded } from '../lib/factorExclusions.js';
 import { auditMcapCoupling } from '../lib/fieldAudit.js';
 import { FIELD_TO_BLOCK } from '../lib/onlineExport.js';
 import { selectRowsBySlice, dayOf, UNKNOWN_DAY, strategyOf, groupRowsByStrategyAndDay } from '../lib/dataSlices.js';
@@ -25,6 +28,8 @@ import ImportStrategyCard from './factorLab/ImportStrategyCard.jsx';
 import FactorSopCard from './factorLab/FactorSopCard.jsx';
 import MissedRowsCard from './factorLab/MissedRowsCard.jsx';
 import FactorRecommendCard from './factorLab/FactorRecommendCard.jsx';
+import FullFieldRecommendCard from './factorLab/FullFieldRecommendCard.jsx';
+import PlanArenaCard from './factorLab/PlanArenaCard.jsx';
 import CompareHardGateCard from './factorLab/CompareHardGateCard.jsx';
 import BaselineVsTrainCard from './factorLab/BaselineVsTrainCard.jsx';
 import BacktestCard from './factorLab/BacktestCard.jsx';
@@ -32,7 +37,6 @@ import { useFactorScan } from './factorLab/useFactorScan.js';
 
 // 字段范围三档：original=只扫原字段（能进生成代码）；assembled=只扫组装/派生字段（仅供探索）；
 // all=两者一起扫（组装字段命中的规律仍需人工在实盘侧复刻，进不了生成代码）。
-const FIELD_SCOPE_LABEL = { original: '原字段', assembled: '组装字段', all: '全部字段' };
 const fmtPct = v => (Number.isFinite(v) ? (v * 100).toFixed(1) + '%' : '-');
 const fmtBound = v => (v === -Infinity ? '-∞' : v === Infinity ? '∞' : formatNumberSmart(v));
 const fmtInterval = iv => iv ? `[${fmtBound(iv.lo)}, ${fmtBound(iv.hi)})` : '-';
@@ -42,12 +46,15 @@ const fmtInterval = iv => iv ? `[${fmtBound(iv.lo)}, ${fmtBound(iv.hi)})` : '-';
 // 邪恶阵营的 interval 只是换成了"输家集中区"（findColdInterval 的结果），不是另一套字段。
 // onExclude(field)：把这个字段标记成"不适合该阵营"，持久化排除——以后扫描/勾选都不再出现，
 // 跟"删除已选因子"（removeFactor，只是取消这次勾选）是两回事，这个是更强的"判定"。
+// onBlacklist(field) / isBlacklisted(field)：比"移除"轻一档的判定——字段留在表里、指标照常算、
+// 仍可手动勾选，只是【因子推荐的贪心搜索不许选它】（见 lib/factorBlacklist.js）。两个按钮并排，
+// 靠 tooltip 讲清楚差别：拉黑挡算法，移除连扫描都不扫。
 // getMarginal(field) -> undefined（未算）| { error } | computeHeldOutDeltaRho 的返回值
 //   { deltaTrain, deltaTest, baselineTrain/Test, withTrain/Test, nTrain, nTest }——
 //   展示的主数字固定是 deltaTest（held-out 增量），deltaTrain 只用来标过拟合。
 // permNull：边际ρ 的置换零分布（scan.permNull），有就给每个候选的边际ρ 配一个经验 p 值
 // （"纯噪声凑出这么大增量的概率"）；没算过就只显示增量本身。
-function makeScanColumns(camp, onExclude, getMarginal, permNull) {
+function makeScanColumns(camp, onExclude, getMarginal, permNull, onBlacklist, isBlacklisted) {
   const isEvil = camp === 'evil';
   const cols = [
     { title: '字段', dataIndex: 'field', width: 230, fixed: 'left',
@@ -136,8 +143,21 @@ function makeScanColumns(camp, onExclude, getMarginal, permNull) {
           <span style={{ fontSize: 11, color: a >= 0.5 ? '#ff453a' : a >= 0.3 ? '#ff9f0a' : undefined }}>{r.mcapRho.toFixed(2)}</span>
         </Tooltip>;
       } },
-    { title: '', width: 70, render: (_, r) => (
-      <Button size="small" type="text" danger onClick={() => onExclude(r.field)}>移除</Button>) },
+    { title: '', width: 132, render: (_, r) => {
+      const black = isBlacklisted?.(r.field);
+      return <Space size={0}>
+        <Tooltip title={black
+          ? '已拉黑：因子推荐的贪心搜索不会选它。指标照常算、照常显示，也仍然可以手动勾选进池。点一下解除。'
+          : '拉黑：不让因子推荐选它，但保留在这张表里继续看指标、仍可手动勾选。跟「移除」的区别是移除会连扫描都不扫。'}>
+          <Button size="small" type={black ? 'primary' : 'text'} danger={black}
+            style={black ? { fontSize: 11 } : { fontSize: 11, opacity: .75 }}
+            onClick={() => onBlacklist?.(r.field)}>{black ? '已拉黑' : '拉黑'}</Button>
+        </Tooltip>
+        <Tooltip title="移除：判定这个字段不适合本阵营，以后扫描都不再出现（比拉黑更强）">
+          <Button size="small" type="text" danger onClick={() => onExclude(r.field)}>移除</Button>
+        </Tooltip>
+      </Space>;
+    } },
   );
   return cols;
 }
@@ -149,6 +169,8 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
   // 挖因子是个耗时手工活，刷新页面/误关标签页不该让这些进度清零。
   const [persisted] = useState(loadFactorPoolState);
   const [restoredNotice, setRestoredNotice] = useState(!!(persisted && persisted.factors && persisted.factors.length));
+  // 存档里的 cutoff 是旧分数尺度的，loadFactorPoolState 已经摘掉并打了标记（见 factorPoolStore.js）
+  const [cutoffScaleNotice, setCutoffScaleNotice] = useState(!!(persisted && persisted.cutoffScaleStale));
   const [threshold, setThreshold] = useState(persisted?.threshold ?? DEFAULT_FACTOR_WIN_THRESHOLD);
   // 字段范围：默认只扫原字段（数据源直接给、能映射回实盘 ctx 的）。组装字段是工具聚合/派生的，
   // 无法进生成代码，需要人工审核后才考虑使用——所以单独一档，不和原字段混在一张表里。
@@ -157,7 +179,14 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
   // 直接筛掉不够格的——只影响候选表的展示，不影响扫描/勾选本身（勾了的字段被过滤掉也不会被取消勾选）。
   // minMarginal 默认 0.005：算过边际ρ后自动只留"加进池子能提升【验证段】ρ（正贡献）"的候选——挑因子的口径。
   // 算之前该过滤不生效（下面 applyCandFilter 里有 scan.marginalRho 守卫），所以默认值不会误伤未算的表。
-  const [candFilter, setCandFilter] = useState({ minMarginal: 0.005, maxMissRate: 100 });
+  // 缺失率闸门【必须持久化】：它是这几个过滤器里唯一真正限制「因子推荐」能选到什么的
+  // （其余只影响候选表展示，见 recommendCandidates）。原来默认 100=全放行、又不进
+  // saveFactorPoolState，于是**每次刷新都静默回到全放行**——readme 第 102 节那次
+  // "算推荐挑进缺失率 95%+ 字段"的事故就是这么复发的（真实数据里 whale_recent_notice_mcap
+  // 缺失 96.2%、总 n=28，靠 28 条样本的 AUC 0.656 排到候选表榜首，还进了贪心路径第 10 步）。
+  // 默认值同时从 100 收到 10，跟 readme 第 36 节定的口径一致。
+  const [candFilter, setCandFilter] = useState(
+    () => ({ minMarginal: 0.005, maxMissRate: 10, ...(persisted?.candFilter || {}) }));
   const [candSearch, setCandSearch] = useState('');   // 按字段名/含义搜索候选（跨两阵营、跨分页）
   // 2026-07-29：打分形状与缺失口径从"两个可选开关"降成两个常量，UI 上的 Segmented 已删。
   //
@@ -178,6 +207,9 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
   const [oosBusy, setOosBusy] = useState(false);
   const [oosProgress, setOosProgress] = useState(null); // {completed,total} walk-forward 逐段进度
   const [oosFoldIdx, setOosFoldIdx] = useState(0); // 详情面板选中的那一段，默认最后一段（训练集最大、离现在最近）
+  // 默认 false = 每段连权重也重新自动配（检验"整套参数"能不能外推）；打开则只重挖区间、沿用
+  // 因子池里手调的权重（把"配权变了"这个变量摘掉，单独检验区间是不是过拟合）。
+  const [oosKeepWeights, setOosKeepWeights] = useState(false);
   // FactorRecommendCard 算出的推荐结果，靠 onResultChange 抛上来——不是给这里渲染用，只为了
   // 「导出完整报告」能把分档诊断也并进去，不用再单独一个导出按钮（见 exportFullReport）。
   const [recommendResult, setRecommendResult] = useState(null);
@@ -204,8 +236,8 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
   // 可能过期的候选表更可靠。
   useEffect(() => {
     if (!factors.length) { clearFactorPoolState(); return; }
-    saveFactorPoolState({ factors, threshold, fieldScope, scoreShape, missingPolicy, cutoff });
-  }, [factors, threshold, fieldScope, scoreShape, missingPolicy, cutoff]);
+    saveFactorPoolState({ factors, threshold, fieldScope, scoreShape, missingPolicy, cutoff, candFilter });
+  }, [factors, threshold, fieldScope, scoreShape, missingPolicy, cutoff, candFilter]);
 
   const base = useMemo(() => baseStats(rows, threshold), [rows, threshold]);
   const scopedFields = useMemo(
@@ -291,9 +323,13 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
     // 回测段固定用"详情面板"当前选中的那一段（跟页面上展示的一致），不是笼统平均——
     // 这样导出的数字和用户在页面上实际看到的数字对得上。
     const oosSelectedFold = (oos && !oos.error) ? oos.folds[Math.min(oosFoldIdx, oos.folds.length - 1)] : null;
+    const oosRow = oosFoldRows?.[Math.min(oosFoldIdx, (oosFoldRows?.length || 1) - 1)];
     const oosInput = (oosSelectedFold && !oosSelectedFold.error) ? {
       trainSize: oosSelectedFold.trainSize, testSize: oosSelectedFold.testSize, skipped: oosSelectedFold.skipped,
-      train: sweepAt(oosSelectedFold.train, cutoff), test: sweepAt(oosSelectedFold.test, cutoff),
+      // 用该段自己训出来的 cutoff，跟页面表格/walk-forward 报告完全一致（不是全样本那个 cutoff）
+      cutoff: oosRow?.cutoff, cutoffSource: oosSelectedFold.cutoffSource,
+      weightSource: oosSelectedFold.weightSource, inert: oosRow?.inert,
+      train: oosRow?.tr, test: oosRow?.te,
     } : (oos && oos.error ? { error: oos.error } : (oosSelectedFold?.error ? { error: oosSelectedFold.error } : null));
     sections.push(buildBacktestReport({
       config: { sampleN: rows.length, threshold, cutoff, missingPolicy, scoreShape, fieldScope },
@@ -301,6 +337,7 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
       factors: factors.map(f => ({ field: f.field, camp: f.camp, weight: f.weight,
         lo0: f.lo0, lo1: f.lo1, hi1: f.hi1, hi0: f.hi0, auc: f.auc, missRate: missingRate(rows, f.field) })),
       corr: factorCorr,
+      northStar,
       rhoOpt,
       current: { triggered: p.triggered, hitRate: p.hitRate, capture: p.capture, lift: p.lift },
       sweep: backtest.sweep.points.map(x => ({ cut: x.cut, triggered: x.triggered, hitRate: x.hitRate, capture: x.capture, lift: x.lift })),
@@ -315,7 +352,10 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
       sections.push(buildBaselineVsTrainReport(baselineVsTrain, { cutoff, threshold, strategyName: baselineVsTrainStrategy }));
     }
 
-    if (recommendResult?.path?.length) sections.push(buildRecommendPathReport(recommendResult.path, { threshold }));
+    if (recommendResult?.path?.length) {
+      sections.push(buildRecommendPathReport(recommendResult.path,
+        { threshold, blacklist: scan.blacklistSorted, crossCampBlocked: recommendResult.crossCampBlocked }));
+    }
 
     const report = sections.join('\n\n---\n\n');
     const ok = await copyText(report);
@@ -384,7 +424,18 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
   }, [rows, threshold]);
 
   const hasEvil = factors.some(f => f.camp === 'evil');
-  const cutoffMin = hasEvil ? -100 : 0;
+  // 分数下界跟着【实际能到多低】走，不再硬编码 -100：2026-07-29 归一分母改成 Σ勇者权重
+  // （= 满分上限，跟策略模板对齐，见 factorLab.js scoreRow 的注释）之后，最低分是
+  // -Σ邪恶权重/Σ勇者权重×100，邪恶占比越高越负——用户真实池子（勇者 29.7/邪恶 70.5）能到 -237。
+  // 还卡在 -100 的话，InputNumber 会把 cutoff 夹住，负分段整段选不到。
+  const heroW = useMemo(() => heroWeightSum(factors), [factors]);
+  const evilW = useMemo(
+    () => factors.reduce((a, f) => a + (f.camp === 'evil' ? (Number(f.weight) || 0) : 0), 0), [factors]);
+  const cutoffMin = useMemo(() => {
+    if (!hasEvil) return 0;
+    if (!(heroW > 0)) return -100;             // 纯邪恶池分数恒为 0，下界给多少都无所谓
+    return Math.floor(-evilW / heroW * 100);
+  }, [hasEvil, heroW, evilW]);
   // 因子池里"映射不回原始 ctx，且上线代码也没有已知派生算法"的因子：这类字段在上线代码里
   // 取值才会真的恒为 null（记 0 分）、权重却仍占分母，线上总分因此系统性低于回测总分——阈值
   // 直接照搬就会偏紧。这里算一次，发送到策略时提示，因子表上也常驻一条提醒。
@@ -399,6 +450,13 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
       return !classifyFieldOrigin(f.field).original || !resolveCtxAccessor(rows, f.field).ok;
     });
   }, [factors, rows]);
+  // 因子池里"梯形退化成人人同分"的因子（见 factorLab.js 的 factorHitProfile 那段）。
+  // buildFactors 的硬闸只拦【新建】的因子；从策略导入的、换过字段范围保留下来的、以及这道闸
+  // 上线之前就已经存在于池子里的，都不走那条路，所以这里要有一条常驻体检。
+  // 软线取 90%（NEAR_DEGENERATE_HIT_SHARE 的默认值）：≥99% 的是确定零贡献，90%~99% 的是
+  // "只对一成样本说话"，两种都列出来但文案分开——后者该不该删由人判断，不替人决定。
+  const degenerateFactors = useMemo(
+    () => findDegenerateFactors(rows, factors), [rows, factors]);
   // 推荐触发阈值：净超额命中数最大的档位（见 factorLab.js 里 recommendCutoff 的注释）
   const cutoffRecommend = useMemo(
     () => (backtest ? recommendCutoff(backtest.sweep) : null),
@@ -474,7 +532,8 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
   // 删因子【不】重新 autoWeights：剩下那些因子的权重可能是「按ρ最优配权」搜出来的、或者用户
   // 手工调的，autoWeights 会按 interval.score 把它们整体覆盖掉——删一个因子顺手把配权成果清了，
   // 界面上还留着 rhoOpt 那张"train/test 都涨了"的结果给新权重站台（真实踩过）。
-  // 权重和不再是 100 也没关系：scoreRow 按 Σw 归一，相对比例不变，cutoff 的含义也不漂移。
+  // 权重和不再是 100 也没关系：scoreRow 按 Σ勇者权重 归一（= 满分上限，跟策略模板对齐），
+  // 相对比例不变。但删掉【勇者】因子会改变分母、进而改变分数尺度，cutoff 要重新定。
   function removeFactor(f) {
     if (f.camp === 'evil') scan.setSelectedEvil(prev => prev.filter(x => x !== f.field));
     else scan.setSelectedHero(prev => prev.filter(x => x !== f.field));
@@ -531,10 +590,13 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
       // 反过来勾了却没能建出因子的字段也不该拿去验证。用勾选去验证的后果是"页面上在用的因子池"
       // 和"被验证的因子集"根本不是同一批（导入策略之后 selected 为空，直接报"推导不出任何有效
       // 因子"，用户看到的却是满满一池因子）。
-      const fieldSpecs = factors.map(f => ({ field: f.field, camp: f.camp }));
+      // 带上 weight：只有 keepWeights 打开时 backtestOneSplit 才会读它（见那边 applyKeepWeights）
+      const fieldSpecs = factors.map(f => ({ field: f.field, camp: f.camp, weight: f.weight }));
       if (!fieldSpecs.length) { message.warning('因子池为空，先扫描并勾选因子'); return; }
       const res = await runWalkForwardBacktest(rows, fieldSpecs, threshold, {
         bootstrapB: 100, shape: scoreShape, missingPolicy, splits: 5,
+        // cutoff 每段自己在训练段上重新定；这里的 cutoff 只是 recommendCutoff 定不出来时的兜底
+        keepWeights: oosKeepWeights, cutoffMode: 'train', cutoff,
         onProgress: ({ completed, total }) => setOosProgress({ completed, total }),
       });
       setOos(res);
@@ -586,10 +648,49 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
   // 候选表批量导出：制表符分隔，直接粘贴进 Excel/飞书表格能对齐成列，或整段发给 AI 帮忙挑因子。
   // 列（方向/coverage/CI 等挑因子必看项）由 lib/factorScanExport.js 统一拼，勇者/邪恶口径一致。
   // 只导出当前"过滤后"展示的那些行，跟表格里看到的一致。
-  const exportOpts = () => ({
-    getDesc: getFieldDesc, getMarginal: scan.getMarginal,
-    meta: `因子扫描候选导出 · 高倍阈值=${threshold}x · 样本=${rows.length} · 字段范围=${FIELD_SCOPE_LABEL[fieldScope]}`,
-  });
+  // 导出的候选表是【过滤后】的行，之前 meta 里没写这件事——拿到导出的人（尤其是 AI）会把
+  // 28 行当成全部候选来选品，实际上可用的有三百多个。所以把"导出多少/可用多少/哪些过滤生效"
+  // 一起写进抬头，缺了什么一眼可见。
+  const exportOpts = () => {
+    const shown = (filteredHeroCandidates?.length || 0) + (filteredEvilCandidates?.length || 0);
+    const avail = (scan.visibleHeroCandidates?.length || 0) + (scan.visibleEvilCandidates?.length || 0);
+    const on = [];
+    if (candSearch.trim()) on.push(`关键词"${candSearch.trim()}"`);
+    if (candFilter.maxMissRate < 100) on.push(`缺失率≤${candFilter.maxMissRate}%`);
+    if (candFilter.minMarginal > 0) on.push(`边际ρ(test)≥${candFilter.minMarginal}`);
+    const scope = `导出 ${shown} 行 / 扫描出 ${avail} 个可用候选`
+      + (on.length ? ` · 生效过滤：${on.join('、')}` : ' · 无过滤');
+    return {
+      getDesc: getFieldDesc, getMarginal: scan.getMarginal,
+      meta: `因子扫描候选导出 · 高倍阈值=${threshold}x · 样本=${rows.length} · 字段范围=${FIELD_SCOPE_LABEL[fieldScope]}\n# ${scope}`,
+    };
+  };
+
+  // 北极星（默认口径）+ 同分饱和度：**无条件算**，不依赖任何按钮。
+  // 之前报告第 4 节只有跑过「ρ最优配权」才有数字，没跑就整节空白——于是"这套权重此刻到底几分"
+  // 从来没进过报告，诊断时只能靠 lift@cutoff 反推。同分饱和同理：分段表里"连着几段分数区间
+  // 一模一样"就是它造成的，但那要人肉数（真实数据上数出过 344/688 和 145/728 两次），直接给数字。
+  const northStar = useMemo(() => {
+    if (!factors.length || !backtest) return null;
+    const rho = scorePoolRho(rows, factors, missingPolicy);
+    const cnt = new Map();
+    for (const s of backtest.scored) {
+      if (!Number.isFinite(s.score)) continue;
+      const k = s.score.toFixed(4);          // 浮点分数按定精度归组，避免 0.1 和 0.10000000001 算两档
+      cnt.set(k, (cnt.get(k) || 0) + 1);
+    }
+    let tieScore = null, tieN = 0;
+    for (const [k, v] of cnt) if (v > tieN) { tieN = v; tieScore = Number(k); }
+    const scoredN = [...cnt.values()].reduce((a, b) => a + b, 0);
+    // 同分并列对 ρ 的代价【估计】（见 factorLab.js 的 estimateTieRhoCost，那里写了模型假设
+    // 和为什么它不可能是实测值）。报告拿它替掉原来那句笼统的"直接压住 ρ 的上限"——
+    // 在弱信号下实际代价可能只有千分之几，值不值得去拉宽梯形要看这个数。
+    const tieRatio = scoredN ? tieN / scoredN : NaN;
+    const tieCost = estimateTieRhoCost({ n: scoredN, tieRatio, rho });
+    return { rho, n: scoredN, tieScore, tieN, tieRatio, distinct: cnt.size,
+      tieRhoCost: tieCost ? tieCost.estCost : NaN,
+      rhoUntiedEst: tieCost ? tieCost.rhoUntiedEst : NaN };
+  }, [rows, factors, missingPolicy, backtest]);
 
   // 市值耦合体检：进场市值与 returnMax 的相关有多强（见 fieldAudit.js）。
   // 只跟 rows 有关，跟因子池/阈值都无关，所以缓存住即可。
@@ -597,8 +698,12 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
 
   // 不用 useMemo 缓存：列定义要闭包住当前这一份 scan.handleExcludeCandidate（引用了随渲染变化的
   // selectedHero/selectedEvil/scanHero/scanEvil），缓存住旧闭包会让"移除"按钮操作到过期的状态。
-  const scanHeroColumns = makeScanColumns('hero', field => scan.handleExcludeCandidate('hero', field), scan.getMarginal, scan.permNull);
-  const scanEvilColumns = makeScanColumns('evil', field => scan.handleExcludeCandidate('evil', field), scan.getMarginal, scan.permNull);
+  const scanHeroColumns = makeScanColumns('hero', field => scan.handleExcludeCandidate('hero', field), scan.getMarginal, scan.permNull,
+    field => (scan.isBlacklisted('hero', field) ? scan.handleUnblacklistCandidate('hero', field) : scan.handleBlacklistCandidate('hero', field)),
+    field => scan.isBlacklisted('hero', field));
+  const scanEvilColumns = makeScanColumns('evil', field => scan.handleExcludeCandidate('evil', field), scan.getMarginal, scan.permNull,
+    field => (scan.isBlacklisted('evil', field) ? scan.handleUnblacklistCandidate('evil', field) : scan.handleBlacklistCandidate('evil', field)),
+    field => scan.isBlacklisted('evil', field));
   // 候选表过滤：AUC 按偏离 0.5 的幅度筛（判别力，不分方向）；边际ρ按【带符号】筛——只留
   // deltaTest ≥ 阈值的正贡献候选（验证段真涨的才是该挑的；负贡献 = 加了反而拉低 ρ，不该留，
   // 哪怕它绝对值很大）。卡的是 test 不是 train：train 涨 test 不涨的候选正是要被这道拦掉的那类。
@@ -634,6 +739,15 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
   // 算法，导致「算推荐」依然会挑出缺失率95%+的字段并给不小权重。
   const recommendCandidates = [...(scan.visibleHeroCandidates || []), ...(scan.visibleEvilCandidates || [])]
     .filter(c => (c.missRate ?? 0) * 100 <= candFilter.maxMissRate);
+
+  // 「全字段贪心」/「方案擂台」的候选池底料：跟 recommendCandidates 同一条口径——按阵营剔掉手点
+  // 「移除」的字段，缺失率闸门在卡片里用 maxMissRate 再过一道。跟候选表的差别【只剩】不受 fieldScope
+  // 分批限制（用 fields 而不是 scopedFields），所以这里是原字段+组装字段一起给。
+  // 分两份而不是一份：exclusions 按 camp+field 记，同一字段可能"允许当勇者、不许当邪恶"。
+  const campScanFields = useMemo(() => ({
+    hero: filterExcluded(fields, scan.exclusions, 'hero'),
+    evil: filterExcluded(fields, scan.exclusions, 'evil'),
+  }), [fields, scan.exclusions]);
 
   // ---------- 因子权重编辑表 ----------
   const boundInput = (f, key, openIsNeg) => (
@@ -737,6 +851,7 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
     const fold = oos.folds?.[Math.min(oosFoldIdx, oos.folds.length - 1)];
     if (!fold || fold.error) return null;
     const c = plotColors(!light);
+    const foldCut = Number.isFinite(fold.cutoff) ? fold.cutoff : cutoff;
     const trainPts = fold.train.sweep.points.filter(p => Number.isFinite(p.lift));
     const testPts = fold.test.sweep.points.filter(p => Number.isFinite(p.lift));
     const traces = [
@@ -751,7 +866,9 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
       xaxis: { title: { text: 'cutoff' }, ...c.axis },
       yaxis: { title: { text: 'lift（命中率÷基准率）' }, ...c.axis },
       shapes: [
-        { type: 'line', x0: cutoff, x1: cutoff, y0: 0, y1: 1, yref: 'paper',
+        // 竖线画【该段自己训出来的 cutoff】，跟表格里那一行的口径一致；全样本 cutoff 在这张图上
+        // 没有意义（各段独立重训，分数分布跟全样本对不上）
+        { type: 'line', x0: foldCut, x1: foldCut, y0: 0, y1: 1, yref: 'paper',
           line: { color: '#ff453a', width: 1.5, dash: 'dash' } },
         { type: 'line', x0: 0, x1: 1, xref: 'paper', y0: 1, y1: 1,
           line: { color: '#8e8e93', width: 1, dash: 'dot' } },
@@ -766,13 +883,17 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
 
   // walk-forward 各段总览行：渲染的总览表和「导出完整报告」（exportFullReport）共用同一份计算——
   // 保证页面上看到的"衰减判定"跟导出markdown里的判定永远一致，不会出现两处算出不同结论。
+  // 每段用【它自己在训练段上定出来的 cutoff】，不是页面上那个全样本 cutoff——各段是独立重训的，
+  // 分数分布跟全样本对不上，套同一个数值会让阈值整体失效（详见 factorLab.js backtestOneSplit 注释）。
   const oosFoldRows = useMemo(() => {
     if (!oos || oos.error) return null;
     return oos.folds.map((f, i) => {
       if (f.error) return { key: i, idx: i, error: f.error, trainSize: f.trainSize, testSize: f.testSize };
-      const tr = sweepAt(f.train, cutoff), te = sweepAt(f.test, cutoff);
+      const cut = Number.isFinite(f.cutoff) ? f.cutoff : cutoff;
+      const tr = sweepAt(f.train, cut), te = sweepAt(f.test, cut);
       const decay = assessSplitDecay(tr, te);
-      return { key: i, idx: i, tr, te, decay, trainSize: f.trainSize, testSize: f.testSize,
+      return { key: i, idx: i, tr, te, decay, cutoff: cut, cutoffSource: f.cutoffSource,
+               inert: assessCutoffInert(tr, f.trainSize), trainSize: f.trainSize, testSize: f.testSize,
                testStart: f.testStart, testEnd: f.testEnd };
     });
   }, [oos, cutoff]);
@@ -832,6 +953,20 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
             setFactors([]); scan.resetScan();
             invalidateDownstream(); setRestoredNotice(false);
           }}>清空重来</Button>} />
+      )}
+      {/* 分数尺度换代提醒：2026-07-29 归一分母改成 Σ勇者权重（跟实盘策略对齐），存档里的 cutoff
+          是旧尺度的数字，已经在 loadFactorPoolState 里摘掉了。因子池本身没变，但阈值必须重定——
+          不提示的话页面会显示一个默认值、触发数跟上次对不上，且没有任何地方说得清为什么。 */}
+      {cutoffScaleNotice && (
+        <Alert type="warning" showIcon closable style={{ marginTop: 8 }}
+          onClose={() => setCutoffScaleNotice(false)}
+          message="分数口径已更新，上次那个触发阈值已作废"
+          description={<span style={{ fontSize: 12 }}>
+            归一化分母从「Σ全部权重」改成「<b>Σ勇者权重</b>」（= 满分上限），跟实盘策略模板对齐——
+            现在<b>找因子的分数和线上分数完全同尺度，cutoff 可以直接搬过去</b>，不用再换算。
+            代价是同一个因子池的分数整体变了一个倍数（<b>秩序不变</b>，ρ／十分位／AUC 全都没受影响），
+            所以存下来的旧 cutoff 已经摘掉了。<b>请重新点一次「推荐阈值」</b>。
+          </span>} />
       )}
       {/* 1. 阈值与总览 */}
       <Card id="fl-threshold" size="small" title="高倍阈值与样本总览"
@@ -1091,8 +1226,24 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
           <FactorRecommendCard rows={rows} factors={factors} threshold={threshold}
             missingPolicy={missingPolicy} scoreShape={scoreShape}
             onAdopt={adoptRecommended} onAdoptFactors={adoptRecommendedFactors}
-            candidates={recommendCandidates} onResultChange={setRecommendResult} />
+            candidates={recommendCandidates} onResultChange={setRecommendResult}
+            blacklist={scan.blacklistSorted} onBlacklist={scan.handleBlacklistCandidate}
+            onUnblacklist={scan.handleUnblacklistCandidate} onClearBlacklist={scan.handleClearBlacklist} />
         )}
+        {/* 全字段贪心（方案A+B+C+D）：跟上面那张并列的第二个入口，候选池是【跨类字段现挖区间】，
+            不受 fieldScope 分批限制，但照样吃手工「移除」（campScanFields 已按阵营剔过）+ 缺失率 + 黑名单。
+            刻意不要求 scanHero/scanEvil 存在——它自己扫，没点过「扫描」也能直接跑。
+            上面那张卡的行为一行未动，两者结果各看各的。 */}
+        <FullFieldRecommendCard rows={rows} fields={campScanFields} factors={factors} threshold={threshold}
+          missingPolicy={missingPolicy} scoreShape={scoreShape} maxMissRate={candFilter.maxMissRate}
+          blacklist={scan.blacklistSorted}
+          onAdopt={adoptRecommended} onAdoptFactors={adoptRecommendedFactors} />
+        {/* 方案擂台：上面两张卡各跑各的，跨卡比要人肉记数字——这张把几种"候选池×搜索策略"的
+            组合一次跑完纵向摆开，按 k* 处的 K折 test ρ 排名，看中哪行直接采用哪行。 */}
+        <PlanArenaCard rows={rows} fields={campScanFields} candidates={recommendCandidates} factors={factors}
+          threshold={threshold} missingPolicy={missingPolicy} scoreShape={scoreShape}
+          maxMissRate={candFilter.maxMissRate} blacklist={scan.blacklistSorted}
+          onAdoptFactors={adoptRecommendedFactors} />
       </Card>
 
       {/* 3. 因子权重（可编辑） */}
@@ -1100,7 +1251,7 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
         <Card id="fl-weights" size="small" title={`因子权重（${factors.length} 个，可编辑）`}
           extra={<Space>
             <Typography.Text type={Math.abs(weightSum - 100) > 0.5 ? 'warning' : 'secondary'} style={{ fontSize: 12 }}>
-              权重合计 {weightSum.toFixed(1)}{Math.abs(weightSum - 100) > 0.5 ? '（≠100，总分会按合计归一）' : ''}
+              权重合计 {weightSum.toFixed(1)}（其中勇者 {heroW.toFixed(1)} = 满分上限，总分按它归一）
             </Typography.Text>
             {/* 打分形状/缺失口径两个 Segmented 已删（2026-07-29），理由见文件上方 scoreShape/missingPolicy
                 两个常量处的注释——前者梯形是超集，后者选了就跟线上代码对不上。 */}
@@ -1122,7 +1273,9 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
             <Tag color="error" style={{ marginRight: 4 }}>邪恶</Tag>命中核心区 = -权重×命中度（减分）。
             梯形打分：值落在 [核心起, 核心止] 满效应，向两侧的 0 效应界线性衰减，界外 0；留空 = 该侧不设界（∞）。
             字段缺失记 0（不加不减，惩罚数据不全的盘，保守；跟线上「生成上线代码」口径一致）。
-            总分 = Σ(±权重×命中度)/权重合计×100，纯勇者阵营时落在 0~100，含邪恶阵营命中时可能为负。
+            总分 = Σ(±权重×命中度)/<b>Σ勇者权重</b>×100 —— 跟实盘策略模板同一口径，cutoff 可直接搬到线上。
+            勇者全中、邪恶一个不踩 = 100 分；纯勇者阵营时落在 0~100，含邪恶阵营命中时为负，
+            下界是 −Σ邪恶/Σ勇者×100{hasEvil && heroW > 0 ? `（本池 ${cutoffMin}）` : ''}，<b>不是 −100</b>。
             权重自动按区间打分（Wilson下界×√coverage，区间感知，不假设方向单调）分配，可手工调整；
             点「🎯 按 ρ 最优配权」直接优化全程点对点 spearman(score, returnMax)，配完权重后用「推荐阈值」单独定 cutoff——先排序、再从排序里读 cutoff，不要反过来。
           </Typography.Paragraph>
@@ -1147,6 +1300,40 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
                 </span>} />
             );
           })()}
+          {/* 常数因子体检：命中度对几乎所有样本都一样的因子，对排序【零贡献】，但权重照样进
+              scoreRow 的分母（Σ全部权重），把其它因子的有效权重按比例稀释掉。它在因子表里跟
+              正常因子长得一模一样（有 AUC、有权重、有区间），不专门标出来看不见。
+              真实案例：shit_volume 邪恶推出 lo1=0/hi1=∞，而它是恒 ≥0 的占比字段 → 724/728 个
+              样本命中度都是 1.00，每个样本一律扣同样的分。 */}
+          {degenerateFactors.length > 0 && (
+            <Alert style={{ marginBottom: 12 }} type="warning" showIcon
+              message={<span style={{ fontSize: 12 }}>
+                🧊 有 {degenerateFactors.length} 个因子几乎对所有样本给同一个命中度，对排序没有贡献：
+              </span>}
+              description={<div style={{ fontSize: 12 }}>
+                {degenerateFactors.map(d => (
+                  <div key={d.factor.camp + ':' + d.factor.field} style={{ paddingLeft: 8 }}>
+                    · <code style={{ fontSize: 11 }}>{d.factor.field}</code>
+                    <Tooltip title={`删除因子「${d.factor.field}」`}><a onClick={() => removeFactor(d.factor)}
+                      style={{ color: '#ff4d4f', fontWeight: 700, margin: '0 6px 0 4px' }}>✕</a></Tooltip>
+                    <span style={{ color: 'var(--text-muted)' }}>
+                      {(d.modalShare * 100).toFixed(1)}% 的样本命中度都是 {d.modalHit.toFixed(2)}
+                      {d.modalHit >= 1 ? '（人人满命中）' : d.modalHit <= 0 ? '（谁也没命中）' : ''}
+                      　权重 {Number(d.factor.weight).toFixed(1)}
+                      {d.degenerate ? '　—— 确定零贡献' : '　—— 只对不到一成样本说话'}
+                    </span>
+                  </div>
+                ))}
+                <div style={{ marginTop: 4 }}>
+                  它们不会让分数出错，只会<b>白占位置</b>：勇者常数因子进分母、贡献却恒定，直接稀释其它因子；
+                  邪恶常数因子不进分母，但把所有样本的分数整体下移。当前权重合计 {factors.reduce((a, f) => a + (Number(f.weight) || 0), 0).toFixed(1)}，
+                  其中 {degenerateFactors.reduce((a, d) => a + (Number(d.factor.weight) || 0), 0).toFixed(1)} 是没在干活的，
+                  等于把其它因子的有效权重按比例压低。删掉后重新点「推荐阈值」——
+                  分数尺度会变，旧 cutoff 不能直接沿用。
+                  （≥{(DEGENERATE_HIT_SHARE * 100).toFixed(0)}% 同分的因子，新建时已经被自动拦下，不会再进池。）
+                </div>
+              </div>} />
+          )}
           {/* 上线尺度检查：池里有映射不回 ctx 的因子时，线上分数跟这里的回测分数不是一个尺度
               （线上取不到值 → 记 0 分，权重却还在分母里），照搬 cutoff 必然偏紧。常驻提醒，
               不能只在点「发送到策略」那一下才说——阈值是在这张卡片上定的。 */}
@@ -1205,7 +1392,8 @@ export default function FactorLab({ rows, fields, light, archiveAllRows, archive
           exportFullReport={exportFullReport} exportRawDataJson={exportRawDataJson} hasEvil={hasEvil}
           base={base} sweepFigure={sweepFigure} scoreScatterFigure={scoreScatterFigure} threshold={threshold}
           oosBusy={oosBusy} runOOS={runOOS} oosProgress={oosProgress} oos={oos} oosFoldRows={oosFoldRows}
-          oosFoldIdx={oosFoldIdx} setOosFoldIdx={setOosFoldIdx} oosFoldSweepFigure={oosFoldSweepFigure} />
+          oosFoldIdx={oosFoldIdx} setOosFoldIdx={setOosFoldIdx} oosFoldSweepFigure={oosFoldSweepFigure}
+          oosKeepWeights={oosKeepWeights} setOosKeepWeights={setOosKeepWeights} />
       )}
 
       {/* 4.4 基线库 vs 训练集(按天) 对比：监控现成策略在不同数据来源/时间上是否漂移，

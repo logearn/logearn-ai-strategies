@@ -37,6 +37,7 @@ import { run as runFactorLab } from './factorlab.test.js';
 import { run as runStrategyVersions } from './strategy-versions.test.js';
 import { run as runDailyBacktest } from './daily-backtest.test.js';
 import { run as runFactorExclusions } from './factor-exclusions.test.js';
+import { run as runFactorBlacklist } from './factor-blacklist.test.js';
 import { run as runExcludedTokens } from './excluded-tokens.test.js';
 import { run as runStrategyReplayLogic } from './strategy-replay-logic.test.js';
 import { run as runCampLibrary } from './camp-library.test.js';
@@ -56,6 +57,9 @@ import { run as runFactorScanExport } from './factor-scan-export.test.js';
 import { run as runRhoOptimize } from './rho-optimize.test.js';
 import { run as runBacktestReport } from './backtest-report-export.test.js';
 import { run as runFactorRecommend } from './factor-recommend.test.js';
+import { run as runFullFieldRecommend } from './full-field-recommend.test.js';
+import { run as runFactorDegenerate } from './factor-degenerate.test.js';
+import { run as runScanOrder } from './scan-order-determinism.test.js';
 import { run as runFactorLabFixes } from './factorlab-fixes.test.js';
 import { run as runFactorRecommendWorker } from './factor-recommend-worker.test.js';
 import { run as runWorkerPool } from './worker-pool.test.js';
@@ -1044,6 +1048,43 @@ await testAsync('buildRows: sell_tx_per_seller 应与 buy_tx_per_buyer 对称', 
   assert.ok(Math.abs(f.sell_tx_per_seller - 173 / 98) < 1e-9);
   assert.ok(Math.abs(f.buy_tx_per_buyer - 263 / 176) < 1e-9);
 });
+// ---------- 内盘毕业哨兵拆解 ----------
+// 平台用 0 表示「未毕业」而不是"测量到 0"。留在数值轴上的后果在真实数据上兑现过：区间挖掘在
+// 四个字段上各自独立把边界切在同一批 219 个样本上（挖到的是"毕业/未毕业"二分类，不是数值规律），
+// 而勇者侧核心区 [-∞, 45.5] 把 70% 的哨兵 0 和"45秒闪电毕业"混在一起给满分，权重 37.2。
+await testAsync('buildRows: 未毕业时四个哨兵字段应记缺失，而不是留着 0', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.launch_time = 0;              // 平台口径：没毕业则为空/0
+  snapshot.signal.launch_time_duration = 0;
+  snapshot.ctx.chip_analysis = { inner_sell_ratio: 0, inner_address_holding: 0, inner_holding_address_count: 0 };
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.strictEqual(f.is_graduated, 0);
+  for (const k of ['launch_time_duration', 'chip_analysis.inner_sell_ratio',
+    'chip_analysis.inner_address_holding', 'chip_analysis.inner_holding_address_count']) {
+    assert.strictEqual(f[k], undefined, k + ' 未毕业时应缺失');
+  }
+});
+await testAsync('buildRows: 已毕业时四个字段原样保留，包括真实的 0', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  snapshot.signal.launch_time = 1500;
+  snapshot.signal.launch_time_duration = 500;
+  snapshot.ctx.chip_analysis = { inner_sell_ratio: 0, inner_address_holding: 12.5, inner_holding_address_count: 8 };
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.strictEqual(f.is_graduated, 1);
+  assert.strictEqual(f.launch_time_duration, 500);
+  assert.strictEqual(f['chip_analysis.inner_sell_ratio'], 0, '毕业盘上的 0 是真实测量值，不能删');
+  assert.strictEqual(f['chip_analysis.inner_address_holding'], 12.5);
+  assert.strictEqual(f['chip_analysis.inner_holding_address_count'], 8);
+});
+await testAsync('buildRows: launch_time 缺失但 duration>0 的脏数据仍按已毕业处理', async () => {
+  const { call, snapshot } = await makeMinimalCallSnapshot();
+  delete snapshot.signal.launch_time;
+  snapshot.signal.launch_time_duration = 300;
+  const f = (await sandbox.buildRows([call], [snapshot]))[0].features;
+  assert.strictEqual(f.is_graduated, 1, 'duration>0 是毕业的旁证，不能误删成缺失');
+  assert.strictEqual(f.launch_time_duration, 300);
+});
+
 await testAsync('buildRows: post_buy_max_drawdown_pct 应按 (initial_mcap - min_mcap) / initial_mcap 计算（min_mcap_time 早于 max_mcap_time）', async () => {
   const { call, snapshot } = await makeMinimalCallSnapshot();
   call.min_mcap = 60; // initial_mcap = 100 → 跌到60，回撤40%
@@ -1640,6 +1681,7 @@ runFieldHealth(test);
 runStrategyVersions(test);
 runDailyBacktest(test);
 runFactorExclusions(test);
+runFactorBlacklist(test);
 runExcludedTokens(test);
 runStrategyReplayLogic(test);
 runCampLibrary(test);
@@ -1659,6 +1701,9 @@ runFactorScanExport(test);
 runRhoOptimize(test);
 runBacktestReport(test);
 runFactorRecommend(test);
+runFullFieldRecommend(test);
+runFactorDegenerate(test);
+runScanOrder(test);
 runFactorLabFixes(test);
 runStripComments(test);
 // 2026-07-28 修复：这里必须 await + 用 testAsync（跟上面几百个 buildRows 测试同一个模式）——

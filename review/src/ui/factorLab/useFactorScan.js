@@ -6,6 +6,8 @@ import { permutationNullMarginalRho } from '../../lib/factorLab.js';
 import { scanCandidatesWithWorkers, evaluateCandidatesWithWorkers, runPermutationNullWithWorkers } from './workerPool.js';
 import { loadFactorExclusions, saveFactorExclusions, excludeFactor,
          unexcludeFactor, filterExcluded, restoreAllExcluded, sortExclusionsByRecency } from '../../lib/factorExclusions.js';
+import { loadFactorBlacklist, saveFactorBlacklist, blacklistFactor, unblacklistFactor,
+         clearFactorBlacklist, isFactorBlacklisted, sortBlacklistByRecency } from '../../lib/factorBlacklist.js';
 
 // 因子发现（扫描/候选/勾选/边际ρ贡献/持久化排除）这一大块状态与逻辑从 FactorLab 组件里搬出来，
 // 单独收进一个 hook——这部分内部耦合很深（扫描结果、已选字段、排除清单、边际ρ互相牵动），
@@ -48,6 +50,9 @@ export function useFactorScan({ rows, scopedFields, fieldScope, threshold, score
   // 已经扫出来的候选表也立刻过滤掉不再展示。camp+field 两边各自独立。
   const [exclusions, setExclusions] = useState(loadFactorExclusions);
   const [showExcluded, setShowExcluded] = useState({ hero: false, evil: false });
+  // 因子推荐黑名单：字段照常扫描、照常在候选表里显示全部指标、照常能手动勾选，只是不许贪心
+  // 推荐算法选它。跟上面的"移除"是两个不同环节的开关，别混（见 lib/factorBlacklist.js 顶部）。
+  const [blacklist, setBlacklist] = useState(loadFactorBlacklist);
   // 打分形状/缺失口径：见 FactorLab 里对应字段的注释，这里只是持有 state，UI 在外层。
   // 候选字段的边际 ρ 贡献（held-out：computeHeldOutDeltaRho 的返回值，主看 deltaTest）：
   // 按需算，key = camp+':'+field；poolKey 记录算这份结果时的因子池签名，池子变了就判过期。
@@ -205,6 +210,29 @@ export function useFactorScan({ rows, scopedFields, fieldScope, threshold, score
     saveFactorExclusions(next);
   }
 
+  // 因子推荐黑名单：拉黑 / 解除 / 一键清空。跟"移除"刻意不同的两点：
+  //   ① 不取消勾选、不动因子池——拉黑只是不让【算法】选它，用户自己想用随时能手动勾；
+  //   ② 不影响扫描——字段照常算 AUC/区间/边际ρ，候选表里照常显示（拉黑的原因往往就是
+  //      "我要继续盯着它的指标，但不许它霸占贪心第一步"）。
+  function handleBlacklistCandidate(camp, field) {
+    const next = blacklistFactor(blacklist, { camp, field });
+    setBlacklist(next);
+    saveFactorBlacklist(next);
+    message.success(`已拉黑「${field}」（${camp === 'evil' ? '邪恶' : '勇者'}阵营）——因子推荐不会再选它，指标照常显示、仍可手动勾选`);
+  }
+
+  function handleUnblacklistCandidate(camp, field) {
+    const next = unblacklistFactor(blacklist, { camp, field });
+    setBlacklist(next);
+    saveFactorBlacklist(next);
+  }
+
+  function handleClearBlacklist() {
+    const next = clearFactorBlacklist();
+    setBlacklist(next);
+    saveFactorBlacklist(next);
+  }
+
   // 一键恢复：清空某个阵营的全部排除记录（不影响另一阵营）——排除多了之后逐个点×太慢，
   // 一次性恢复完再挑几个手动重排更快。跟单条 handleUnexcludeCandidate 同一套持久化写法。
   function handleRestoreAllExcluded(camp) {
@@ -334,6 +362,9 @@ export function useFactorScan({ rows, scopedFields, fieldScope, threshold, score
     scanHero, scanEvil, scanBusy, scanProgress, scanThreshold, scanScope, scanRowsUsed,
     selectedHero, setSelectedHero, selectedEvil, setSelectedEvil,
     exclusions, showExcluded, setShowExcluded,
+    blacklist, blacklistSorted: sortBlacklistByRecency(blacklist),
+    isBlacklisted: (camp, field) => isFactorBlacklisted(blacklist, camp, field),
+    handleBlacklistCandidate, handleUnblacklistCandidate, handleClearBlacklist,
     marginalRho, marginalBusy,
     permNull: permNull?.dist || null, permNullBusy, permNullProgress, permNullStale, runPermNull,
     runScan, rebuildFactors, handleExcludeCandidate, handleUnexcludeCandidate, handleRestoreAllExcluded, runMarginalRho, resetScan,

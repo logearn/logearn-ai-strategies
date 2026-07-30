@@ -8,7 +8,8 @@ import {
   trapScore, findHotInterval, findColdInterval, deriveTrapezoid, deriveColdTrapezoid,
   splitRowsByTime, autoWeights,
   scoreRow, scoreRows, buildScoreDeciles, sweepScoreCutoffs, backtestFactors,
-  runOOSBacktest, runWalkForwardBacktest, assessSplitDecay, compareGroupsAgainstBaseline, compareWithHardGate, resolveCtxAccessor,
+  runOOSBacktest, runWalkForwardBacktest, assessSplitDecay, assessCutoffInert,
+  compareGroupsAgainstBaseline, compareWithHardGate, resolveCtxAccessor,
   buildFactors, scanFactorCandidates, missingRate, classifyFieldOrigin, factorCorrelations,
   computeHeldOutDeltaRho, recommendCutoff, recommendFactorPath,
   computeFieldRaw, assembleCampScan,
@@ -278,7 +279,66 @@ export async function run(test, testAsync) {
         assert.ok(wfMany.folds.every(f => f.testSize >= 15), '每段验证窗口应≥15条');
       });
     }
+
+    // 2026-07-29：每段自己在训练段上定 cutoff。以前这里不返回 cutoff，调用方拿页面上那个全样本
+    // cutoff 去 sweepAt，而各段是重新配权的、分数分布对不上——阈值整体失效（触发≈全量、lift≡1.00）。
+    test('runWalkForwardBacktest: 每段应带自己训出来的 cutoff，且落在该段训练分数区间内', () => {
+      for (const f of wf3.folds) {
+        assert.ok(Number.isFinite(f.cutoff), `第${f.splitIndex}段应给出 cutoff`);
+        assert.strictEqual(f.cutoffSource, 'train', '样本充足时应是训练段定出来的，不是兜底');
+        const cuts = f.train.sweep.points.map(p => p.cut);
+        assert.ok(f.cutoff >= Math.min(...cuts) && f.cutoff <= Math.max(...cuts),
+          `cutoff=${f.cutoff} 应落在该段训练扫描网格内`);
+      }
+    });
+    test('runWalkForwardBacktest: 该段 cutoff 在训练段上应真的筛掉东西（不是放行全部）', () => {
+      const sweepAt = (bt, cut) => bt.sweep.points.reduce((b, p) => (p.cut <= cut ? p : b), bt.sweep.points[0]);
+      for (const f of wf3.folds) {
+        const tr = sweepAt(f.train, f.cutoff);
+        assert.ok(tr.triggered < f.trainSize,
+          `第${f.splitIndex}段训练触发 ${tr.triggered}/${f.trainSize}，阈值等于没筛`);
+        assert.ok(tr.lift > 1, `第${f.splitIndex}段训练 lift=${tr.lift}，训出来的阈值至少要跑赢基准`);
+      }
+    });
+
+    // cutoffMode='fixed'：显式要求沿用外部传进来的 cutoff（保留旧行为的逃生口）
+    const wfFixed = await runWalkForwardBacktest(rows, ['x'], T,
+      { bootstrapB: 60, splits: 3, cutoffMode: 'fixed', cutoff: -12 });
+    test('runWalkForwardBacktest: cutoffMode=fixed 时各段沿用外部 cutoff 并标明来源', () => {
+      assert.ok(wfFixed.folds.every(f => f.cutoff === -12), '应原样沿用 -12');
+      assert.ok(wfFixed.folds.every(f => f.cutoffSource === 'fixed'), '来源要标 fixed，报告才能提示不可比');
+    });
+
+    // keepWeights：只重挖区间、权重沿用因子池那一套（把"配权变了"这个变量摘掉）
+    const specsW = [{ field: 'x', camp: 'hero', weight: 42 }];
+    const wfKeep = await runWalkForwardBacktest(rows, specsW, T, { bootstrapB: 60, splits: 1, keepWeights: true });
+    const wfAuto = await runWalkForwardBacktest(rows, specsW, T, { bootstrapB: 60, splits: 1 });
+    test('runWalkForwardBacktest: keepWeights 打开时沿用因子池权重，关闭时走 autoWeights', () => {
+      assert.strictEqual(wfKeep.folds[0].weightSource, 'pool');
+      assert.strictEqual(wfKeep.folds[0].trainFactors[0].weight, 42, '应贴回池子里的权重');
+      assert.strictEqual(wfAuto.folds[0].weightSource, 'auto');
+      assert.strictEqual(wfAuto.folds[0].trainFactors[0].weight, 100, 'autoWeights 单因子归一到 100');
+    });
+    // specs 是字符串数组（没有 weight）却打开了 keepWeights：只能整体退回自动配权，
+    // 绝不能只贴回一部分——那会造出一套既不是池子也不是自动的混合尺度，比两者都难解释。
+    const wfNoWeight = await runWalkForwardBacktest(rows, ['x'], T, { bootstrapB: 60, splits: 1, keepWeights: true });
+    test('runWalkForwardBacktest: keepWeights 打开但 specs 没带权重时应退回自动配权，不造混合尺度', () => {
+      assert.strictEqual(wfNoWeight.folds[0].weightSource, 'auto-fallback');
+      assert.strictEqual(wfNoWeight.folds[0].trainFactors[0].weight, 100, '退回后就是纯 autoWeights 的结果');
+    });
   }
+
+  // ---------- assessCutoffInert：阈值是否形同虚设 ----------
+  test('assessCutoffInert: 训练段触发率≥95% 判定阈值失效', () => {
+    assert.strictEqual(assessCutoffInert({ triggered: 96 }, 100).inert, true);
+    assert.strictEqual(assessCutoffInert({ triggered: 95 }, 100).inert, true, '正好 95% 也算失效');
+    assert.strictEqual(assessCutoffInert({ triggered: 94 }, 100).inert, false);
+    assert.ok(Math.abs(assessCutoffInert({ triggered: 40 }, 100).frac - 0.4) < 1e-9);
+  });
+  test('assessCutoffInert: 缺样本量/缺 point 时不谎报失效', () => {
+    assert.strictEqual(assessCutoffInert(null, 100).inert, false);
+    assert.strictEqual(assessCutoffInert({ triggered: 10 }, 0).inert, false);
+  });
 
   // ---------- assessSplitDecay：用两比例检验判断验证段是否显著衰减，替代固定阈值 ----------
   test('assessSplitDecay: 大样本下命中率明显更低应判显著衰减', () => {
@@ -614,11 +674,37 @@ export async function run(test, testAsync) {
     assert.strictEqual(classifyFieldOrigin('frequent_volume').original, true);
     assert.strictEqual(classifyFieldOrigin('mcap').original, true);
   });
-  test('classifyFieldOrigin: 派生/K线量能/holder聚合/筹码字段都是组装字段，且带原因', () => {
-    for (const f of ['buy_sell_amount_ratio', 'kline_volume_cv', 'holder_pnl_median', 'chip_analysis.above_percent']) {
+  test('classifyFieldOrigin: 派生/K线量能/holder聚合 是组装字段，且带原因', () => {
+    for (const f of ['buy_sell_amount_ratio', 'kline_volume_cv', 'holder_pnl_median']) {
       const c = classifyFieldOrigin(f);
       assert.strictEqual(c.original, false, f);
       assert.ok(c.reason, f + ' 应带原因');
+    }
+  });
+  // ctx 里 chip_analysis 本身就是平台给的一个块，标量字段是原样存在的（buildRows 只是展开了一层）。
+  // 曾经按前缀一刀切拦掉，害得上线告警对 chip_analysis.current_mcap 恒误报——它就是 ctx.logearn.mcap
+  // 的副本，实盘取值毫无问题，用户却被建议"删掉因子或自己复刻计算逻辑"。
+  test('classifyFieldOrigin: chip_analysis 的直传标量是原字段，不能按前缀一刀切', () => {
+    for (const f of ['chip_analysis.current_mcap', 'chip_analysis.above_percent',
+      'chip_analysis.below_percent', 'chip_analysis.total_holding_percent']) {
+      assert.strictEqual(classifyFieldOrigin(f).original, true, f);
+    }
+  });
+  test('classifyFieldOrigin: chip_analysis 里从数组算出来的那几个仍是组装字段', () => {
+    for (const f of ['chip_analysis.above_below_ratio', 'chip_analysis.price_to_peak_ratio',
+      'chip_analysis.price_concentration_hhi', 'chip_analysis.top5_hold_percent',
+      'chip_analysis.top5_transfer_in_ratio']) {
+      const c = classifyFieldOrigin(f);
+      assert.strictEqual(c.original, false, f);
+      assert.ok(c.reason, f + ' 应带原因');
+    }
+  });
+  // 这四个虽然是 ctx 原生字段，但 review 侧做了「未毕业→缺失」的变换，跟 ctx 里的 0 已经不同口径，
+  // 必须判成组装字段——否则 onlineExport 会内联 ctx 路径，线上未毕业的盘拿 0 而 review 是缺失。
+  test('classifyFieldOrigin: 毕业哨兵拆解过的字段判成组装字段（口径已跟 ctx 不同）', () => {
+    for (const f of ['is_graduated', 'launch_time_duration', 'chip_analysis.inner_sell_ratio',
+      'chip_analysis.inner_address_holding', 'chip_analysis.inner_holding_address_count']) {
+      assert.strictEqual(classifyFieldOrigin(f).original, false, f);
     }
   });
   test('classifyFieldOrigin: 与 resolveCtxAccessor 的拒绝口径一致', () => {
@@ -669,6 +755,30 @@ export async function run(test, testAsync) {
     assert.ok(r.ok, r.reason);
     assert.strictEqual(r.path, '__effMcap__');
   });
+  // 上线告警误报的回归：探测必须真的跑起来，而不是被前缀规则短路掉。
+  test('resolveCtxAccessor: chip_analysis 标量应解析到 ctx.chip_analysis 下的同名路径', () => {
+    const rows = [1, 2, 3].map(i => ({
+      id: i, returnMax: 2,
+      features: { 'chip_analysis.current_mcap': 10000 * i, 'chip_analysis.above_percent': 40 + i },
+      rawCtx: { chip_analysis: { current_mcap: 10000 * i, above_percent: 40 + i } },
+    }));
+    const r = resolveCtxAccessor(rows, 'chip_analysis.current_mcap');
+    assert.ok(r.ok, r.reason);
+    assert.strictEqual(r.path, 'chip_analysis.current_mcap');
+    const r2 = resolveCtxAccessor(rows, 'chip_analysis.above_percent');
+    assert.ok(r2.ok, r2.reason);
+  });
+  test('resolveCtxAccessor: chip_analysis 字段对不上 ctx 时，理由是"核对过对不上"而不是"前缀不许"', () => {
+    const rows = [1, 2, 3].map(i => ({
+      id: i, returnMax: 2,
+      features: { 'chip_analysis.current_mcap': 10000 * i },
+      rawCtx: { chip_analysis: { current_mcap: 777 } },   // 数值对不上
+    }));
+    const r = resolveCtxAccessor(rows, 'chip_analysis.current_mcap');
+    assert.ok(!r.ok);
+    assert.ok(r.reason.includes('数值一致'), r.reason);
+  });
+
   test('resolveCtxAccessor: 样本缺 rawCtx 时给出明确原因', () => {
     const r = resolveCtxAccessor([{ id: 1, returnMax: 2, features: { foo: 1 }, rawCtx: null }], 'foo');
     assert.ok(!r.ok && r.reason.includes('ctx'), r.reason);

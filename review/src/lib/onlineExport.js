@@ -91,6 +91,31 @@ const BLOCKS = [
   }`,
   },
   {
+    // 内盘毕业哨兵拆解，必须跟 data.js 的 applyGraduationFeatures 完全同口径。
+    // 平台在这四个字段上用 0 表示「未毕业」而不是"测量到 0"，直接内联 ctx 路径会让线上未毕业的
+    // 盘拿到 0（落进核心区算满分），而 review 侧是缺失——所以它们【不能】走 direct 路径，
+    // 在 data.js 的 DERIVED_KEYS 里登记过，classifyFields 会把它们导到这个块。
+    id: 'graduation',
+    produces: [
+      'is_graduated', 'launch_time_duration', 'chip_analysis.inner_sell_ratio',
+      'chip_analysis.inner_address_holding', 'chip_analysis.inner_holding_address_count',
+    ],
+    code: `  // ---- 内盘毕业哨兵拆解（data.js applyGraduationFeatures）----
+  var gradLaunchTime = Number(L.launch_time), gradDuration = Number(L.launch_time_duration);
+  var graduated = (fin(gradLaunchTime) && gradLaunchTime > 0) || (fin(gradDuration) && gradDuration > 0);
+  F['is_graduated'] = graduated ? 1 : 0;
+  if (graduated) {
+    // 只有毕业的盘才写这四个；未毕业时【不写】= 取值为 null = 记缺失，跟 review 一致
+    if (fin(gradDuration)) F['launch_time_duration'] = gradDuration;
+    var gradInnerSell = Number(chip.inner_sell_ratio);
+    var gradInnerHold = Number(chip.inner_address_holding);
+    var gradInnerCnt = Number(chip.inner_holding_address_count);
+    if (fin(gradInnerSell)) F['chip_analysis.inner_sell_ratio'] = gradInnerSell;
+    if (fin(gradInnerHold)) F['chip_analysis.inner_address_holding'] = gradInnerHold;
+    if (fin(gradInnerCnt)) F['chip_analysis.inner_holding_address_count'] = gradInnerCnt;
+  }`,
+  },
+  {
     id: 'top5',
     produces: ['chip_analysis.top5_hold_percent', 'chip_analysis.top5_transfer_in_ratio'],
     code: `  // ---- top5 头部持仓（data.js 479~492）----

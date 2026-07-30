@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Card, Button, Segmented, Tag, Typography, Space, Tooltip, Alert, Checkbox } from 'antd';
+import { Card, Button, Segmented, Tag, Typography, Space, Tooltip, Alert, Checkbox, Popconfirm } from 'antd';
 import { recommendFactorPool } from '../../lib/factorLab.js';
 import { runRecommendInWorker } from './workerPool.js';
 
@@ -25,8 +25,13 @@ import { runRecommendInWorker } from './workerPool.js';
 // 因子池的轻量签名（字段+阵营+权重），只用来判断"结果算完之后池子是不是又变了"，不用做深比较。
 const poolSignature = factors => factors.map(f => `${f.camp}:${f.field}:${f.weight}`).join('|');
 
+// blacklist / onBlacklist / onUnblacklist / onClearBlacklist：黑名单（[{camp,field,blacklistedAt}]，
+// 已按时间新→旧排好）——里面的字段不参与下面这条贪心搜索，但照常扫描、照常在候选表里显示指标、
+// 照常可以手动勾选进池（见 lib/factorBlacklist.js 顶部"跟 exclusions 的区别"）。状态与持久化都在
+// useFactorScan 里，跟候选表的「拉黑」按钮共用同一份，两个入口改的是同一个清单。
 export default function FactorRecommendCard({ rows, factors, candidates, threshold, missingPolicy,
-  scoreShape, onAdopt, onAdoptFactors, onResultChange }) {
+  scoreShape, onAdopt, onAdoptFactors, onResultChange,
+  blacklist = [], onBlacklist, onUnblacklist, onClearBlacklist }) {
   const [mode, setMode] = useState('combo');
   // 只看勇者阵营：邪恶阵营候选量通常远大于勇者（"高倍盘"永远是少数类，反过来"输家/红旗"样本
   // 天然多得多），贪心搜索天然会一边倒选邪恶——不是算法偏心，是数据本身的类别不平衡（详见项目
@@ -40,7 +45,12 @@ export default function FactorRecommendCard({ rows, factors, candidates, thresho
 
   const canRun = Array.isArray(candidates) && candidates.length > 0 && rows.length > 0;
 
-  const run = async (m = mode) => {
+  // blOverride：拉黑之后要立刻重算，但 onBlacklist 走的是父组件 setState，本次渲染闭包里的
+  // blacklist prop 还是旧的——直接把新清单传进来，不然重算出的路径里那个字段还在。
+  // heroOverride：跟 blOverride 同理——勾选"只看勇者阵营"要立刻重算，但 setHeroOnly 是异步的，
+  // 本次渲染闭包里的 heroOnly 还是旧值，不显式传进来就会用勾选【前】的候选范围重算一遍（表现
+  // 就是"点了没效果"）。传 null 表示沿用 state。
+  const run = async (m = mode, blOverride = null, heroOverride = null) => {
     if (!canRun) return;
     if (runCtrl.current) try { runCtrl.current.abort(); } catch (e) {}
     const ac = new AbortController(); runCtrl.current = ac;
@@ -48,8 +58,11 @@ export default function FactorRecommendCard({ rows, factors, candidates, thresho
     await new Promise(r => setTimeout(r, 0)); // 让 loading 画出来
     try {
       const start = m === 'combo' ? factors : [];
-      const scopedCandidates = heroOnly ? candidates.filter(c => c.camp !== 'evil') : candidates;
-      const opts = { threshold, missingPolicy, shape: scoreShape, startFactors: start };
+      const hero = heroOverride == null ? heroOnly : heroOverride;
+      const scopedCandidates = hero ? candidates.filter(c => c.camp !== 'evil') : candidates;
+      // 黑名单只传 camp+field：blacklistedAt 对算法没用，少一个字段少一次 structuredClone 的负担。
+      const bl = (blOverride || blacklist).map(b => ({ camp: b.camp, field: b.field }));
+      const opts = { threshold, missingPolicy, shape: scoreShape, startFactors: start, blacklist: bl };
       // 整条推荐（选字段贪心 + 精配权 + K折曲线）搬进 worker；无 Worker/失败兜底回主线程直算。
       let res;
       try {
@@ -94,7 +107,8 @@ export default function FactorRecommendCard({ rows, factors, candidates, thresho
           onChange={v => { setMode(v); if (result) run(v); }}
           options={[{ label: '组合路径(基于当前池)', value: 'combo' }, { label: '探索全路径(从零)', value: 'explore' }]} />
         <Tooltip title='邪恶阵营候选量通常远大于勇者（"高倍盘"永远是少数类，"输家/红旗"样本天然多得多），贪心搜索一边倒选邪恶不是算法偏心，是数据类别不平衡（详见项目记忆）。勾选后把邪恶候选彻底排除在搜索范围外，逼着看勇者阵营单独能不能挖出真实、经得住held-out检验的正向信号。'>
-          <Checkbox checked={heroOnly} onChange={e => { setHeroOnly(e.target.checked); if (result) run(); }}
+          <Checkbox checked={heroOnly}
+            onChange={e => { setHeroOnly(e.target.checked); if (result) run(mode, null, e.target.checked); }}
             style={{ fontSize: 12 }}>只看勇者阵营</Checkbox>
         </Tooltip>
         <Button size="small" type="primary" loading={busy} disabled={!canRun} onClick={() => run()}>算推荐</Button>
@@ -133,6 +147,16 @@ export default function FactorRecommendCard({ rows, factors, candidates, thresho
                         <span style={{ marginLeft: 4, color: p.deltaTest > 0 ? 'var(--ok,#30d158)' : 'var(--text-muted)' }}>{fmt(p.deltaTest)}</span>
                         {p.overfit && ' ⚠️'}
                         {p.testZigzag?.inversionCount > 0 && <span style={{ marginLeft: 4 }}>🌀{p.testZigzag.inversionCount}</span>}
+                        {onBlacklist && (
+                          <Tooltip title={`拉黑「${p.field}」——把它踢出候选、立刻重算这条路径。字段本身照常扫描、候选表里指标照常看，只是算法不许再选它。`}>
+                            <span style={{ marginLeft: 6, opacity: .5, fontSize: 10 }}
+                              onClick={e => {
+                                e.stopPropagation();   // 别触发 Tag 自己的"只采用到这一步"
+                                onBlacklist(p.camp, p.field);
+                                run(mode, [...blacklist, { camp: p.camp, field: p.field }]);
+                              }}>🚫</span>
+                          </Tooltip>
+                        )}
                       </Tag>
                     </Tooltip>
                   </React.Fragment>
@@ -146,7 +170,32 @@ export default function FactorRecommendCard({ rows, factors, candidates, thresho
                 {result.zeroedFields?.length > 0 && <>　被压到 0（建议删）：{result.zeroedFields.map(f => <code key={f} style={{ fontSize: 11, marginLeft: 4 }}>{f}</code>)}</>}
               </div>
 
-              <Alert style={{ marginTop: 8 }} type={result.overfit ? 'warning' : 'success'} showIcon
+              {/* 同字段跨阵营闸门：拦下来这件事必须说出来。静默拦跟原来的静默放行是同一类毛病
+                  （readme 39.5 那族"看起来正常"），只是方向反了——用户会以为这个字段压根没被评估过。 */}
+              {result.crossCampBlocked?.length > 0 && (
+                <Alert style={{ marginTop: 8 }} type="info" showIcon
+                  message={<span style={{ fontSize: 12 }}>
+                    有 {result.crossCampBlocked.length} 个候选因为<b>同字段的另一个阵营已在路径里</b>被拦下
+                  </span>}
+                  description={<span style={{ fontSize: 12 }}>
+                    {result.crossCampBlocked.map(b => (
+                      <span key={b.camp + ':' + b.field} style={{ marginRight: 10 }}>
+                        {b.camp === 'evil' ? '☠' : '🛡'}<code style={{ fontSize: 11 }}>{b.field}</code>
+                        （held-out Δρ {fmt(b.deltaTest)}，已被 {b.blockedBy === 'evil' ? '☠邪恶' : '🛡勇者'} 版占位）
+                      </span>
+                    ))}
+                    <Typography.Text type="secondary"><br />
+                      同一个字段的勇者版和邪恶版同时进池 = "值高加分"和"值低扣分"同时成立，语义上没法向实盘复刻，
+                      而且勇者版会计入 Σ勇者（满分分母）、邪恶版不计入。真要这种跨零的双向形状，请手工在因子池里配。
+                    </Typography.Text>
+                  </span>} />
+              )}
+
+              {/* 三态而不是两态：原来只判 `test < train*0.4`（塌陷），于是 test 反常地【高于】train
+                  时会输出"没有明显塌陷，站得住脚"——readme 26.2.1 那次真实泄漏正是这个形态。
+                  第三态刻意不做显著性门槛也不下定论，只提示去查（理由见 lib 里 testAboveTrain 的注释）。 */}
+              <Alert style={{ marginTop: 8 }} showIcon
+                type={result.overfit ? 'warning' : result.testAboveTrain ? 'info' : 'success'}
                 message={<span style={{ fontSize: 12 }}>
                   过拟合校验（影子权重：只用 train 拟合、对 test 完全盲）：
                   <b> train</b> ρ={fmt(result.rhoTrain)}　<b>held-out test</b> ρ={fmt(result.rhoTest)}
@@ -155,12 +204,27 @@ export default function FactorRecommendCard({ rows, factors, candidates, thresho
                 description={<span style={{ fontSize: 12 }}>
                   {result.overfit
                     ? '⚠️ test 明显低于 train（<40%）——这份因子池的【权重】贴着训练区间的噪声/漂移，采用前先减因子再试一次。'
-                    : 'test 没有明显塌陷，这份权重站得住脚，可以采用。'}
+                    : result.testAboveTrain
+                      ? <>🔍 <b>test 反而比 train 高</b>（高 {((result.rhoTest / result.rhoTrain - 1) * 100).toFixed(0)}%）。
+                        held-out 高过自己拟合的那一段是反直觉的，值得回头查一眼——
+                        <b>有没有事后字段进池</b>（含买入之后信息的，比如 post_buy_* / max_up_* / *_to_max_up_*），
+                        或者<b>缺失率很高的字段</b>（大部分样本恒 0 分，落在哪半边全看切分）。
+                        鼠标悬停上面路径上的标签，找 held-out Δρ 明显大于样本内 Δρ 的那一步。
+                        <Typography.Text type="secondary"><br />
+                          注意：<b>这不构成证据</b>。两段 ρ 之差的抽样噪声约 ±{fmt(result.rhoGapSe)}，
+                          光靠这个差距分不出泄漏和运气——readme 26.2.1 那次确认过的真泄漏也没到统计显著。它只是个该看一眼的信号。
+                        </Typography.Text></>
+                      : 'test 没有明显塌陷，这份权重站得住脚，可以采用。'}
                 </span>} />
 
               {result.heldoutCurve && (() => {
                 const hc = result.heldoutCurve;
                 const rec = result.recommendedCount, kMax = hc.kMax, tail = rec < kMax;
+                // 峰值落在 k* 之后 = 1-SE 判定"多出来那截增益在一个标准误之内"，而不是"后面没增益"。
+                // 原文案一律说成"不再有增益（过拟合尾巴）"，真实数据上出过反例：
+                // k7=0.169 而 k11=0.184 / k12=0.199，曲线明明还在涨。两种情况的处理方式不同，分开说。
+                const peakAfter = Number.isFinite(hc.kBest) && hc.kBest > rec;
+                const recRho = hc.curve?.[rec - 1]?.testRho;
                 return (
                   <Alert style={{ marginTop: 8 }} type={tail ? 'warning' : 'success'} showIcon
                     message={<span style={{ fontSize: 12 }}>
@@ -168,7 +232,12 @@ export default function FactorRecommendCard({ rows, factors, candidates, thresho
                     </span>}
                     description={<span style={{ fontSize: 12 }}>
                       {tail
-                        ? <>{result.mode === 'combo' ? '这次新增' : '选出来'} {kMax} 个，但第 <b>{rec + 1}~{kMax}</b> 个在 K 折 held-out 上不再有增益（<b>过拟合尾巴</b>）——建议只留<b>前 {rec} 个</b>。{result.mode === 'combo' && '（起点池不参与这个计数，视为已采信）'}</>
+                        ? (peakAfter
+                          ? <>{result.mode === 'combo' ? '这次新增' : '选出来'} {kMax} 个。曲线的<b>峰值其实在 k={hc.kBest}</b>（ρ={fmt(hc.bestTestRho)}），
+                            但 k*={rec} 处的 ρ={fmt(recRho)} 已经落在峰值的 <b>1 个标准误之内</b>——
+                            多出来那 {kMax - rec} 个带来的增益<b>在噪声范围里</b>，1-SE 规则按奥卡姆取更省的。
+                            <b>这不等于"后面没增益"</b>，只是那点增益分不出真假；想要就留整条，求稳就取前 {rec} 个。{result.mode === 'combo' && '（起点池不参与这个计数，视为已采信）'}</>
+                          : <>{result.mode === 'combo' ? '这次新增' : '选出来'} {kMax} 个，但第 <b>{rec + 1}~{kMax}</b> 个在 K 折 held-out 上不再有增益（<b>过拟合尾巴</b>）——建议只留<b>前 {rec} 个</b>。{result.mode === 'combo' && '（起点池不参与这个计数，视为已采信）'}</>)
                         : <>{result.mode === 'combo' ? '这次新增的' : ''} {kMax} 个因子在 K 折 held-out 上都还在涨（k*={rec}），没有明显过拟合尾巴。</>}
                       <div style={{ marginTop: 4, fontFamily: 'monospace', fontSize: 11, lineHeight: 1.9 }}>
                         {hc.curve.map(c => (
@@ -207,6 +276,37 @@ export default function FactorRecommendCard({ rows, factors, candidates, thresho
               </Space>
             </>
           ))}
+
+      {/* 黑名单：常驻显示（不藏在结果里）——没算推荐时也要能看到"我到底拉黑了哪些字段"，
+          否则一个上周拉黑的字段会在这周静默地不出现在推荐里，人还以为是数据变了。
+          解除【不】自动重算：一次解除好几个的情况下每次都重跑贪心太贵，跟卡片"手动触发"的
+          总基调一致（点🚫拉黑倒是会自动重算——那是单次动作，用户就是想立刻看到新路径）。 */}
+      {blacklist.length > 0 && (
+        <div style={{ marginTop: 10, paddingTop: 8, borderTop: '1px solid var(--border-weak, rgba(255,255,255,.12))' }}>
+          <Space wrap size={4} align="start">
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              🚫 黑名单 {blacklist.length} 个（不参与上面的贪心搜索，指标照常算、仍可手动勾选）：
+            </Typography.Text>
+            {blacklist.map(b => (
+              <Tag key={b.camp + ':' + b.field} closable style={{ margin: 0 }}
+                color={b.camp === 'evil' ? 'red' : 'green'}
+                onClose={() => onUnblacklist?.(b.camp, b.field)}>
+                {b.camp === 'evil' ? '☠' : '🛡'} <code style={{ fontSize: 11 }}>{b.field}</code>
+              </Tag>
+            ))}
+            {onClearBlacklist && (
+              <Popconfirm title={`清空全部 ${blacklist.length} 个黑名单字段？`} okText="清空" cancelText="取消"
+                onConfirm={() => onClearBlacklist()}>
+                <Button size="small" type="link" style={{ fontSize: 12, padding: '0 4px' }}>一键清空</Button>
+              </Popconfirm>
+            )}
+          </Space>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+            解除后要重新点「算推荐」才会重新参与挑选。黑名单不影响已经在因子池里的同名因子——
+            那是你采信过的，要去掉请直接在因子池里删。
+          </div>
+        </div>
+      )}
     </Card>
   );
 }

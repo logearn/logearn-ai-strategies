@@ -1,5 +1,6 @@
 import { computeHeldOutDeltaRho,
          recommendFactorPool, permutationNullMarginalRho } from '../../lib/factorLab.js';
+import { recommendFromAllFields, compareRecommendPlans } from '../../lib/fullFieldRecommend.js';
 
 // 因子推荐/边际评估的计算 worker——把主线程会冻住页面的三类重活都搬到这里：
 //   1. 逐候选并行评估（per-candidate，主线程用 workerPool 切批派发）
@@ -46,6 +47,51 @@ self.addEventListener('message', (ev) => {
         ? permutationNullMarginalRho(rows, msg.currentFactors || [], msg.candidates,
             (msg.opts && msg.opts.winThreshold), msg.opts || {})
         : recommendFactorPool(rows, msg.candidates, msg.opts || {});
+      self.postMessage({ type: 'result', taskId: msg.taskId, whole: res });
+    } catch (err) {
+      self.postMessage({ type: 'error', taskId: msg.taskId, error: String(err && err.stack || err) });
+    }
+    return;
+  }
+
+  // ---- 全字段推荐（方案A）：字段名列表进来，worker 里现挖区间再跑贪心 ----
+  // 跟 'recommend' 分开而不是复用：它收的是 fields（字符串数组，几 KB），不是已经扫好的
+  // candidates；扫描那一步（几百个字段 × 两阵营挖区间）本身就是主线程扛不住的重活，
+  // 必须在 worker 内做完再一起返回，不能让主线程先扫好再发进来。
+  // 进度按字段回报（progress 消息），主线程只用来画进度条，不影响结果。
+  if (msg.type === 'recommendAll') {
+    try {
+      const rows = msg.rows || cachedRows;
+      let last = -1;
+      const res = recommendFromAllFields(rows, msg.fields || [], {
+        ...(msg.opts || {}),
+        onProgress: (done, total) => {
+          // 节流到整百分比：几百个字段逐个 postMessage 会把主线程的消息队列淹掉
+          const pct = Math.floor(done / Math.max(total, 1) * 100);
+          if (pct !== last) { last = pct; self.postMessage({ type: 'progress', taskId: msg.taskId, pct }); }
+        },
+      });
+      self.postMessage({ type: 'result', taskId: msg.taskId, whole: res });
+    } catch (err) {
+      self.postMessage({ type: 'error', taskId: msg.taskId, error: String(err && err.stack || err) });
+    }
+    return;
+  }
+
+  // ---- 方案擂台：几种"候选池 × 搜索策略"各跑一遍，一次返回一张可排序的对比表 ----
+  // 进度按【方案】回报（不是按字段）：这里最贵的全字段扫描在 compareRecommendPlans 内部只做一次，
+  // 之后每个方案就是一次贪心，粒度到方案刚好——再细就要把回调塞进贪心内层，不值当。
+  if (msg.type === 'comparePlans') {
+    try {
+      const rows = msg.rows || cachedRows;
+      const res = compareRecommendPlans(rows, {
+        ...(msg.opts || {}), fields: msg.fields || [], candidates: msg.candidates || [],
+        plans: msg.plans,
+        onPlanDone: (row, done, total) => self.postMessage({
+          type: 'progress', taskId: msg.taskId, pct: Math.floor(done / Math.max(total, 1) * 100),
+          note: row.name,
+        }),
+      });
       self.postMessage({ type: 'result', taskId: msg.taskId, whole: res });
     } catch (err) {
       self.postMessage({ type: 'error', taskId: msg.taskId, error: String(err && err.stack || err) });

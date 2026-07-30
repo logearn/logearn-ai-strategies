@@ -1,3 +1,5 @@
+import { heroWeightSum, fieldScopeLabel } from './factorLab.js';
+
 // 回测报告导出：把因子池 + 回测 + OOS + 北极星（默认ρ，筛垃圾类策略例外走分层增益）+ 漏网之鱼等，
 // 拼成一份【喂给 AI 调试】的 markdown。
 // 纯函数、只做格式化；数据由 FactorLab 侧抽好传进来（它才拿得到全部 state）。
@@ -20,6 +22,10 @@ function mdTable(headers, rows) {
 //   base: { n, pos, baseRate, wilson:{lo,hi} },
 //   factors: [{ field, camp, weight, lo0, lo1, hi1, hi0, auc, missRate }],
 //   corr: [{ a, b, rho, n }],           // 两两相关（按 |ρ| 降序，全部或前若干）
+//   northStar: { rho, n, tieScore, tieN, tieRatio, distinct } | null,
+//     —— 当前因子池【原样】打分的北极星 ρ + 同分饱和度。不依赖任何按钮，只要有因子池就该有值。
+//     跟下面三个 *Opt 的区别：那三个是"优化之后能到多少"，这个是"现在是多少"。
+//     tieN/tieRatio = 最大同分块的样本数/占比，distinct = 不同分值个数。
 //   bucketRhoOpt: { rhoTrainBefore, rhoTrainAfter, rhoTestBefore, rhoTestAfter, nTrain, nTest, zeroedFields } | null,
 //     —— 分层秩相关（唯一的配权口径，不吃 cutoff，见 lib/factorLab.js 的 optimizeWeightsForBucketRho）。
 //     2026-07-28：rhoOpt/tierGainOpt 两个字段已废弃（UI 不再产出，函数里仍保留 if(rhoOpt)/if(tierGainOpt)
@@ -27,11 +33,15 @@ function mdTable(headers, rows) {
 //   current: { triggered, hitRate, capture, lift },   // 当前 cutoff 的回测
 //   sweep: [{ cut, triggered, hitRate, capture, lift }],
 //   deciles: [{ bin, scoreLo, scoreHi, n, pos, hiRate, wilson:{lo,hi}, avgRet, medRet }],
-//   oos: { trainSize, testSize, train:{triggered,hitRate,capture,lift}, test:{...}, skipped:[{field,reason}] } | null,
+//   oos: { trainSize, testSize, train:{triggered,hitRate,capture,lift}, test:{...}, skipped:[{field,reason}],
+//          cutoff, cutoffSource:'train'|'fallback'|'fixed', weightSource:'auto'|'pool'|'auto-fallback',
+//          inert:{frac,inert} } | null,
+//     —— cutoff 是【该段训练集上重新定】的，跟 config.cutoff（全样本）不同源、数值不可比；
+//        inert.inert=true 表示阈值放行了≥95%训练样本、这一节的结论不成立（见下面 assessCutoffInert）。
 //   missed: [{ ca, symbol, score, ret }],   // 漏网之鱼（score<cutoff 但 >阈值）
 // }
 export function buildBacktestReport(input) {
-  const { config: c = {}, base = {}, factors = [], corr = [], rhoOpt, tierGainOpt, bucketRhoOpt, current = {}, sweep = [], deciles = [], oos, missed = [] } = input || {};
+  const { config: c = {}, base = {}, factors = [], corr = [], northStar, rhoOpt, tierGainOpt, bucketRhoOpt, current = {}, sweep = [], deciles = [], oos, missed = [] } = input || {};
   const L = [];
 
   L.push(`# 打分策略回测报告`);
@@ -42,7 +52,7 @@ export function buildBacktestReport(input) {
   L.push(`- 样本数：**${c.sampleN ?? base.n ?? '-'}**`);
   L.push(`- 高倍阈值：**>${c.threshold}x**（高倍盘 ${base.pos ?? '-'} 个，基准高倍率 **${pct(base.baseRate)}**，Wilson区间 ${pct(base.wilson?.lo)}~${pct(base.wilson?.hi)}）`);
   L.push(`- 触发阈值 cutoff：**${c.cutoff}**`);
-  L.push(`- 缺失口径：${c.missingPolicy === 'renorm' ? '缺失重归一' : '缺失记0分'} · 打分形状：${c.scoreShape === 'interval' ? '区间命中' : '梯形'} · 字段范围：${c.fieldScope === 'assembled' ? '组装字段' : '原字段'}`);
+  L.push(`- 缺失口径：${c.missingPolicy === 'renorm' ? '缺失重归一' : '缺失记0分'} · 打分形状：${c.scoreShape === 'interval' ? '区间命中' : '梯形'} · 字段范围：${fieldScopeLabel(c.fieldScope)}`);
   L.push('');
 
   L.push(`## 2. 因子池（${factors.length} 个）`);
@@ -54,7 +64,24 @@ export function buildBacktestReport(input) {
       Number.isFinite(f.auc) ? f.auc.toFixed(3) : '-', pct(f.missRate),
     ])));
   L.push('');
-  L.push(`> 打分：勇者命中核心区[lo1,hi1] = +权重×命中度；邪恶 = −权重×命中度。总分 = Σ(±权重×命中度)/Σ正权重 ×100。`);
+  // 分母写清楚是「Σ勇者权重」，并说明它就是满分上限：2026-07-29 起 review 的 scoreRow 跟策略
+  // 模板逐位对齐（都是 `wsum += Math.max(0, weight)` 的语义），cutoff 两边通用，不再需要换算。
+  // 原文案写的是含糊的「Σ正权重」，而当时 review 实际除的是【全部权重】——两边差一个正的常数倍，
+  // 排序一致但 cutoff 绝对值不通用，是个真分叉，不是笔误。详见 readme 第 32/33 节。
+  const wHero = heroWeightSum(factors);
+  const wEvil = factors.reduce((a, f) => a + (f.camp === 'evil' ? (Number(f.weight) || 0) : 0), 0);
+  L.push(`> 打分：勇者命中核心区[lo1,hi1] = +权重×命中度；邪恶 = −权重×命中度。`
+    + `总分 = Σ(±权重×命中度)/**Σ勇者权重（=满分上限 ${num(wHero, 1)}）** ×100，跟实盘策略同一尺度，cutoff 可直接搬。`);
+  if (wHero > 0 && wEvil > 0) {
+    L.push(`>`);
+    L.push(`> 分数范围：勇者全中、邪恶一个不踩 = +100；邪恶权重合计 ${num(wEvil, 1)}，`
+      + `全踩中时最低可到 **${num(-wEvil / wHero * 100, 1)}** —— 邪恶占比越高分数越负，**下界不是 −100**。`);
+  }
+  if (wHero <= 0 && factors.length) {
+    L.push(`>`);
+    L.push(`> ⚠️ **这个池子没有勇者因子**（Σ勇者权重=0）：满分上限为 0、归一无定义，`
+      + `review 和实盘策略都会让**所有样本的分数恒为 0**，下面所有分数相关的数字都不成立。至少要加一个勇者因子。`);
+  }
   L.push('');
 
   L.push(`## 3. 去冗余（两两 Spearman ρ，按 |ρ| 降序）`);
@@ -63,6 +90,38 @@ export function buildBacktestReport(input) {
   L.push('');
 
   L.push(`## 4. 北极星（默认：score↔returnMax 的 Spearman ρ；筛垃圾例外：分层增益；推荐例外：分层秩相关）`);
+  // 这两行【无条件】出：下面三种配权都要用户点按钮才有数，都没点时整节曾经只剩三行"未跑"，
+  // 于是"当前这套权重此刻到底几分"从来没写进过报告，诊断只能靠 lift@cutoff 反推。
+  // 北极星本身不依赖任何按钮——它就是 rows+factors 的函数。
+  if (northStar && Number.isFinite(northStar.rho)) {
+    L.push(`- **当前因子池原样打分（未做任何优化）：ρ(score, returnMax) = ${num(northStar.rho, 3)}**（n=${northStar.n}）——这是这套权重此刻的北极星，下面三种配权都是在它基础上找改进。`);
+  } else if (northStar) {
+    L.push(`- 当前因子池原样打分：ρ 算不出（有效样本 <8 或因子池为空）。`);
+  }
+  // 同分饱和：分段表里"连着几段分数区间一模一样"就是它，但那要人肉数。真实数据上出现过
+  // 344/688（50%）和 145/728（20%）两次，两次都恰好是命中率塌陷的那几段。
+  if (northStar && Number.isFinite(northStar.tieRatio)) {
+    L.push(`- 同分饱和：最大同分块 **${northStar.tieN} 个样本（${pct(northStar.tieRatio)}）** 都是 ${num(northStar.tieScore, 1)} 分；全样本共 ${northStar.distinct} 个不同分值。`);
+    // 三条后果各自有条件，分开写。原来是一句笼统的"⚠️ 同分块内部无法排序，直接压住 ρ 的上限，
+    // 也让第 7 节对应分段的高倍率失去意义"，触发线 10%。问题出在【第一句】：同分块对 ρ 的代价
+    // 是 f(块大小, 信号强度)，弱信号下小得多——实测 ρ≈0.19 时 36% 的块只值 +0.005，
+    // 而 10%（那条触发线本身）的代价是 0.000。见 readme 第 35 节。
+    // 后两条（分段表可读性、cutoff 没有中间档位）在 10% 就已经成立，照常报。
+    const hr = northStar.tieRhoCost;
+    if (Number.isFinite(hr)) {
+      // 0.02 这条线是"够不够得上一次有意义的改进"：低于它，拉宽梯形/换更连续的因子最多赚这么多。
+      // 注意措辞必须写明是【估计】——真实代价取决于被打平抹掉的那部分信息，测不出来。
+      L.push(hr >= 0.02
+        ? `  - **对 ρ 的代价估计 +${num(hr, 3)}**（拆干净并列后 ρ 约 ${num(northStar.rhoUntiedEst, 3)}）——值得去拉宽梯形过渡带或换更连续的因子。`
+        : `  - **对 ρ 的代价估计只有 +${num(hr, 3)}**（拆干净了 ρ 也只到约 ${num(northStar.rhoUntiedEst, 3)}）——ρ 的瓶颈**不在分数粒度上**，拉宽梯形过渡带／换更连续的因子赚不到东西，别在这上面花时间。要抬 ρ 只能加信息量（更多样本／更强的因子）。`);
+      L.push(`    （代价 = f(同分块占比, 信号强度)，两个方向都单调；ρ 越弱、块内排序本来携带的信息就越少，打平它损失越小。这是模型估计不是测量值，只看量级。）`);
+    }
+    if (northStar.tieRatio >= 0.1) {
+      const spanDeciles = Math.max(1, Math.round(northStar.tieRatio * 10));
+      L.push(`  - ⚠️ **第 7 节有约 ${spanDeciles} 个十分位落在这同一个分数上**，那几档之间的高倍率差异是随机切分的产物，不是信号，别据此判断单调性。`);
+      L.push(`  - ⚠️ **cutoff 在这里没有中间档位**：阈值跨过 ${num(northStar.tieScore, 1)} 分时触发数会一步跳掉约 ${northStar.tieN} 个样本（见第 6 节扫描表的断崖），${pct(northStar.tieRatio)} 那一档区间内你无法再细调。`);
+    }
+  }
   if (rhoOpt) {
     L.push(`- ρ最优配权（默认口径）：train ${num(rhoOpt.rhoTrainBefore, 3)} → **${num(rhoOpt.rhoTrainAfter, 3)}**，held-out test ${num(rhoOpt.rhoTestBefore, 3)} → **${num(rhoOpt.rhoTestAfter, 3)}**（train ${rhoOpt.nTrain} / test ${rhoOpt.nTest}）`);
     if (rhoOpt.zeroedFields?.length) L.push(`- ρ最优把这些因子权重压到 0（对 ρ 无贡献/有害）：${rhoOpt.zeroedFields.join('、')}`);
@@ -102,18 +161,41 @@ export function buildBacktestReport(input) {
 
   L.push(`## 8. 时间外推验证（前70%推导→后30%检验）`);
   if (oos && !oos.error) {
+    // cutoff 是该段【在训练段上重新定】的，不是第 1/5/6 节那个全样本 cutoff——区间/权重都重训过，
+    // 分数分布跟全样本对不上，套同一个数值阈值会整体失效（曾经导致本节恒定输出"泛化较好"）。
+    // oos.cutoff 缺失 = 旧版调用方没传，退回全样本 cutoff 并且不打这段说明（免得凭空报警）。
+    const oosCut = Number.isFinite(oos.cutoff) ? oos.cutoff : c.cutoff;
+    if (Number.isFinite(oos.cutoff)) {
+      L.push(`- 本节 cutoff = **${oosCut}**（${oos.cutoffSource === 'train' ? '该段训练集上重新定的，净超额命中数最大' : `⚠️ 该段训练集太薄、定不出阈值，退回全样本 cutoff=${c.cutoff}，本节结论请打折扣看`}）· 权重口径：${oos.weightSource === 'pool' ? '沿用因子池现有权重（只重挖区间）' : '每段重新自动配权'}`);
+      L.push(`> 别拿这个 cutoff 跟第 5/6 节的 ${c.cutoff} 比大小——两套分数不同源，数值不可比。`);
+    }
     L.push(mdTable(
       ['指标', `训练段(n=${oos.trainSize})`, `验证段(n=${oos.testSize})`],
       [
-        [`触发数@${c.cutoff}`, oos.train?.triggered ?? '-', oos.test?.triggered ?? '-'],
+        [`触发数@${oosCut}`, oos.train?.triggered ?? '-', oos.test?.triggered ?? '-'],
         ['高倍命中率', pct(oos.train?.hitRate), pct(oos.test?.hitRate)],
         ['高倍捕获率', pct(oos.train?.capture), pct(oos.test?.capture)],
         ['lift', num(oos.train?.lift), num(oos.test?.lift)],
       ]));
     const trL = oos.train?.lift, teL = oos.test?.lift;
-    if (Number.isFinite(trL) && Number.isFinite(teL)) {
+    if (oos.inert?.inert) {
+      // 阈值放行了几乎全部训练样本 → 命中率退化成基准高倍率、lift 恒 1.00。这时"落差 0.00 =
+      // 泛化较好"是彻头彻尾的假结论，必须换成警告，不能照常输出那句让人放心的话。
+      L.push(`> ⚠️ **本节无效**：训练段触发率 ${pct(oos.inert.frac)} ≥95%，阈值形同虚设——两侧"高倍命中率"实际就是各自的基准高倍率，lift 必然≈1.00，"落差小"不代表泛化好，而是**根本没测到**。请改看下一份 walk-forward 报告里 cutoff 正常的那几段。`);
+    } else if (Number.isFinite(trL) && Number.isFinite(teL)) {
       const gap = trL - teL;
-      L.push(`> train→val lift 落差 = ${num(gap)}${teL < trL * 0.6 ? '（验证段不到训练段 60%，疑似过拟合）' : gap > 0.3 ? '（落差偏大，注意过拟合）' : '（落差小，泛化较好）'}`);
+      // 判定必须【先看绝对水平、再看相对落差】。原来只比 trL/teL 的差值，于是
+      // train 1.13 → val 0.96（落差 0.17）会输出"落差小，泛化较好"——可 lift<1 的意思是
+      // **这个筛子比不筛还差**（触发的那批里高倍率低于基准），落差再小也不是"泛化好"。
+      // 真实数据上撞到过：用户 4 因子那轮第 8 节 val lift=0.96，报告照样说泛化较好。
+      // lift≈1（0.95~1.05）同样不算好，只是"没筛出东西"，跟"筛出来且守住了"是两回事。
+      const verdict = teL < 0.95
+        ? `（⚠️ **验证段 lift<1，比不筛还差**——落差小只说明训练段也没多好，不是泛化好）`
+        : teL < 1.05
+          ? `（⚠️ 验证段 lift≈1，**阈值在验证段没筛出超额**，落差小不代表有效）`
+          : teL < trL * 0.6 ? '（验证段不到训练段 60%，疑似过拟合）'
+            : gap > 0.3 ? '（落差偏大，注意过拟合）' : '（落差小且验证段 lift>1，泛化较好）';
+      L.push(`> train→val lift 落差 = ${num(gap)}${verdict}`);
     }
     if (oos.skipped?.length) L.push(`> 训练段推导时跳过：${oos.skipped.map(s => `${s.field}(${s.reason})`).join('；')}`);
   } else L.push(oos?.error ? `（${oos.error}）` : `（未跑时间外推验证）`);
@@ -129,9 +211,9 @@ export function buildBacktestReport(input) {
 
   L.push(`## 10. 给 AI 的诊断清单`);
   L.push([
-    `1. **过拟合**：看第 8 节 train→val lift 落差；落差大(>0.3)或验证段<训练段60% = 过拟合，配权或因子在贴训练期噪声。`,
+    `1. **过拟合**：看第 8 节 train→val lift。**先看绝对值再看落差**——验证段 lift<1 = 比不筛还差，lift≈1 = 没筛出超额，这两种情况下"落差小"毫无意义；确认验证段 lift>1 之后，再看落差大(>0.3)或验证段<训练段60% = 过拟合。`,
     `2. **弱因子权重过高**：看第 2 节，AUC 低(接近0.5)的因子却拿高权重 = 风险；对照第 4 节 ρ最优是否把权重堆到弱因子上。`,
-    `3. **分数饱和**：看第 7 节分数区间，若顶部多段都是同一分数(如 100~100) = 顶部区分不了、压住 ρ；建议加邪恶因子把满分盘拉开。`,
+    `3. **分数饱和**：直接看第 4 节「同分饱和」那一行——最大同分块占比 ≥10% 就该处理（它同时压 ρ 和第 7 节对应分段的可读性）。饱和在顶部(如 100~100)=顶部区分不了，加邪恶因子拉开；饱和在中部=那批样本在所有因子上都落同一档，得换维度不同的因子，不是调权重能解决的。`,
     `4. **单调性**：第 7 节高倍率/倍数中位是否随分段上升；顶段反而低多半是饱和噪声，不是信号。`,
     `5. **ρ vs lift@cutoff 打架**：第 4 节 ρ 涨但第 8 节 val lift 跌 = ρ(全体单调)好但顶部薄片(实盘买的)没守住；实盘看 lift@cutoff。`,
     `6. **样本量**：验证段触发数小(<60)时所有 OOS 数字噪声大，别据此反复手调权重。`,
@@ -154,6 +236,30 @@ export function buildRecommendPathReport(path, meta = {}) {
   L.push(`> 每一步选中因子后，held-out(test)/样本内(全量) 各自的分档命中率剖面；"打架"=某档命中率比前一档还低（曲线倒挂/锯齿），`);
   L.push(`> 分层秩相关只看整体排序、对这种中段反复无感——数值上 rho 不低不代表曲线真的单调爬升，得看这份剖面。`);
   if (meta.threshold != null) L.push(`> 高倍阈值：>${meta.threshold}x`);
+  // 黑名单必须写进报告：这份路径是"在排除了这些字段的前提下"选出来的，不写清楚，读报告的人
+  // （或者拿去问 AI 的时候）会把"某个明显该上的字段没出现"当成算法有问题去查。
+  if (meta.blacklist?.length) {
+    L.push(`> 🚫 本次推荐排除了 ${meta.blacklist.length} 个黑名单字段（人工判定不许算法选，指标仍照常统计）：`
+      + meta.blacklist.map(b => `\`${b.camp === 'evil' ? '☠' : '🛡'}${b.field}\``).join('、'));
+  }
+  // 同字段跨阵营闸门拦下的候选。写进报告的理由跟黑名单一样：不写，读报告的人会以为
+  // 这个字段没被评估过。反过来，闸门生效【之前】的报告里同字段两阵营会隔着好几步各出现一次
+  // （真实案例：holder_gini 第 3 步 ☠、第 10 步 🛡），谁都看不出是同一个字段——所以下面
+  // 还额外做一次自检，万一将来有人开了 allowCrossCamp，报告要自己把它顶到最前面说清楚。
+  if (meta.crossCampBlocked?.length) {
+    L.push(`> 🔁 有 ${meta.crossCampBlocked.length} 个候选被「同字段跨阵营」闸门拦下（同一字段的勇者版和邪恶版不许同时进池）：`
+      + meta.crossCampBlocked.map(b => `\`${b.camp === 'evil' ? '☠' : '🛡'}${b.field}\`（held-out Δρ ${num(b.deltaTest, 3)}，`
+        + `已被 ${b.blockedBy === 'evil' ? '☠' : '🛡'} 版占位）`).join('、'));
+  }
+  const dupFields = (() => {
+    const byField = new Map();
+    for (const p of path || []) byField.set(p.field, (byField.get(p.field) || 0) + 1);
+    return [...byField.entries()].filter(([, c]) => c > 1).map(([f]) => f);
+  })();
+  if (dupFields.length) {
+    L.push(`> ⚠️ **同一字段在本路径里出现了多次**：${dupFields.map(f => `\`${f}\``).join('、')}`
+      + ` —— 勇者版与邪恶版同时进池，"值高加分"和"值低扣分"同时成立，无法向实盘复刻，且勇者版计入 Σ勇者 分母、邪恶版不计入。`);
+  }
   L.push('');
   if (!path?.length) { L.push(`（路径为空，无步骤可诊断）`); return L.join('\n'); }
 
@@ -185,8 +291,9 @@ export function buildRecommendPathReport(path, meta = {}) {
 //   train:{sweep,base,...}, test:{...}, factorDecay:[{field,camp,trainAuc,testAuc,testN,testPos,aucDrop}],
 //   skipped, error? }], splits, trainRatio, burnIn } | { error }。
 // foldRows: 调用方（FactorLab.jsx）已经算好、跟页面总览表用的是同一份——[{ idx, error?, trainSize,
-//   testSize, tr, te, decay }]，tr/te 是 sweepScoreCutoffs 的 point，decay 是 factorLab.js
-//   assessSplitDecay 的返回值。本模块保持"纯格式化、不重新计算业务逻辑"的既有约定（这个文件
+//   testSize, tr, te, decay, cutoff, cutoffSource, inert }]，tr/te 是 sweepScoreCutoffs 的 point
+//   （在【该段自己的 cutoff】上取的，不是全样本 cutoff），decay 是 factorLab.js assessSplitDecay
+//   的返回值，inert 是 assessCutoffInert 的返回值。本模块保持"纯格式化、不重新计算业务逻辑"的既有约定（这个文件
 //   本来就没有任何 import），不重新实现一遍两比例检验——避免页面显示"显著衰减"但导出报告
 //   算出"未衰减"这种两处判定不一致的风险，两边永远读同一份计算结果。
 // opts: { cutoff, threshold }。
@@ -194,7 +301,9 @@ export function buildWalkForwardReport(oos, foldRows, opts = {}) {
   const { cutoff, threshold } = opts;
   const L = [];
   L.push(`# 时间外推验证（walk-forward 多段滚动）诊断报告`);
-  L.push(`> 供 AI 判断这套因子/权重是不是真的稳，不是只切一刀看运气。高倍阈值 >${threshold}x，当前 cutoff=${cutoff}。`);
+  L.push(`> 供 AI 判断这套因子/权重是不是真的稳，不是只切一刀看运气。高倍阈值 >${threshold}x。`);
+  L.push(`> ⚠️ **每段的 cutoff 是各自在该段训练集上重新定的（见「该段cutoff」列），不是页面上那个全样本 cutoff=${cutoff}。**`);
+  L.push(`> 各段的区间/权重都是独立重训的，分数分布跟全样本不同源，所以段间 cutoff 数值、以及它们跟 ${cutoff} 之间，都不可直接比大小。`);
   L.push('');
   if (!oos || oos.error) { L.push(`（${oos?.error || '未跑时间外推验证'}）`); return L.join('\n'); }
 
@@ -204,23 +313,36 @@ export function buildWalkForwardReport(oos, foldRows, opts = {}) {
   L.push(`- 训练起步比例：**${num(oos.trainRatio, 2)}**（第 0 段跟单次70/30切分等价） · 共切 **${oos.splits}** 段（扩张窗口：每段训练集=从最早到该段验证窗口开始为止的全部历史）`);
   L.push('');
 
-  const nSig = foldRows.filter(r => r.decay?.significant).length;
-  L.push(`## 2. 各段总览（共 ${oos.folds.length} 段，其中 **${nSig}** 段判定「验证段命中率显著低于训练段」——两比例检验 p<0.05，不是固定比例阈值）`);
+  const usable = foldRows.filter(r => !r.error && !r.inert?.inert);
+  const nSig = usable.filter(r => r.decay?.significant).length;
+  const nInert = foldRows.filter(r => !r.error && r.inert?.inert).length;
+  L.push(`## 2. 各段总览（共 ${oos.folds.length} 段，其中 ${nInert} 段阈值失效不计入；余下 ${usable.length} 段里 **${nSig}** 段判定「验证段命中率显著低于训练段」——两比例检验 p<0.05，不是固定比例阈值）`);
   L.push(mdTable(
-    ['段', '验证窗口时间', 'train n', 'test n', '验证段高倍盘数(基准率)', `触发数@${cutoff}(train/test)`, '命中率(train/test)', 'lift(train/test)', 'p值', '判定'],
+    ['段', '验证窗口时间', 'train n', 'test n', '验证段高倍盘数(基准率)', '该段cutoff', '触发数(train/test)', '命中率(train/test)', 'lift(train/test)', 'p值', '判定'],
     foldRows.map(r => {
-      if (r.error) return [`#${r.idx + 1}`, '-', r.trainSize, r.testSize, '-', '-', '-', '-', '-', `训练段推导失败：${r.error}`];
+      if (r.error) return [`#${r.idx + 1}`, '-', r.trainSize, r.testSize, '-', '-', '-', '-', '-', '-', `训练段推导失败：${r.error}`];
       const testBase = oos.folds[r.idx].test.base;
+      // 阈值失效（训练段触发率≥95%）的段：命中率退化成两段各自的基准高倍率，衰减检验比的是
+      // 行情本身的差异而不是因子池，必须把判定换成明确的"无意义"，不能输出"未衰减"。
+      const verdict = r.inert?.inert
+        ? `⚠️阈值失效(train触发率${pct(r.inert.frac)})，判定无意义`
+        : r.decay.insufficientN ? '样本不足，不下结论'
+        : r.decay.significant ? '⚠️显著衰减' : r.decay.decayed ? '略降未达显著' : '未衰减';
       return [
         `#${r.idx + 1}`, `${fmtT(r.testStart)}~${fmtT(r.testEnd)}`, r.trainSize, r.testSize,
         `${testBase.pos}（${pct(testBase.baseRate)}）`,
+        // cutoffSource 缺失 = 旧版调用方没传，只显示数值不凭空报警
+        `${Number.isFinite(r.cutoff) ? r.cutoff : cutoff}${r.cutoffSource && r.cutoffSource !== 'train' ? '⚠兜底' : ''}`,
         `${r.tr.triggered}/${r.te.triggered}`, `${pct(r.tr.hitRate)}/${pct(r.te.hitRate)}`,
         `${num(r.tr.lift)}/${num(r.te.lift)}`,
-        r.decay.insufficientN ? '样本不足' : num(r.decay.p, 3),
-        r.decay.insufficientN ? '样本不足，不下结论' : r.decay.significant ? '⚠️显著衰减' : r.decay.decayed ? '略降未达显著' : '未衰减',
+        r.inert?.inert || r.decay.insufficientN ? '-' : num(r.decay.p, 3),
+        verdict,
       ];
     })));
   L.push(`> "验证段高倍盘数(基准率)"很小（个位数）时，这一段的命中率/lift/AUC 都该打折扣看——样本太少，数字天然噪声大。`);
+  if (nInert) {
+    L.push(`> ⚠️ 标「阈值失效」的 ${nInert} 段：该段 cutoff 放行了 ≥95% 的训练样本，等于没筛——命中率就是基准高倍率、lift 必然≈1.00。**这不是"泛化好"，是这一段没测到东西**，下结论时请整段排除。多半是该段训练集正类太少，recommendCutoff 找不到净超额为正的档位。`);
+  }
   L.push('');
 
   L.push(`## 3. 逐段·逐因子归因（该字段独立算的 AUC 在训练段/验证段的差值，跌得最多的排最前；粗略诊断，不是严格检验）`);
@@ -244,6 +366,7 @@ export function buildWalkForwardReport(oos, foldRows, opts = {}) {
 
   L.push(`## 4. 给 AI 的诊断清单`);
   L.push([
+    `0. **先剔掉不可用的段**：第2节判定列里标「⚠️阈值失效」的段，命中率/lift/p值全部无意义（阈值没在筛东西，两侧命中率就是各自的基准高倍率），别拿它们的"未衰减/落差小"当泛化好的证据；标「⚠兜底」cutoff 的段也要打折扣（阈值不是训出来的）。剩下的段才进入下面的判断。`,
     `1. **是不是真的过拟合**：看第2节"判定"列，多段都判显著衰减 = 真的靠不住；只有个别段判显著、且那几段"验证段高倍盘数"本来就很小 = 更可能是那几段样本太少，不是参数坏了。`,
     `2. **别被单段的巨大AUC波动唬住**：第3节里 aucDrop 绝对值很大（比如±0.15以上）但对应的"test样本量(正类数)"很小（比如正类数<10）时，这个波动大概率是噪声，不代表这个字段真的变强/变弱了——AUC是排序统计量，正类数太少时方差极大。`,
     `3. **定位哪个字段该重新审视**：优先看在【多个段】里都稳定出现较大正向aucDrop（真衰减）、且对应段"test样本量"不算太小的字段——这才是真正值得怀疑的候选，不是随便挑单段里数字最大的那一个。`,

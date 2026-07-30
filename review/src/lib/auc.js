@@ -68,7 +68,13 @@ export function finalizeAucScan(results) {
   // 单字段 AUC 显著性的门槛随字段数抬升：批量扫 m 个字段时，
   // 光看"CI 不跨 0.5"会有大量假阳性，所以额外给出 BH 校正后的判定。
   usable.forEach(r => { r.significantAdj = r.significant && r.pAdj < 0.05; });
-  return { results, usable: usable.sort((a, b) => Math.abs(b.auc - 0.5) - Math.abs(a.auc - 0.5)) };
+  // 排序加【字段名】做最终 tie-breaker：|AUC−0.5| 精确打平在真实数据里很常见（同一个量的两个
+  // 路径别名，比如 chip_analysis.inner_sell_ratio / inner_address_holding，AUC 逐位相同）。
+  // 只按 |AUC−0.5| 排的话，Array#sort 稳定 → 打平时保留【输入顺序】，而输入顺序是 worker 完成
+  // 顺序（见 ui/factorLab/workerPool.js 的 slots 注释），每次刷新都不同，最终会传导到"推荐出来
+  // 的字段每次不一样"。加上字段名之后，结果只依赖候选【集合】，跟顺序无关。
+  return { results, usable: usable.sort((a, b) =>
+    (Math.abs(b.auc - 0.5) - Math.abs(a.auc - 0.5)) || String(a.field).localeCompare(String(b.field))) };
 }
 
 function normCdf(z) {

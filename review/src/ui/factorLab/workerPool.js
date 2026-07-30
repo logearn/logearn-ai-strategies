@@ -22,8 +22,23 @@ export async function scanCandidatesWithWorkers(rows, heroFields, evilFields, op
     for (let i = 0; i < fs.length; i += batchSize) batches.push({ camp, fields: fs.slice(i, i + batchSize) });
   }
   const total = heroScan.length + evilScan.length;
-  const heroRaw = [], evilRaw = [];
-  const assemble = () => ({ hero: assembleCampScan(heroRaw, 'hero'), evil: assembleCampScan(evilRaw, 'evil') });
+  // 按【批次下标】回填，不是按完成顺序 push —— 批次派进共享 worker 池，谁空谁取下一批，
+  // 完成顺序取决于各批耗时和 OS 调度，每次刷新都不同。而 rawList 的顺序是会传导到最终推荐结果的：
+  //   rawList 顺序 → finalizeAucScan 的稳定排序（|AUC−0.5| 打平时保留输入顺序）→ candidates 顺序
+  //   → 贪心 pool.sort（interval.score 打平时保留 candidates 顺序）→ cands.sort（testRho 打平时
+  //   保留 pool 顺序）→ 选中哪个候选。
+  // 真实数据里精确打平很常见（同一个量的两个路径别名，如 chip_analysis.inner_sell_ratio /
+  // inner_address_holding，AUC 和边际ρ 逐位相同），于是"每次刷新推荐出来的字段不一样"。
+  // 既有的并行等价性测试喂的是按字段顺序的 rawList，从没测过乱序，所以一直没抓到。
+  const slots = new Array(batches.length);
+  const assemble = () => {
+    const heroRaw = [], evilRaw = [];
+    for (let i = 0; i < batches.length; i++) {
+      if (!slots[i]) continue;                     // 该批失败/被取消：当"没扫到"，跟原行为一致
+      (batches[i].camp === 'evil' ? evilRaw : heroRaw).push(...slots[i]);
+    }
+    return { hero: assembleCampScan(heroRaw, 'hero'), evil: assembleCampScan(evilRaw, 'evil') };
+  };
   if (!batches.length) return assemble();
 
   const workerUrl = new URL('./scanWorker.js', import.meta.url);
@@ -56,13 +71,15 @@ export async function scanCandidatesWithWorkers(rows, heroFields, evilFields, op
         if (--active <= 0) finish();
         return;
       }
-      const batch = batches[bi++];
+      const bIdx = bi++;
+      const batch = batches[bIdx];
       const id = taskId++;
       const onmsg = (ev) => {
         const msg = ev.data;
         if (!msg || msg.taskId !== id) return;
         if (msg.type === 'result') {
-          (batch.camp === 'evil' ? evilRaw : heroRaw).push(...(msg.raw || []));
+          slots[bIdx] = msg.raw || [];   // 回填到派发下标，见上方 slots 的注释
+
           completed += batch.fields.length;
           if (typeof onProgress === 'function') onProgress({ completed, total });
         } else if (msg.type === 'error') {
@@ -159,7 +176,8 @@ export async function evaluateCandidatesWithWorkers(rows, currentFactors, candid
         if (--active <= 0) finish();
         return;
       }
-      const batch = batches[bi++];
+      const bIdx = bi++;
+      const batch = batches[bIdx];
       const id = taskId++;
       const onmsg = (ev) => {
         const msg = ev.data;
@@ -260,7 +278,9 @@ export async function runPermutationNullWithWorkers(rows, currentFactors, candid
 // kind:'recommend'（两张推荐卡片合并后只剩这一种）。payload 带该函数的入参（rows/candidates/opts，
 // 起点池在 opts.startFactors 里）。
 export function runRecommendInWorker(kind, payload, opts = {}) {
-  const { signal } = opts;
+  // onProgress(pct)：只有 kind='recommendAll' 会回报（全字段扫描要跑几百个字段，没有进度条
+  // 用户不知道是卡死还是在算）。其它 kind 不发 progress 消息，这条分支对它们是死代码。
+  const { signal, onProgress } = opts;
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./recommendWorker.js', import.meta.url), { type: 'module' });
     const cleanup = () => { try { worker.terminate(); } catch (e) {} };
@@ -271,6 +291,9 @@ export function runRecommendInWorker(kind, payload, opts = {}) {
     worker.addEventListener('message', (ev) => {
       const msg = ev.data;
       if (!msg || msg.taskId !== 1) return;
+      // progress 必须在 cleanup 之前拦掉：不然它会掉进下面的 else 被当成 error 直接 reject，
+      // 顺手还把 worker terminate 了——整个任务在第一个进度回报时就死了。
+      if (msg.type === 'progress') { if (onProgress) onProgress(msg.pct, msg.note); return; }
       cleanup();
       if (msg.type === 'result') resolve(msg.whole);
       else reject(new Error(msg.error || 'worker error'));

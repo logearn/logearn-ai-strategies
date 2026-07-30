@@ -322,7 +322,13 @@ const FIELD_DESC = {
   'whale_recent_signal_to_buy_min': '共振信号新鲜度(分钟) = 买入时刻 − signalTime',
   'mcap_to_max_up_ratio': '当前市值 / 历史最高市值 = mcap / max_up_mcap；<1=已从高点回落，越小买在越深的回撤位',
   'max_up_speed_pct_per_min': '冲到历史高点的速度(%/分钟) = max_up_ratio / (max_up_duration/60)；快=急拉，慢=温和爬升',
-  'launch_time_duration': '开盘到内盘毕业经过的秒数；越短毕业越快（热度高），还没毕业则为 0',
+  'launch_time_duration': '开盘到内盘毕业经过的秒数；越短毕业越快（热度高）。⚠️ 平台原始口径是"未毕业则为 0"，那是哨兵值不是测量值——review 已把未毕业的盘改记【缺失】（见 data.js applyGraduationFeatures），所以这个字段只在毕业的盘上有定义，缺失率≈未毕业占比。想用"是否毕业"请用 is_graduated',
+  // 这三个跟 launch_time_duration 同批：平台口径都是"未毕业时固定为 0"，review 已改记缺失。
+  // 之前没有词条，字段浏览器只能靠名字自动拼出"筹码分析 / inner / 卖出 / 比例"这种读不出重点的描述。
+  'chip_analysis.inner_sell_ratio': '内盘卖出率(%)：内盘毕业时持有的筹码到现在为止卖出的比例。0=内盘几乎没卖，100=内盘全部离场。⚠️ 只在【已毕业】的盘上有定义（未毕业时平台给哨兵 0，review 已改记缺失）',
+  'chip_analysis.inner_address_holding': '内盘地址剩余持仓 / 全部持仓(%)：当前还在持仓的筹码里有多少是内盘地址（launch_time 之前买入的钱包）持有的。⚠️ 只在【已毕业】的盘上有定义',
+  'chip_analysis.inner_holding_address_count': '内盘地址里当前仍有持仓的去重地址数。⚠️ 只在【已毕业】的盘上有定义',
+  'is_graduated': '是否已内盘毕业(0/1)。从 launch_time>0（或 launch_time_duration>0 作旁证）判定。存在的理由：平台在 launch_time_duration / chip_analysis.inner_* 四个字段上都用 0 表示"未毕业"，把哨兵值留在数值轴上会让区间挖掘去拟合"毕业/未毕业"这个二分类却伪装成连续量——拆出来之后，"未毕业"这条信息由本字段单独承载，让它自己去因子池里竞争',
   'is_fake': '仿冒识别(0/1)：地址含 pump/four/bonk 关键词但实际平台不符时为 1，可疑仿盘',
   'is_new_m5_hot_ranking_token': '是否新进入5分钟热度榜单(0/1)',
   'is_new_h1_hot_ranking_token': '是否新进入1小时热度榜单(0/1)',

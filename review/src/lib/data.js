@@ -61,6 +61,16 @@ const DERIVED_KEYS = [
   'mcap_liquidity_ratio',
   'avg_buy_amount',
   'avg_sell_amount',
+  // 毕业哨兵拆解产物：is_graduated 是新造的哑变量；后面四个虽然是 ctx 原生字段，但 review 侧
+  // 对它们做了"未毕业→缺失"的变换，跟原始 ctx 里的 0 【已经不同口径】了。必须登记成组装字段，
+  // 否则 onlineExport 的 classifyFields 会把它们判成 direct、直接内联 ctx 路径，
+  // 线上未毕业的盘就会拿到 0（落进核心区算满分）而 review 侧是缺失——这是实打实的口径破裂。
+  // 登记之后它们走 BLOCKS 里的 'graduation' 块，两边同一套哨兵规则。
+  'is_graduated',
+  'launch_time_duration',
+  'chip_analysis.inner_sell_ratio',
+  'chip_analysis.inner_address_holding',
+  'chip_analysis.inner_holding_address_count',
   'chip_analysis.above_below_ratio',
   'chip_analysis.price_to_peak_ratio',
   'chip_analysis.price_concentration_hhi',
@@ -398,6 +408,43 @@ function applySimpleRatioFeatures(features, mcap) {
   // m 按参与检验的字段总数算，冗余字段越多，真信号的校正后 p 越难通过。
   // 差值与比值二选一时保留比值：比值无量纲，不受总持仓规模影响
   //（above=40/below=20 与 above=4/below=2 的净压力差 10 倍，但压力比例相同）。
+}
+
+// ---------- 内盘毕业哨兵值拆解 ----------
+// 平台在这四个字段上用 0 表示「未毕业」，不是"测量到 0"：
+//   launch_time_duration（还没毕业则为 0）、chip_analysis.inner_sell_ratio /
+//   inner_address_holding / inner_holding_address_count（未毕业时固定为 0）。
+//
+// 留在数值轴上的代价在真实数据上已经兑现（728 个样本那轮）：
+//   · 区间挖掘在这【四个字段上各自独立】把邪恶边界切在了同一批 219~221 个样本上——它挖到的
+//     根本不是这些字段的数值规律，是「毕业/未毕业」这个二分类，被伪装成了四个连续量。
+//   · 勇者侧 launch_time_duration 的核心区推成 [-∞, 45.5]，把 509 个哨兵 0（70% 样本）
+//     和"45 秒内闪电毕业"混在一起给满分，权重 37.2 —— 也是 136 个样本卡同一分数的主因。
+//   · 缺失率显示 0%，是哨兵值伪装出来的；真实定义域只有 30% 的样本。
+//
+// 所以 0 必须从数值轴上拿走。两件事缺一不可：
+//   ① 未毕业时删掉这四个数值字段 → 缺失率如实反映真实定义域（会跳到 ~70%）；
+//   ② 加 is_graduated 哑变量 → 「未毕业」这个信息本身单独保留下来，让它自己去因子池里竞争，
+//      而不是搭 duration 的便车。只做①会把这条信息整个丢掉，只做②则哨兵 0 还在轴上照样被拟合。
+//
+// 【不要改梯形边界代替这一步】：区间挖掘是数据驱动的，把 lo0 抬到 0 以上只治标——下次重新
+// 推导时看到那堆 0 对应着不差的命中率，边界还会被拉回去。
+const GRADUATION_SENTINEL_FIELDS = [
+  'launch_time_duration',
+  'chip_analysis.inner_sell_ratio',
+  'chip_analysis.inner_address_holding',
+  'chip_analysis.inner_holding_address_count',
+];
+
+function applyGraduationFeatures(features) {
+  // 判定用 launch_time 优先（平台口径：内盘毕业时间，没毕业为空/0）；duration>0 作为旁证，
+  // 兜住"launch_time 缺失但确实有毕业耗时"的脏数据，避免把真毕业的盘误删成缺失。
+  const launchTime = Number(features['launch_time']);
+  const duration = Number(features['launch_time_duration']);
+  const graduated = (Number.isFinite(launchTime) && launchTime > 0)
+                 || (Number.isFinite(duration) && duration > 0);
+  features['is_graduated'] = graduated ? 1 : 0;
+  if (!graduated) for (const f of GRADUATION_SENTINEL_FIELDS) delete features[f];
 }
 
 // 筹码分布组装字段（从 chip_analysis 的数组算，标量字段由 flattenObject 自动展开，不用管）。
@@ -1275,6 +1322,9 @@ async function buildRows(calls, snapshots, onProgress) {
     const launchMs = toMilliseconds(features['launch_time']);
     if (Number.isFinite(buyMs) && Number.isFinite(swapBeginMs)) features['open_to_buy_duration'] = (buyMs - swapBeginMs) / 60000;
     if (Number.isFinite(buyMs) && Number.isFinite(launchMs)) features['launch_to_buy_duration'] = (buyMs - launchMs) / 60000;
+    // 内盘毕业哨兵值：必须在 flattenObject 之后（那四个字段要先存在才删得掉），
+    // 也必须在 launch_to_buy_duration 之后（那个读的是 launch_time，跟哨兵无关，先算完更清楚）。
+    applyGraduationFeatures(features);
 
     // buy 之前最大回撤：v_breakout_volume_list 里最大的 n_pattern_retracement，没有则为 0
     // 该数组实际挂在 ctx.logearn 下（logearn 与 signal 同源重复，flatten 时已跳过标量去重，但数组需要单独取）

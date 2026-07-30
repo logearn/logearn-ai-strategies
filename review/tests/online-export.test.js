@@ -70,6 +70,37 @@ export function run(test) {
     assert.ok(!/f\('buy_sell_count_ratio'\)/.test(g.code));
   });
 
+  // ---------- 内盘毕业哨兵：两边必须同口径 ----------
+  // 这四个字段是 ctx 原生的，但 review 侧做了「未毕业→缺失」的变换。如果上线代码把它们当
+  // direct 内联 ctx 路径，线上未毕业的盘会拿到 0（落进核心区算满分）而 review 是缺失——
+  // 静默的口径破裂，回测再准也没用。所以它们必须走 graduation 块。
+  function mkGradRows(n = 12) {
+    return Array.from({ length: n }, (_, i) => {
+      const graduated = i % 3 !== 0;          // 1/3 未毕业
+      const duration = graduated ? 100 + i * 10 : 0;
+      return {
+        tokenAddress: 'G' + i, buyTimestamp: 1000 + i, returnMax: 2,
+        features: graduated ? { launch_time_duration: duration, is_graduated: 1 } : { is_graduated: 0 },
+        rawCtx: { logearn: { launch_time: graduated ? 500 : 0, launch_time_duration: duration } },
+      };
+    });
+  }
+
+  test('classifyFields: 毕业哨兵字段走派生块，不能被判成 direct', () => {
+    const cls = classifyFields(['launch_time_duration', 'is_graduated'], mkGradRows());
+    assert.ok(!cls.direct.has('launch_time_duration'), '内联 ctx 路径会让线上未毕业的盘拿到 0');
+    assert.ok(cls.derived.includes('launch_time_duration'));
+    assert.ok(cls.derived.includes('is_graduated'));
+  });
+
+  test('verifyParity: 毕业哨兵字段两边口径一致（未毕业→null，已毕业→原值）', () => {
+    const src = `const ALL_CHECKS = [ ['毕业耗时', f('launch_time_duration'), 10, 0, 0, 45, 2425, null, '快'],
+      ['已毕业', f('is_graduated'), 10, 1, 1, 1, 1, null, '是'] ]`;
+    const r = verifyParity(src, mkGradRows());
+    assert.strictEqual(r.ok, true, JSON.stringify(r.fields));
+    assert.ok(r.rowsChecked > 0);
+  });
+
   test('classifyFields: 直接/派生/无法解析三类正确', () => {
     const cls = classifyFields(['shit_volume', 'buy_sell_count_ratio', 'nope_field_xyz'], mkRows());
     assert.ok(cls.direct.has('shit_volume'));

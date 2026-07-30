@@ -6,7 +6,9 @@ FactorLab 前端 worker 使用说明
 主要文件
 - `recommendWorker.js` — ESM worker 脚本，接收批量候选并返回每条候选的 `result` 或 `error`。
 - `workerPool.js` — 简单的 Worker 池，支持并发、分批、取消 (`AbortSignal`) 与进度回调 (`onProgress`)。
-- `FactorRecommendCard.jsx` — UI 集成范例：在按下“算推荐”时调用 `evaluateCandidatesWithWorkers` 做预评估，随后用 `recommendFactorPath` 做贪心路径构建。
+- `FactorRecommendCard.jsx` — UI 集成范例：按下“算推荐”时把整条 `recommendFactorPool`（选字段贪心 + 精配权 + K折曲线）交给 worker 跑，无 Worker/失败时兜底回主线程直算。
+  （2026-07-29 起不再有 `evaluateCandidatesWithWorkers` 那道候选预评估——贪心内部本来就会跳过评估不出来的候选，那是纯重复的全量计算。）
+  卡片里的**黑名单**（`lib/factorBlacklist.js`）通过 `opts.blacklist` 随 payload 一起进 worker，无需额外协议。
 
 API 摘要
 

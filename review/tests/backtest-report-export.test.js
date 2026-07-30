@@ -18,6 +18,39 @@ const input = {
 };
 
 export function run(test) {
+  // ---------- 第 4 节：北极星必须无条件出 ----------
+  // 回归的是这个缺口：三种配权都要点按钮才有数，都没点时第 4 节只剩三行"未跑"，
+  // 于是"当前这套权重此刻几分"从来没进过报告，诊断只能靠 lift@cutoff 反推。
+  const northStar = { rho: 0.234, n: 728, tieScore: 0.1, tieN: 145, tieRatio: 145 / 728, distinct: 402 };
+
+  test('buildBacktestReport: 没跑任何配权时，北极星 ρ 仍要出现在第 4 节', () => {
+    const r = buildBacktestReport({ ...input, rhoOpt: null, northStar });
+    assert.ok(r.includes('0.234'), '当前因子池原样打分的 ρ 要落进报告');
+    assert.ok(r.includes('未跑「按 ρ 最优配权」'), '"没优化过"这件事仍要说明，不能被北极星顶掉');
+  });
+
+  test('buildBacktestReport: 同分饱和给出块大小/占比/不同分值个数', () => {
+    const r = buildBacktestReport({ ...input, northStar });
+    assert.ok(r.includes('145'), '最大同分块样本数');
+    assert.ok(r.includes('19.9%'), '同分块占比');
+    assert.ok(r.includes('402'), '不同分值个数');
+    assert.ok(r.includes('⚠️'), '占比 ≥10% 要给警告');
+  });
+
+  test('buildBacktestReport: 同分块占比低于 10% 时不报警', () => {
+    const r = buildBacktestReport({ ...input,
+      northStar: { ...northStar, tieN: 20, tieRatio: 20 / 728 } });
+    assert.ok(r.includes('同分饱和'), '这一行照常出');
+    assert.ok(!r.includes('⚠️'), '占比小就不该加警告');
+  });
+
+  test('buildBacktestReport: 没有 northStar 时不崩、也不硬造数字', () => {
+    const r = buildBacktestReport({ ...input, northStar: undefined });
+    assert.ok(r.includes('## 4. 北极星'));
+    // 断言的是【数据行】不出现，不能断言 '同分饱和' 四个字——第 10 节诊断清单里也提到了它
+    assert.ok(!r.includes('个不同分值'), '没有 northStar 就不该出同分饱和的数据行');
+  });
+
   test('buildBacktestReport: 包含全部关键小节', () => {
     const r = buildBacktestReport(input);
     for (const h of ['## 1. 配置', '## 2. 因子池', '## 3. 去冗余', '## 4. 北极星',
@@ -39,6 +72,36 @@ export function run(test) {
   test('buildBacktestReport: OOS 落差大应提示过拟合', () => {
     const r = buildBacktestReport(input); // 1.63→1.08，1.08 < 1.63*0.6=0.978? 否；落差0.55>0.3
     assert.ok(r.includes('落差偏大') || r.includes('疑似过拟合'), '应给过拟合提示');
+  });
+
+  // 第 8 节同样的坑：阈值失效时 lift 两侧都≈1.00、落差必然 0.00，旧版会照常打出
+  // "落差小，泛化较好"——那是把"没测到"说成了"泛化好"，必须换成明确的无效声明。
+  test('buildBacktestReport: 第8节 cutoff 失效时不能输出「泛化较好」，要声明本节无效', () => {
+    const r = buildBacktestReport({ ...input, oos: { ...input.oos,
+      cutoff: -58, cutoffSource: 'train', weightSource: 'auto', inert: { frac: 0.997, inert: true },
+      train: { triggered: 294, hitRate: 0.133, capture: 1, lift: 1.0 },
+      test: { triggered: 127, hitRate: 0.064, capture: 1, lift: 1.0 } } });
+    assert.ok(!r.includes('泛化较好'), '失效时绝不能输出"泛化较好"');
+    assert.ok(r.includes('本节无效'), '要明确声明本节结论不成立');
+    assert.ok(r.includes('99.7%'), '要给出训练段触发率');
+  });
+
+  test('buildBacktestReport: 第8节应标明 cutoff 是该段训出来的、跟全样本 cutoff 不可比', () => {
+    const r = buildBacktestReport({ ...input, oos: { ...input.oos,
+      cutoff: -58, cutoffSource: 'train', weightSource: 'pool', inert: { frac: 0.4, inert: false } } });
+    assert.ok(r.includes('本节 cutoff = **-58**'), '要显示该段自己的 cutoff');
+    assert.ok(r.includes('触发数@-58'), '表格标签也要用该段 cutoff，不是全样本那个');
+    assert.ok(r.includes('沿用因子池现有权重'), 'keepWeights 口径要写清楚');
+    assert.ok(r.includes('两套分数不同源'), '要提醒不可跟第5/6节比大小');
+    assert.ok(r.includes('train→val lift 落差'), '没失效时照常走正常的落差结论分支');
+    assert.ok(!r.includes('本节无效'), '没失效就不该声明无效');
+  });
+
+  test('buildBacktestReport: 旧版 oos（没有 cutoff 字段）应退回全样本 cutoff 且不凭空报警', () => {
+    const r = buildBacktestReport({ ...input, northStar: { ...northStar, tieN: 20, tieRatio: 20 / 728 } });
+    assert.ok(r.includes('触发数@80'), '缺 cutoff 时退回 config.cutoff');
+    assert.ok(!r.includes('本节 cutoff'), '旧版数据不打这段说明');
+    assert.ok(!r.includes('⚠️'), '不该凭空报警');
   });
 
   test('buildBacktestReport: 缺 oos/rhoOpt 时不报错、给占位', () => {
@@ -110,6 +173,45 @@ export function run(test) {
     assert.ok(r.includes('样本太少'));
   });
 
+  // 2026-07-29：cutoff 改成每段各自在训练段上定，报告必须把这件事和"阈值失效"说清楚——
+  // 回归的是这个真实缺口：以前各段套的是全样本 cutoff，重新配权后阈值放行了 99% 的训练样本，
+  // 命中率退化成基准高倍率、lift 恒 1.00，报告却照常输出"未衰减/落差小，泛化较好"。
+  test('buildWalkForwardReport: 每段的 cutoff 与来源应落进报告，并声明与全样本 cutoff 不可比', () => {
+    const rows = wfFoldRows.map((r, i) => ({ ...r, cutoff: i === 0 ? 12 : -34, cutoffSource: i === 0 ? 'train' : 'fallback' }));
+    const r = buildWalkForwardReport(wfOos, rows, { cutoff: 60, threshold: 5 });
+    assert.ok(r.includes('该段cutoff'), '应有「该段cutoff」列');
+    assert.ok(r.includes('12') && r.includes('-34'), '两段各自的 cutoff 都要出现');
+    assert.ok(r.includes('⚠兜底'), '定不出阈值退回全样本 cutoff 的段要标出来');
+    assert.ok(r.includes('不是页面上那个全样本 cutoff=60'), '必须声明跟全样本 cutoff 不同源');
+  });
+
+  // 第 4 节「给 AI 的诊断清单」是固定文案、本来就提到"阈值失效"/"未衰减"这些词，
+  // 断言整篇会被它污染——只截第 2 节（各段总览表）来断言实际判定。
+  const section2 = r => r.split('## 3.')[0];
+
+  test('buildWalkForwardReport: 阈值失效的段判定要换成「无意义」，不能输出未衰减', () => {
+    const rows = [
+      { ...wfFoldRows[0], cutoff: 12, cutoffSource: 'train', inert: { frac: 0.99, inert: true },
+        decay: { p: 0.6, decayed: false, significant: false, insufficientN: false } },
+      { ...wfFoldRows[1], cutoff: 8, cutoffSource: 'train', inert: { frac: 0.4, inert: false } },
+    ];
+    const s = section2(buildWalkForwardReport(wfOos, rows, { cutoff: 60, threshold: 5 }));
+    assert.ok(s.includes('阈值失效'), '失效段要明确标出来');
+    assert.ok(s.includes('99.0%'), '要给出触发率，让人知道失效到什么程度');
+    assert.ok(!s.includes('未衰减'), '失效段绝不能输出"未衰减"这种让人放心的结论');
+    assert.ok(s.includes('1 段阈值失效不计入'), '总览标题要把失效段排除在显著性统计之外');
+  });
+
+  test('buildWalkForwardReport: 全部段都正常时不该出现阈值失效的告警', () => {
+    const rows = wfFoldRows.map(r => ({ ...r, cutoff: 12, cutoffSource: 'train', inert: { frac: 0.33, inert: false } }));
+    const s = section2(buildWalkForwardReport(wfOos, rows, { cutoff: 60, threshold: 5 }));
+    // 标题里那句"0 段阈值失效不计入"照常出（它是计数，不是告警）；不该出的是告警段落和表格标记
+    assert.ok(s.includes('0 段阈值失效不计入'));
+    assert.ok(!s.includes('⚠️ 标「阈值失效」'), '没有失效段就不该出那段告警');
+    assert.ok(!s.includes('判定无意义'), '不该有任何一段被判成无意义');
+    assert.ok(!s.includes('⚠兜底'), 'cutoff 都是训出来的，不该标兜底');
+  });
+
   test('buildWalkForwardReport: 某段训练失败(f.error)时该段应给出失败原因而不是崩溃', () => {
     const oosWithFail = { trainRatio: 0.7, splits: 1,
       folds: [{ splitIndex: 0, error: '训练段推导不出任何有效因子', trainSize: 300, testSize: 60 }] };
@@ -150,5 +252,170 @@ export function run(test) {
     assert.doesNotThrow(() => buildBaselineVsTrainReport(null, { cutoff: 0, threshold: 5 }));
     const r = buildBaselineVsTrainReport({ error: '基准库没有样本' }, { cutoff: 0, threshold: 5 });
     assert.ok(r.includes('基准库没有样本'));
+  });
+
+  // ---------- 第 4 节同分饱和：三条后果分开报，ρ 代价用估计值不用笼统断言 ----------
+  // 原来是一句"⚠️ 同分块内部无法排序，直接压住 ρ 的上限，也让第 7 节…失去意义"，触发线 10%。
+  // 问题在【第一句】：ρ 代价 = f(块大小, 信号强度)，弱信号下小得多，而 10%（触发线本身）
+  // 的实际代价是 0.000。后两条（分段表、cutoff 没中间档位）在 10% 就成立，照常报。
+  const ns = (over) => ({ ...northStar, ...over });
+
+  test('buildBacktestReport: ρ 代价小时要明说"瓶颈不在分数粒度上"，不许喊压住上限', () => {
+    const r = buildBacktestReport({ ...input, northStar:
+      ns({ tieN: 262, tieRatio: 262 / 728, tieRhoCost: 0.004, rhoUntiedEst: 0.194 }) });
+    assert.ok(r.includes('代价估计只有 +0.004'), '要给出估计值本身');
+    assert.ok(r.includes('瓶颈**不在分数粒度上**'), '要明确指路：别去拉宽梯形');
+    assert.ok(!r.includes('直接压住 ρ 的上限'), '不该再出现那句笼统断言');
+    assert.ok(r.includes('模型估计不是测量值'), '必须写明是估计，不是测出来的');
+  });
+
+  test('buildBacktestReport: ρ 代价大时才说值得拉宽梯形', () => {
+    const r = buildBacktestReport({ ...input, northStar:
+      ns({ tieN: 550, tieRatio: 550 / 728, tieRhoCost: 0.059, rhoUntiedEst: 0.249 }) });
+    assert.ok(r.includes('代价估计 +0.059'));
+    assert.ok(r.includes('值得去拉宽梯形过渡带'));
+    assert.ok(!r.includes('瓶颈'), '够大的时候不该再劝人别动手');
+  });
+
+  test('buildBacktestReport: 同分块 ≥10% 要报分段表跨档 + cutoff 没有中间档位', () => {
+    const r = buildBacktestReport({ ...input, northStar:
+      ns({ tieScore: -77.3, tieN: 262, tieRatio: 262 / 728, tieRhoCost: 0.004, rhoUntiedEst: 0.194 }) });
+    assert.ok(/约 4 个十分位/.test(r), '36% 约横跨 4 个十分位，要算出来告诉人');
+    assert.ok(r.includes('cutoff 在这里没有中间档位'), 'cutoff 断崖是这个块的真实代价');
+    assert.ok(r.includes('262'), '要给出一步跳掉多少样本');
+  });
+
+  test('buildBacktestReport: 同分块 <10% 不报后两条（但 ρ 代价那行照常）', () => {
+    const r = buildBacktestReport({ ...input, northStar:
+      ns({ tieN: 20, tieRatio: 20 / 728, tieRhoCost: 0.000, rhoUntiedEst: 0.190 }) });
+    assert.ok(r.includes('代价估计只有'), 'ρ 代价那行不看 10% 这条线');
+    assert.ok(!r.includes('个十分位落在这同一个分数上'));
+    assert.ok(!r.includes('没有中间档位'));
+  });
+
+  test('buildBacktestReport: 旧数据没有 tieRhoCost 时整段不崩、也不漏 NaN', () => {
+    let r;
+    assert.doesNotThrow(() => { r = buildBacktestReport({ ...input, northStar:
+      ns({ tieN: 262, tieRatio: 262 / 728 }) }); });
+    assert.ok(r.includes('同分饱和'), '同分饱和那一行照常出');
+    assert.ok(!r.includes('代价估计'), '没有数据就不硬造这一行');
+    assert.ok(!/代价估计 \+?(NaN|-)/.test(r));
+  });
+
+  // ---------- 第 1 节字段范围：三档都要显示对（readme 第 37 节） ----------
+  // 原来这里是 `fieldScope === 'assembled' ? '组装字段' : '原字段'`，于是 'all' 落进 else
+  // 被标成「原字段」——真实数据上把一次全量轮的结果写成了原字段轮，而同一次的候选表导出
+  // （走 UI 那份三档 map）写的是「全部字段」，两份文件对同一次扫描给出矛盾口径。
+  // 根因是重复实现，已去重到 lib 的 fieldScopeLabel，这几条守着三档 + 兜底。
+  test('buildBacktestReport: fieldScope 三档分别显示对', () => {
+    for (const [scope, label] of [['original', '原字段'], ['assembled', '组装字段'], ['all', '全部字段']]) {
+      const r = buildBacktestReport({ ...input, config: { ...input.config, fieldScope: scope } });
+      assert.ok(r.includes(`字段范围：${label}`), `fieldScope=${scope} 应显示「${label}」`);
+    }
+  });
+
+  test('buildBacktestReport: fieldScope=all 绝不能被标成「原字段」（这次的 bug）', () => {
+    const r = buildBacktestReport({ ...input, config: { ...input.config, fieldScope: 'all' } });
+    assert.ok(!r.includes('字段范围：原字段'));
+    assert.ok(r.includes('字段范围：全部字段'));
+  });
+
+  test('buildBacktestReport: 未登记的 fieldScope 原样显示，不静默归到某一档', () => {
+    const r = buildBacktestReport({ ...input, config: { ...input.config, fieldScope: 'kline' } });
+    assert.ok(r.includes('字段范围：kline'), '宁可显示原始值也别显示一个看起来正常实际是错的标签');
+    const r2 = buildBacktestReport({ ...input, config: { ...input.config, fieldScope: undefined } });
+    assert.ok(r2.includes('字段范围：未指定'));
+  });
+
+  // ---------- 第 8 节判定：先看绝对水平，再看相对落差 ----------
+  // 真实数据上撞到的：用户 4 因子那轮 train lift=1.13 → val lift=0.96，落差只有 0.17，
+  // 报告照样输出"落差小，泛化较好"——可 lift<1 的意思是【这个筛子比不筛还差】，
+  // 触发的那批里高倍率低于基准。原判定只比 trL/teL 的差值，从不看 teL 有没有过 1。
+  const oosWith = (train, test) => ({
+    ...input,
+    oos: { trainSize: 681, testSize: 47, skipped: [], train, test },
+  });
+
+  test('buildBacktestReport: 验证段 lift<1 时不许说"泛化较好"，要点明比不筛还差', () => {
+    const r = buildBacktestReport({ ...oosWith(
+      { triggered: 556, hitRate: 0.246, capture: 0.926, lift: 1.13 },
+      { triggered: 35, hitRate: 0.143, capture: 0.714, lift: 0.96 }), northStar });
+    assert.ok(!r.includes('泛化较好'), '落差 0.17 但验证段 lift<1，绝不能说泛化较好');
+    assert.ok(r.includes('比不筛还差'), '要直说 lift<1 的含义');
+  });
+
+  test('buildBacktestReport: 验证段 lift≈1 时说"没筛出超额"，同样不算泛化好', () => {
+    const r = buildBacktestReport({ ...oosWith(
+      { triggered: 500, hitRate: 0.22, capture: 0.9, lift: 1.02 },
+      { triggered: 40, hitRate: 0.21, capture: 0.9, lift: 1.01 }), northStar });
+    assert.ok(!r.includes('泛化较好'));
+    assert.ok(r.includes('没筛出超额'));
+  });
+
+  test('buildBacktestReport: 验证段 lift>1 且落差小才给"泛化较好"', () => {
+    const r = buildBacktestReport({ ...oosWith(
+      { triggered: 300, hitRate: 0.3, capture: 0.7, lift: 1.40 },
+      { triggered: 30, hitRate: 0.29, capture: 0.7, lift: 1.35 }), northStar });
+    assert.ok(r.includes('泛化较好'));
+    assert.ok(r.includes('验证段 lift>1'), '结论里要写清楚前提，免得又被简化成只看落差');
+  });
+
+  test('buildBacktestReport: 验证段 lift>1 但落差大，仍按过拟合报', () => {
+    const r = buildBacktestReport({ ...oosWith(
+      { triggered: 300, hitRate: 0.4, capture: 0.7, lift: 1.90 },
+      { triggered: 30, hitRate: 0.25, capture: 0.6, lift: 1.15 }), northStar });
+    assert.ok(!r.includes('泛化较好'));
+    assert.ok(/过拟合/.test(r));
+  });
+
+  // ---------- 第 2 节的分数公式：口径必须写对，且要标出跟线上的尺度差 ----------
+  // 原文案写的是「/Σ正权重」，含糊到会被读成"分母只有勇者那一半"。review 的 scoreRow 是
+  // `wsum += f.weight`（全部权重，邪恶的符号在 s 上、weight 恒非负），而【策略模板】是
+  // `wsum += Math.max(0, weight)` + 邪恶权重写成负数 —— 分母真的只有勇者那一半。
+  // 两边分子一致、分母差一个正数倍：排序完全一致（ρ/十分位/AUC 不受影响），但 cutoff 不通用。
+  // 见 readme 第 32 节。
+  const mixedPool = {
+    ...input,
+    config: { ...input.config, cutoff: -42 },
+    factors: [
+      { field: 'mcap', camp: 'evil', weight: 70.5, lo0: 4786, lo1: 14389, hi1: Infinity, hi0: Infinity, auc: 0.541, missRate: 0 },
+      { field: 'chip_analysis.above_percent', camp: 'hero', weight: 29.7, lo0: -1.7, lo1: 6.8, hi1: Infinity, hi0: Infinity, auc: 0.532, missRate: 0 },
+    ],
+  };
+
+  test('buildBacktestReport: 分数公式的分母写成「Σ勇者权重（=满分上限）」，并写明 cutoff 两边通用', () => {
+    const r = buildBacktestReport({ ...mixedPool, northStar });
+    assert.ok(r.includes('Σ勇者权重（=满分上限 29.7）'), '应写出真实分母和它的数值');
+    assert.ok(!r.includes('/Σ正权重'), '不该再出现会被误读的旧措辞');
+    assert.ok(r.includes('cutoff 可直接搬'), '对齐之后要说明 cutoff 不用换算');
+  });
+
+  test('buildBacktestReport: 混合池要标出分数下界不是 −100（邪恶占比越高越负）', () => {
+    const r = buildBacktestReport({ ...mixedPool, northStar });
+    // 邪恶 70.5 / 勇者 29.7 → 全踩中最低 -70.5/29.7*100 = -237.4
+    assert.ok(r.includes('-237.4'), '应算出该池子的真实分数下界');
+    assert.ok(r.includes('下界不是 −100'), '要点明下界不再是 −100，否则 cutoff 会被按旧直觉设');
+  });
+
+  test('buildBacktestReport: 纯勇者阵营池子不输出下界那一行（分数本来就落在 0~100）', () => {
+    const heroOnly = { ...input, factors: input.factors.map(f => ({ ...f, camp: 'hero' })) };
+    const r = buildBacktestReport({ ...heroOnly, northStar });
+    assert.ok(r.includes('Σ勇者权重'), '公式本身照常写');
+    assert.ok(!r.includes('下界不是'), '没有邪恶因子就没有负分，不该凭空多一行');
+  });
+
+  test('buildBacktestReport: 纯邪恶池要显式报"分数恒为 0"，不能让下面的数字看着像真的', () => {
+    const evilOnly = { ...input, factors: input.factors.map(f => ({ ...f, camp: 'evil' })) };
+    const r = buildBacktestReport({ ...evilOnly, northStar });
+    assert.ok(r.includes('没有勇者因子'), '应点名这个池子没有勇者因子');
+    assert.ok(r.includes('恒为 0'), '应说明所有样本分数恒为 0');
+  });
+
+  test('buildBacktestReport: 因子池为空时不做除零，也不误报"没有勇者因子"', () => {
+    const empty = { ...input, factors: [] };
+    let r;
+    assert.doesNotThrow(() => { r = buildBacktestReport({ ...empty, northStar }); });
+    assert.ok(!r.includes('没有勇者因子'), '空池是"还没建因子"，不是"缺勇者阵营"，别误报');
+    assert.ok(!/NaN|Infinity/.test(r.split('## 3.')[0]), '第 2 节不该漏出 NaN/Infinity');
   });
 }

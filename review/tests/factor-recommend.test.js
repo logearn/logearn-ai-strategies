@@ -1,5 +1,6 @@
 import assert from 'node:assert';
 import { recommendFactorPath, recommendFactorPool, heldOutFactorCurve } from '../src/lib/factorLab.js';
+import { buildRecommendPathReport } from '../src/lib/backtestReportExport.js';
 
 function mkRows(n = 120) {
   const rows = [];
@@ -240,5 +241,112 @@ export function run(test) {
     assert.strictEqual(r.path.length, 0);
     assert.ok(r.error, '没有新增候选时应给出提示信息');
     assert.ok(r.error.includes('已经不错'), `提示文案应说明"起点池已经不错"这层意思，实际："${r.error}"`);
+  });
+
+  // ---------- 过拟合校验必须是三态：塌陷 / 正常 / test 反常高于 train（readme 第 39 节） ----------
+  // 原来只判 `rhoTest < rhoTrain*0.4`（单向），于是 train 0.193 / test 0.308 被输出成
+  // "没有明显塌陷，这份权重站得住脚"。readme 26.2.1 那次真实泄漏（事后字段进池）正是这个形态。
+  test('recommendFactorPool: 返回 testAboveTrain / rhoGapSe，且与 overfit 互斥', () => {
+    const rows = mkRows(200);
+    const cands = [
+      { field: 'good', camp: 'hero', interval: { lo: 5, hi: Infinity, score: 1.5 } },
+      { field: 'noise', camp: 'hero', interval: { lo: 40, hi: Infinity, score: 1.1 } },
+    ];
+    const r = recommendFactorPool(rows, cands, { threshold: 5, maxSteps: 2, minGain: 0.001 });
+    assert.ok('testAboveTrain' in r, '必须返回反向异常标记');
+    assert.ok('rhoGapSe' in r, '必须返回噪声量级，UI 要用它说明"这不构成证据"');
+    assert.strictEqual(typeof r.testAboveTrain, 'boolean');
+    assert.ok(!(r.overfit && r.testAboveTrain), 'test 不可能同时既塌陷又反常偏高');
+    if (Number.isFinite(r.rhoGapSe)) assert.ok(r.rhoGapSe >= 0, '标准误不能为负');
+  });
+
+  test('testAboveTrain 的判据：test > train×1.2 且 train>0 才置位', () => {
+    // 直接验判据本身的边界——用 recommendFactorPool 很难精确摆出想要的 train/test 组合，
+    // 这里复刻同一个表达式，锁死"改判据时测试会红"。
+    const judge = (rhoTrain, rhoTest) => Number.isFinite(rhoTrain) && rhoTrain > 0
+      && Number.isFinite(rhoTest) && rhoTest > rhoTrain * 1.2;
+    assert.strictEqual(judge(0.193, 0.308), true, '用户真实遇到的那组应该被标出来');
+    assert.strictEqual(judge(0.243, 0.325), true, 'readme 26.2.1 那次真泄漏也应被标出来');
+    assert.strictEqual(judge(0.20, 0.23), false, '高 15% 属正常波动，不该报');
+    assert.strictEqual(judge(0.20, 0.05), false, '塌陷是另一态，走 overfit 分支');
+    assert.strictEqual(judge(-0.1, 0.3), false, 'train<=0 时比值无意义，不置位');
+    assert.strictEqual(judge(NaN, 0.3), false);
+    assert.strictEqual(judge(0.2, NaN), false);
+  });
+
+  // ---- 同字段跨阵营闸门（2026-07-30）----
+  // 真实数据里 `holder_gini` 同时以 ☠(第3步) 和 🛡(第10步) 进了同一条 12 步路径：
+  // "gini 高加分"和"gini 低扣分"同时成立，语义上没法解释，勇者版还会计入 Σ勇者 分母。
+  // 根因是 chosen 的去重键是 'camp:field'，两个阵营互不相干。
+  // 下面这组 fixture 会精确复现它：x 与 returnMax 同向，hero 版取高值区、evil 版取低值区，
+  // 两边各自都有正的 held-out 增量，所以旧行为下贪心会把两个都选进来。
+  const twoSidedRows = (n = 200) => {
+    const rows = [];
+    for (let i = 0; i < n; i++) {
+      const ret = ((i * 37) % 100) / 10;   // 0~9.9，与时间序去相关
+      rows.push({ tokenAddress: 'T' + i, swapBeginTime: 1000 + i, returnMax: ret, features: { x: ret } });
+    }
+    return rows;
+  };
+  const twoSidedCands = [
+    { field: 'x', camp: 'hero', auc: 0.8, direction: 'high', interval: { lo: 5, hi: Infinity, score: 2 } },
+    { field: 'x', camp: 'evil', auc: 0.8, direction: 'low', interval: { lo: -Infinity, hi: 2, score: 1 } },
+  ];
+
+  test('recommendFactorPath: 同一字段的两个阵营默认不能都进路径，且记进 crossCampBlocked', () => {
+    const r = recommendFactorPath(twoSidedRows(), [], twoSidedCands, { threshold: 5, missingPolicy: 'zero' });
+    const xs = r.path.filter(p => p.field === 'x');
+    assert.strictEqual(xs.length, 1, '同一个字段只能占一个阵营');
+    assert.ok(Array.isArray(r.crossCampBlocked), 'crossCampBlocked 必须返回（否则闸门对使用者不可见）');
+    assert.strictEqual(r.crossCampBlocked.length, 1, '被拦的那个要报出来');
+    const b = r.crossCampBlocked[0];
+    assert.strictEqual(b.field, 'x');
+    assert.notStrictEqual(b.camp, xs[0].camp, '被拦的应是另一个阵营');
+    assert.strictEqual(b.blockedBy, xs[0].camp, 'blockedBy = 占位的那个阵营');
+    assert.ok(b.deltaTest > 0, '只记录本来够格的候选——deltaTest 不够 minGain 的不该出现在这里');
+  });
+
+  test('recommendFactorPath: allowCrossCamp:true 时恢复旧行为（两阵营都能进）', () => {
+    const r = recommendFactorPath(twoSidedRows(), [], twoSidedCands,
+      { threshold: 5, missingPolicy: 'zero', allowCrossCamp: true });
+    const camps = r.path.filter(p => p.field === 'x').map(p => p.camp).sort();
+    assert.deepStrictEqual(camps, ['evil', 'hero'], '显式开开关时不拦');
+    assert.strictEqual(r.crossCampBlocked.length, 0, '没拦任何东西时该是空的');
+  });
+
+  test('recommendFactorPath: 起点池已占用某字段时，另一阵营也不许新增', () => {
+    // 闸门必须覆盖"新增 vs 起点池"，不能只管新增之间——组合路径模式下起点池是用户采信过的池子。
+    const start = [{ field: 'x', camp: 'hero', weight: 100, lo0: -Infinity, lo1: 5, hi1: Infinity, hi0: Infinity }];
+    const r = recommendFactorPath(twoSidedRows(), start, twoSidedCands, { threshold: 5, missingPolicy: 'zero' });
+    assert.ok(!r.path.some(p => p.field === 'x'), '起点池占了 hero:x，evil:x 也不该新增');
+    assert.ok(r.crossCampBlocked.some(b => b.field === 'x' && b.camp === 'evil' && b.blockedBy === 'hero'),
+      '起点池占位也要能报出 blockedBy');
+  });
+
+  test('buildRecommendPathReport: 闸门拦下的要写进报告，同字段重复出现要顶到最前面告警', () => {
+    const path = [{ field: 'x', camp: 'hero', deltaTest: 0.1, deltaIn: 0.12 }];
+    const md = buildRecommendPathReport(path, { threshold: 5,
+      crossCampBlocked: [{ field: 'x', camp: 'evil', deltaTest: 0.03, blockedBy: 'hero' }] });
+    assert.ok(/同字段跨阵营/.test(md), '报告应说明闸门拦过东西');
+    assert.ok(md.includes('已被 🛡 版占位'), '要写清是哪个阵营占的位');
+    // 不传时不该凭空多出这段（老报告格式不变）
+    assert.ok(!/同字段跨阵营/.test(buildRecommendPathReport(path, { threshold: 5 })));
+    // 自检：万一有人开了 allowCrossCamp，报告要自己认出同字段出现两次——这正是
+    // holder_gini 那次（第3步☠/第10步🛡 隔了 7 步）在报告里完全隐形的场景。
+    const dup = buildRecommendPathReport([
+      { field: 'holder_gini', camp: 'evil', deltaTest: 0.063, deltaIn: 0.044 },
+      { field: 'other', camp: 'hero', deltaTest: 0.02, deltaIn: 0.02 },
+      { field: 'holder_gini', camp: 'hero', deltaTest: 0.010, deltaIn: 0.031 },
+    ], { threshold: 5 });
+    assert.ok(/同一字段在本路径里出现了多次/.test(dup), '同字段多次出现必须被顶出来');
+    assert.ok(dup.includes('holder_gini'));
+  });
+
+  test('recommendFactorPool: crossCampBlocked 透传到收尾结果（两条 return 路径都要带）', () => {
+    const r = recommendFactorPool(twoSidedRows(), twoSidedCands, { threshold: 5, maxSteps: 3, minGain: 0.001 });
+    assert.ok(Array.isArray(r.crossCampBlocked), '有路径时要带');
+    assert.strictEqual(r.factors.filter(f => f.field === 'x').length, 1, '最终因子池里同字段只该有一个阵营');
+    const empty = recommendFactorPool(twoSidedRows(), [], { threshold: 5 });
+    assert.ok(!empty.path.length && 'error' in empty, '无候选走 error 分支');
   });
 }

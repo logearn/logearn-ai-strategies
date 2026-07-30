@@ -19,6 +19,17 @@ import { fieldMcapRho } from './fieldAudit.js';
 export const FACTOR_WIN_THRESHOLDS = [2, 3, 5, 10];
 export const DEFAULT_FACTOR_WIN_THRESHOLD = 5;
 
+// 字段范围的显示名。放在 lib 里让【候选表导出 / 回测报告 / UI】三处共用一份——
+// 2026-07-30 之前 backtestReportExport 自己写了一份两分支的
+// `fieldScope === 'assembled' ? '组装字段' : '原字段'`，于是 fieldScope='all' 落进 else、
+// 报告第 1 节把全量轮的结果标成「原字段」。候选表导出用的是 UI 里那份三档全覆盖的 map，
+// 两处对同一次扫描给出矛盾的口径，存下来过几个月回看会直接误判是哪一轮的结果。
+// 重复实现才是根因，所以修法是去重而不是把那个三元补全。
+export const FIELD_SCOPE_LABEL = { original: '原字段', assembled: '组装字段', all: '全部字段' };
+// 兜底给原始值本身（而不是静默显示成某一档）：真出现没登记的 scope，宁可让人看见 'xxx'
+// 也别显示成一个看起来正常、实际是错的标签——这次的 bug 就是"看起来正常"造成的。
+export const fieldScopeLabel = scope => FIELD_SCOPE_LABEL[scope] || String(scope ?? '未指定');
+
 // ---------- 时间切分 ----------
 // 镜像 analytics.js mineBreakpointsOOS 的锚点语义：优先开仓时间，退回买入时刻，都没有的排最后。
 // 不用 utils.splitTrainTest——它只认单一 timeField，没有这条回退链。
@@ -288,6 +299,73 @@ export async function scanFactorCandidates(rows, fields, opts = {}) {
   return assembleCampScan(rawList, camp);
 }
 
+// ---------- 常数因子（梯形退化成"人人同分"）检测 ----------
+// 一个因子如果对几乎所有样本给出【相同的命中度】，它对排序的贡献是【严格的 0】：scoreRow 里
+// 每个样本加的都是同一个 ±w·s，秩序完全不变，spearman(score, returnMax) 一分不动。
+// 但它并不是"无害的 0"。第 33 节把归一分母改成 **Σ勇者权重** 之后（scoreRow 里
+// `if (f.camp !== 'evil') wsum += f.weight`），伤害按阵营分成两种，别混为一谈：
+//   · **勇者**常数因子 → 进分母、贡献又是常数，这才是真正的【稀释】：其它因子的有效权重
+//     按比例被压小，没满命中的样本被白送着拉向中位。
+//   · **邪恶**常数因子 → 不进分母，对每个样本减掉同一个 `w/Σ勇者×100`，是纯粹的
+//     【整体平移】。ρ、十分位、lift 逐位不变，**只有 cutoff 的含义漂了**——也正因为它
+//     什么排序指标都不动，比勇者版更难被发现。
+// 两种共同的代价：占着 K 折 k* 的因子数计数、占着「去冗余」表的一行、上线代码里也会照样
+// 生成一段永远走同一分支的判断。（对应断言见 tests/factor-degenerate.test.js 的两条分机制测试。）
+//
+// 真实案例（2026-07-29，用户 >3x 那轮的因子池）：`shit_volume` 邪恶，推出来的梯形是
+// lo0=-0.3492 / lo1=0 / hi1=∞ / hi0=∞。shit_volume 是持仓占比、恒 ≥0，于是 724/728 个样本
+// 命中度全是 1.00（剩下 4 个是缺失记 0），每个样本一律扣 `8.1/Σ勇者×100` 分。它在报告里跟别的因子长得
+// 一模一样，AUC 0.530、权重 8.1，没有任何一处指标能看出它其实什么都没做。
+//
+// 为什么会推出这种梯形：区间挖掘在正类样本少时系统性偏好"几乎全收"的宽窗（见 scanIntervalCore
+// 的 score 注释），宽到把整个取值域包住时，deriveTrapezoidCore 推出的核心区自然覆盖全部样本。
+// 所以这不是偶发，是上游口径在小样本下的必然产物——必须在建因子这一步拦住。
+//
+// 判据用"众数命中度的占比"而不是"方差为 0"：缺失样本会拿到 0 分，把严格方差撑起来，
+// 上面那个 724/1.00 + 4/0.00 的因子在方差判据下测不出来。
+const HIT_BUCKET = 1e6;   // 命中度是浮点，按 1e-6 归桶再数众数
+
+// 返回 { n, modalHit, modalShare, distinct }：modalShare 就是"最大的一撮同命中度样本占多少"。
+// modalShare→1 = 这个因子对排序没有贡献；modalHit 是那个大家共享的命中度（0=谁也没命中，
+// 1=人人满命中，两种都一样没用）。
+export function factorHitProfile(rows, factor) {
+  const counts = new Map();
+  let n = 0;
+  for (const r of rows) {
+    const hit = trapScore(getFeatureValue(r, factor.field), factor.lo0, factor.lo1, factor.hi1, factor.hi0);
+    const key = Math.round(hit * HIT_BUCKET);
+    counts.set(key, (counts.get(key) || 0) + 1);
+    n++;
+  }
+  if (!n) return { n: 0, modalHit: NaN, modalShare: NaN, distinct: 0 };
+  let modalKey = 0, modalCount = 0;
+  for (const [k, c] of counts) if (c > modalCount) { modalCount = c; modalKey = k; }
+  return { n, modalHit: modalKey / HIT_BUCKET, modalShare: modalCount / n, distinct: counts.size };
+}
+
+// 硬闸：≥99% 的样本同一个命中度 = 明确的零贡献，buildFactors 直接不收。
+// 为什么定在 99% 而不是更松（比如 95%）：这道闸是【自动丢弃】，宁可漏放也不能误杀——
+// 一个只对 5% 样本有区分的因子确实很弱，但它至少还在区分，该由人看着 UI 提醒去删，
+// 不该由算法替人决定。n 小时这个阈值也天然保守：n≤100 时只有"一个不差全同分"才会被拦。
+export const DEGENERATE_HIT_SHARE = 0.99;
+// 软线：≥90% 同分 = 这个因子只在 10% 的样本上说话，UI 上挂提醒但不自动删。
+export const NEAR_DEGENERATE_HIT_SHARE = 0.90;
+
+// 给【已经在池子里】的因子体检（UI 用）：硬闸只管新建的因子，导入策略/换过字段范围保留下来的
+// 老因子不走 buildFactors，照样可能是常数因子，得有一条常驻提醒。
+// 返回 [{ factor, ...profile, degenerate }]，只含 modalShare ≥ minShare 的。
+export function findDegenerateFactors(rows, factors, minShare = NEAR_DEGENERATE_HIT_SHARE) {
+  if (!rows || !rows.length || !factors || !factors.length) return [];
+  const out = [];
+  for (const f of factors) {
+    const p = factorHitProfile(rows, f);
+    if (Number.isFinite(p.modalShare) && p.modalShare >= minShare) {
+      out.push({ factor: f, ...p, degenerate: p.modalShare >= DEGENERATE_HIT_SHARE });
+    }
+  }
+  return out.sort((a, b) => b.modalShare - a.modalShare);
+}
+
 // 从扫描结果构建可编辑的因子集（区间→打分形状，含权重与阵营）。fieldSpecs 里推导失败的进 skipped。
 // candidates 可以是勇者阵营和邪恶阵营两次扫描结果的合并数组——每个候选自带 camp，
 // 这里按各自的 camp 选用对应的区间/梯形推导（hero 走高倍盘密集核，evil 走输家密集核）。
@@ -309,7 +387,11 @@ export async function scanFactorCandidates(rows, fields, opts = {}) {
 // 注意 **矩形因子本身仍然合法**——从策略导入时 checks 文案只编码了核心区 [lo1,hi1]，就是按
 // lo0=lo1/hi1=hi0 近似导入的，trapScore 对矩形的处理（见其右端点注释）不能删。
 // 删的只是"扫描完按矩形建因子"这个选项，opts.shape 参数保留但当前唯一取值是 'trap'。
+// opts.degenerateGate（默认开）：拦掉"梯形退化成人人同分"的因子，见上方 factorHitProfile 那段。
+// 做成可关的开关只为测试/排查用（想看看被拦掉的到底长什么样），正常路径都该开着——
+// 放进去的常数因子不会报错、不会显形，只会静默稀释别人的权重。
 export function buildFactors(rows, candidates, fieldSpecs, winThreshold = WIN_THRESHOLD, opts = {}) {
+  const { degenerateGate = true, degenerateShare = DEGENERATE_HIT_SHARE } = opts;
   const specs = fieldSpecs.map(s => (typeof s === 'string' ? { field: s, camp: 'hero' } : s));
   const campKey = c => (c.camp === 'evil' ? 'evil' : 'hero') + ':' + c.field;
   const byKey = new Map(candidates.map(c => [campKey(c), c]));
@@ -324,6 +406,13 @@ export function buildFactors(rows, candidates, fieldSpecs, winThreshold = WIN_TH
       ? deriveColdTrapezoid(rows, field, c.interval, winThreshold)
       : deriveTrapezoid(rows, field, c.interval, winThreshold);
     if (bounds.error) { skipped.push({ field, reason: bounds.error }); continue; }
+    if (degenerateGate) {
+      const prof = factorHitProfile(rows, { field, ...bounds });
+      if (Number.isFinite(prof.modalShare) && prof.modalShare >= degenerateShare) {
+        skipped.push({ field, camp, reason: `梯形退化成常数：${(prof.modalShare * 100).toFixed(1)}% 的样本命中度都是 ${prof.modalHit.toFixed(2)}，对排序零贡献（却会稀释其它因子的权重）` });
+        continue;
+      }
+    }
     factors.push({ field, camp, auc: c.auc, direction: c.direction, interval: c.interval,
                    missRate: c.missRate, weight: 0, ...bounds });
   }
@@ -408,7 +497,7 @@ export function factorCorrelations(rows, fields, { threshold = 0.7, minN = 20 } 
 // 这里把候选字段临时并入当前已选因子池（自动配权），对比加入前后 rows 整体 score 与
 // returnMax 的 ρ，差值就是"进池后的边际贡献"——可能出现"单字段 AUC 不错但边际贡献接近 0"
 // （信息与已选因子高度重叠，见 factorCorrelations）或反过来的情况。
-function scorePoolRho(rows, factorSet, missingPolicy) {
+export function scorePoolRho(rows, factorSet, missingPolicy) {
   if (!factorSet.length) return NaN;
   const scored = scoreRows(rows, factorSet, { missingPolicy });
   const pairs = [];
@@ -417,6 +506,62 @@ function scorePoolRho(rows, factorSet, missingPolicy) {
     if (Number.isFinite(s.score) && Number.isFinite(ret)) pairs.push([s.score, ret]);
   }
   return pairs.length >= 8 ? spearman(pairs) : NaN;
+}
+
+// ---------- 同分并列对北极星的实际代价（拆结天花板） ----------
+// 报告第 4 节原来对同分饱和的措辞是"直接压住 ρ 的上限"，触发线 tieRatio ≥ 10%。
+// 2026-07-30 用模拟量过一遍，发现这句话在弱信号下夸大了一个数量级：
+//   同分块的代价 = f(块大小, 信号强度)，两个方向都单调，但在 ρ≈0.19 这个量级上
+//   36% 的同分块只值 +0.005；10%（正好是那条触发线）的代价实测是 **0.000**。
+//   要到 55% 才 +0.019、76% 才 +0.052；而在 ρ≈0.9 时 36% 的块值 +0.026。
+// 直觉解释：ρ 已经很弱时，"块内那 36% 样本的相对顺序"本来就没携带多少信息，打平它损失有限。
+//
+// 所以不再拍一句笼统的警告，而是把这个数【估出来】。
+//
+// ⚠️ 必须是估计，不可能是实测。真实代价取决于"如果分数更细，并列的那批样本本来该怎么排"，
+// 而那个信息正是被打平抹掉的那部分，从观测数据里【算不出来】。
+// 第一版实现踩过这个坑：拿"主键 score、次键 returnMax 排序后重算 ρ"当上界——那是错的，
+// 按 returnMax 拆结等于把答案注入进去，测的是"如果有神谕替我排序"。测试立刻抓到了后果：
+// 弱信号（ρ≈0.19）给出 +0.118、强信号（ρ≈0.9）只给 +0.026，跟真实机制完全相反
+// （神谕能凭空造 ρ，信号越弱它造得越多）。
+//
+// 改成模型估计：假设一个潜在信号 latent，观测分数是它的单调量化（中间一段被压成同一个值），
+// returnMax 的秩由 strength·latent + (1−strength)·noise 决定。用观测到的 ρ 反解 strength
+// （打结后的 ρ 对 strength 单调递增，二分即可），再在同一个 strength 下算"分数无并列"时的 ρ，
+// 两者之差就是估计代价。固定种子，同一份输入结果可复现。
+//
+// 模型假设写在这里，读数的人要知道它不是测量值：latent 均匀分布、噪声可加、同分块位于分数分布
+// 中部（真实数据里那 262 个正好横跨第 5~7 十分位，跟这个假设吻合）。量级判断够用，别当精确值。
+export function estimateTieRhoCost(opts) {
+  // 不用参数默认值解构：显式传 null 时 `= {}` 不生效，会直接抛 TypeError（实测踩到）
+  const { n, tieRatio, rho, trials = 24, seed = 0x71E5C057 } = opts || {};
+  if (!Number.isFinite(n) || n < 20 || !Number.isFinite(tieRatio) || !Number.isFinite(rho)) return null;
+  const tieN = Math.round(Math.max(0, Math.min(1, tieRatio)) * n);
+  if (tieN < 2) return { estCost: 0, rhoUntiedEst: Math.abs(rho), strength: NaN, n, tieN };
+  const sim = (strength) => {
+    let tied = 0, untied = 0;
+    for (let k = 0; k < trials; k++) {
+      const rand = mulberry32((seed + k * 7919) | 0);
+      const rows = [];
+      for (let i = 0; i < n; i++) { const l = rand(); rows.push([l, strength * l + (1 - strength) * rand()]); }
+      rows.sort((a, b) => a[0] - b[0]);
+      const lo = Math.floor((n - tieN) / 2);
+      tied += spearman(rows.map((r, i) => [(i >= lo && i < lo + tieN) ? lo + tieN / 2 : i, r[1]]));
+      untied += spearman(rows);
+    }
+    return { tied: tied / trials, untied: untied / trials };
+  };
+  // 二分反解 strength。用 |rho|：模型对方向对称，代价只跟强度的绝对值有关。
+  const target = Math.abs(rho);
+  let lo = 0, hi = 1;
+  for (let it = 0; it < 12; it++) {
+    const mid = (lo + hi) / 2;
+    if (sim(mid).tied < target) lo = mid; else hi = mid;
+  }
+  const strength = (lo + hi) / 2;
+  const r = sim(strength);
+  const estCost = Math.max(0, r.untied - r.tied);
+  return { estCost, rhoUntiedEst: target + estCost, strength, n, tieN };
 }
 
 // 按 score 排序后切成粗粒度分档：给已排好分数的 pairs 按分位数切 K 档（同分绝不跨档，
@@ -747,11 +892,40 @@ function buildWithBase(baseFactors, rowsForBuild, candidates, addSpecs, threshol
 // candidates: [{ field, camp, interval, auc }]（两阵营合并，需带 interval）。
 // opts.scoreFn 同 computeHeldOutDeltaRho，默认 scorePoolRho——注入而不是写死，避免"换目标函数"要在
 // 多处复制这条贪心搜索逻辑。
-// 返回 { path:[{field,camp,deltaTest,deltaIn,testRho,inRho,overfit}], baseTestRho, nTrain, nTest }。
+// opts.blacklist: [{camp,field}]，手动拉黑的字段——照常扫描、照常在候选表里看指标，只是这条贪心
+// 不许选它们（见 factorBlacklist.js 里"跟 exclusions 的区别"那段）。只挡新增挑选，不动起点池。
+// 返回 { path:[{field,camp,deltaTest,deltaIn,testRho,inRho,overfit}], baseTestRho, nTrain, nTest,
+//        crossCampBlocked:[{field,camp,deltaTest,blockedBy}] }。crossCampBlocked = 被同字段跨阵营
+// 闸门拦下的候选（见 opts.allowCrossCamp）；只保留占位因子最终真的留在路径里的那些。
 export function recommendFactorPath(rows, startFactors, candidates, opts = {}) {
   const { threshold = WIN_THRESHOLD, missingPolicy = 'zero', shape = 'trap',
     maxSteps = 6, minGain = 0.003, trainRatio = 0.7, timeField = 'swapBeginTime',
-    splitMethod = 'time', candLimit = Infinity, batchSize = 10, scoreFn = scorePoolRho } = opts;
+    splitMethod = 'time', candLimit = Infinity, batchSize = 10, scoreFn = scorePoolRho,
+    blacklist = [],
+    // ↓ 三个搜索增强（2026-07-29 加）。默认值就是加它们之前的行为——不传任何一个，这条贪心
+    // 逐字段、逐平局都跟原来一致（既有测试守着这份等价性）。开关而不是替换，是因为原来那条
+    // "单路径、只加不减、不看分档"的搜索仍是默认入口「因子推荐」在用的，不能被顺手改掉。
+    //   beamWidth   >1 时保留多条最优前缀（方案C），治"第一步被虚高的 Δρ 带偏，后面全在错误分支找补"
+    //   backward    每步回头试删已选因子（方案D），治"前向贪心只加不减、旧因子被顶替了还占着位置"
+    //   monotoneGate 拒绝会增加 held-out 分档倒挂的候选（方案B）。注意：目标函数【仍然只有 ρ】，
+    //               倒挂是准入约束不是被优化的量——换目标函数那条线（BucketRho）已经试过并大回退，
+    //               见 readme 第1节，别再走回去。
+    // allowCrossCamp：允许【同一个字段】的勇者版和邪恶版都进同一条路径。默认 false（拦住）。
+    // 候选层面两个阵营各自独立是有意的（用户可以只允许某字段当勇者，见 fullFieldRecommend.js
+    // 头部注释），但让贪心把同一字段的两个【相反】方向都选进来是另一回事：
+    //   ① 语义上无法解释——"gini 高加分"和"gini 低扣分"同时成立，上线复刻时没法写；
+    //   ② 归一分母被污染——勇者版计入 Σ勇者（第 33 节的分母），邪恶版不计入，
+    //      等于同一个字段既抬高满分上限又能扣分；
+    //   ③ 它在报告里【看不出来】——真实案例里两步隔了 7 步（第 3 步 ☠、第 10 步 🛡），
+    //      没人会注意到是同一个字段。这正是 readme 39.5 节那族"看起来正常"的问题。
+    // 真需要"低扣分/高加分"这种跨零的双向形状，应当人工在因子池里配，不该由贪心悄悄凑出来。
+    allowCrossCamp = false,
+    beamWidth = 1, backward = false, monotoneGate = false, gateTopK = 20 } = opts;
+  let stopReason = null;
+  // 被同字段跨阵营闸门拦下的候选（本来 deltaTest 够格，只因为同字段的另一个阵营已在路径里）。
+  // 记下来往上抛，否则闸门生效与否对使用者完全不可见——那就跟原来的静默行为一样糟。
+  const crossCampBlocked = [];
+  const blockedSeen = new Set();
   const { train, test } = splitTrainTest(rows, splitMethod, trainRatio, timeField);
   const scoreOf = (rowsSet, factorSet) => scoreFn(rowsSet, factorSet, missingPolicy);
   // 候选：必须有区间；按 interval.score 降序排（不截断，见上方注释）；排除已在起点池里的。
@@ -761,67 +935,193 @@ export function recommendFactorPath(rows, startFactors, candidates, opts = {}) {
   // 字段更糟。区间显著性现在只在UI候选表里当展示/参考（跟AUC的判定列待遇一样），不再拿它
   // 砍候选池——recommendFactorPath 自己的train/test held-out验证已经是足够的把关。
   const startKeys = new Set((startFactors || []).map(f => f.camp + ':' + f.field));
+  // 起点池占用的【字段名】（不带 camp）——组合路径模式下，起点池里已有 hero:X 时
+  // 贪心也不该再新增 evil:X，否则闸门只管新增之间、管不住新增与起点池之间。
+  const startFields = new Set((startFactors || []).map(f => f.field));
+  // 黑名单（opts.blacklist，[{camp,field}]）：用户手动判定"不许算法选它"的字段，只在这里挡住，
+  // candidates 仍然全量传进来——它同时是 buildWithBase/heldOutFactorCurve 重建区间用的字典，
+  // 在调用方就从数组里删掉会让起点池里的同名因子退化成全样本推出来的旧区间（见 factorBlacklist.js）。
+  // 也正因为只挡这一步：拉黑不影响已在起点池里的因子（那是用户采信过的），要踢得去因子池里删。
+  const blackKeys = new Set((blacklist || []).map(b => b.camp + ':' + b.field));
   const pool = (candidates || [])
-    .filter(c => c && c.interval && !startKeys.has(c.camp + ':' + c.field))
-    .sort((a, b) => (b.interval?.score ?? 0) - (a.interval?.score ?? 0))
+    .filter(c => c && c.interval && !startKeys.has(c.camp + ':' + c.field)
+                 && !blackKeys.has(c.camp + ':' + c.field))
+    // 同分时按 'camp:field' 兜底排序（不是靠 Array#sort 的稳定性保留输入顺序）——
+    // interval.score 打平在真实数据里很常见，而 candidates 的顺序来自并行扫描的完成顺序，
+    // 每次刷新都不同。见 auc.js finalizeAucScan 的同一段说明。
+    .sort((a, b) => ((b.interval?.score ?? 0) - (a.interval?.score ?? 0))
+      || (a.camp + ':' + a.field).localeCompare(b.camp + ':' + b.field))
     .slice(0, candLimit);
-  if (!pool.length) return { path: [], baseTestRho: NaN, nTrain: train.length, nTest: test.length, error: '没有可推荐的候选（先扫描）' };
+  if (!pool.length) {
+    // 全被黑名单挡下时要说清楚，否则用户会以为是没扫描/没数据，跑去重扫一遍还是这句话。
+    const blockedAll = blackKeys.size > 0
+      && (candidates || []).some(c => c && c.interval && blackKeys.has(c.camp + ':' + c.field));
+    return { path: [], baseTestRho: NaN, nTrain: train.length, nTest: test.length,
+      error: blockedAll ? '没有可推荐的候选——剩下的候选都在黑名单里（下方可解除）' : '没有可推荐的候选（先扫描）' };
+  }
 
   const buildOf = (addSpecs, rowsForBuild) => buildWithBase(startFactors, rowsForBuild, candidates, addSpecs, threshold, shape);
-  let pathSpecs = [];          // 只记【新增】的 spec，起点池由 buildWithBase 兜底（见其注释）
-  const chosen = new Set(startKeys);
   const hasBase = !!(startFactors && startFactors.length);
-  let baseTestRho = hasBase ? scoreOf(test, autoWeights(buildOf([], train))) : NaN;
-  let baseInRho = hasBase ? scoreOf(rows, autoWeights(buildOf([], train))) : NaN;
-  const path = [];
+  const baseTestRho0 = hasBase ? scoreOf(test, autoWeights(buildOf([], train))) : NaN;
+  const baseInRho0 = hasBase ? scoreOf(rows, autoWeights(buildOf([], train))) : NaN;
+
+  // 分档命中率剖面（跟 UI 散点图紫线同一套 computeRankBuckets/threshold 口径）。
+  // 两个用途共用这一份：① 每步选中后的逐步诊断日志；② monotoneGate 的闸门判据。
+  const bucketsOn = (rowsSet, built) => {
+    const scored = scoreRows(rowsSet, built, { missingPolicy });
+    const pairs = [];
+    for (const s of scored) {
+      const ret = Number(s.row.returnMax);
+      if (Number.isFinite(s.score) && Number.isFinite(ret)) pairs.push({ score: s.score, ret });
+    }
+    return computeRankBuckets(pairs, threshold)?.buckets ?? null;
+  };
+
+  // beam：一条搜索路径的完整状态。beamWidth=1 时永远只有一条，行为跟单路径贪心逐字节一致。
+  // zigzag = 这条路径当前 held-out 分档的倒挂处数，monotoneGate 拿它当"不许变差"的基线；
+  // 起点池为空时初始值取 Infinity —— 第一步没有"之前"可比，不设限，从第二步起才约束。
+  const makeBeam = () => ({
+    specs: [], path: [], chosen: new Set(startKeys), chosenFields: new Set(startFields),
+    testRho: baseTestRho0, inRho: baseInRho0,
+    zigzag: hasBase && monotoneGate
+      ? (bucketZigzag(bucketsOn(test, autoWeights(buildOf([], train)))).inversionCount)
+      : Infinity,
+  });
+  let beams = [makeBeam()];
+  // 历史最优：**必须跨步保留**，不能只在收尾时看最后一轮活着的 beam。一条 beam 可能这一步
+  // 没有任何合法扩展（候选都不够 minGain，或都被闸门拦下）而"走到顶"，下一轮 beams 一换它就
+  // 消失了——但它本身可能正是全局最优解。beamWidth=1 时 testRho 逐步单调不降（每步要求
+  // deltaTest>minGain>0，backward 也只在 ρ 不降时才删），取历史最优 ≡ 取最后一条，与原行为一致。
+  let bestBeam = null;
+  const consider = b => { if (b.path.length && (!bestBeam || b.testRho > bestBeam.testRho)) bestBeam = b; };
 
   for (let step = 0; step < maxSteps; step++) {
-    let best = null;
-    // evaluate pool in batches to avoid blocking the event loop
-    for (let i = 0; i < pool.length; i += batchSize) {
-      const batch = pool.slice(i, i + batchSize);
-      for (const c of batch) {
-        const key = c.camp + ':' + c.field;
-        if (chosen.has(key)) continue;
-        const specs = [...pathSpecs, { field: c.field, camp: c.camp }];
-        const built = autoWeights(buildOf(specs, train));
-        const testRho = scoreOf(test, built);
-        if (!Number.isFinite(testRho)) continue;
-        const deltaTest = Number.isFinite(baseTestRho) ? testRho - baseTestRho : testRho;
-        if (!best || deltaTest > best.deltaTest) {
-          const inRho = scoreOf(rows, built);
-          best = { field: c.field, camp: c.camp, testRho, inRho, deltaTest,
-                   deltaIn: Number.isFinite(baseInRho) ? inRho - baseInRho : inRho, built };
+    // ① 展开：每条 beam × 每个未选候选，算 held-out ρ。beamWidth=1 时外层只跑一次。
+    const cands = [];
+    for (const beam of beams) {
+      // evaluate pool in batches to avoid blocking the event loop
+      for (let i = 0; i < pool.length; i += batchSize) {
+        const batch = pool.slice(i, i + batchSize);
+        for (const c of batch) {
+          const key = c.camp + ':' + c.field;
+          if (beam.chosen.has(key)) continue;
+          const specs = [...beam.specs, { field: c.field, camp: c.camp }];
+          const built = autoWeights(buildOf(specs, train));
+          const testRho = scoreOf(test, built);
+          if (!Number.isFinite(testRho)) continue;
+          const deltaTest = Number.isFinite(beam.testRho) ? testRho - beam.testRho : testRho;
+          if (!(deltaTest > minGain)) continue;
+          // 同字段跨阵营闸门：放在 deltaTest 检查【之后】，这样报出来的都是"本来够格、
+          // 只因同字段另一阵营已在路径里而被拦"的，不会把本来也进不去的候选也记一笔。
+          if (!allowCrossCamp && beam.chosenFields.has(c.field)) {
+            const bk = c.camp + ':' + c.field;
+            if (!blockedSeen.has(bk)) {
+              blockedSeen.add(bk);
+              // blockedBy = 占位的那个阵营，可能来自本轮新增（beam.specs）也可能来自起点池。
+              const holder = beam.specs.find(s => s.field === c.field)
+                || (startFactors || []).find(f => f.field === c.field);
+              crossCampBlocked.push({ field: c.field, camp: c.camp, deltaTest,
+                blockedBy: holder ? holder.camp : null });
+            }
+            continue;
+          }
+          cands.push({ beam, field: c.field, camp: c.camp, specs, built, testRho, deltaTest });
         }
+        // synchronous version for Node tests: no yielding
       }
-      // synchronous version for Node tests: no yielding
     }
-    if (!best || !(best.deltaTest > minGain)) break;
-    best.overfit = Number.isFinite(best.deltaIn) && best.deltaIn > 0 && best.deltaTest < best.deltaIn * 0.4;
-    // 诊断日志：这一步选中因子之后，held-out(test) 和样本内(全量 rows) 各自的分档命中率剖面
-    // （跟 UI 散点图紫线同一套 computeRankBuckets/threshold 口径）。目的：定位"贪心某一步选中的
-    // 因子，是不是让中段分数区间命中率打架(锯齿)"，不用再靠人工在 UI 上逐步点 onAdopt 对照图，
-    // 这份数据直接导出就能看出是哪一步、哪个字段引入的锯齿。
-    const bucketsOn = rowsSet => {
-      const scored = scoreRows(rowsSet, best.built, { missingPolicy });
-      const pairs = [];
-      for (const s of scored) {
-        const ret = Number(s.row.returnMax);
-        if (Number.isFinite(s.score) && Number.isFinite(ret)) pairs.push({ score: s.score, ret });
+    if (!cands.length) break;
+
+    // ② 排序：跨 beam 比较必须用 testRho 绝对值，不能用 deltaTest——不同 beam 的基线不同，
+    // 一条差路径上的大增量不代表它比好路径上的小增量更优。beamWidth=1 时同一基线下
+    // "testRho 最大" ⟺ "deltaTest 最大"，且 Array#sort 稳定、平局保留 pool 顺序，
+    // 与改动前 `deltaTest > best.deltaTest`（严格大于，平局取先出现的）逐字节等价。
+    // 同 testRho 时按 'camp:field' 兜底——完全相关的别名字段（ρ≈1）建出来的因子打分逐位相同，
+    // testRho 必然精确打平，靠"保留 pool 顺序"决定选谁等于把结果绑在扫描完成顺序上。
+    cands.sort((a, b) => (b.testRho - a.testRho)
+      || (a.camp + ':' + a.field).localeCompare(b.camp + ':' + b.field));
+
+    // ③ 单调性闸门（方案B）：目标函数【不变】，仍然只优化 ρ；倒挂只当准入约束——
+    // 一个候选如果让 held-out 分档的倒挂处数比本 beam 当前更多，直接淘汰，不参与排名。
+    // 只检查排名靠前的 gateTopK 个：闸门要多算一次 scoreRows+分档，全量算会让贪心慢一个量级，
+    // 而排到 20 名开外的候选本来也轮不到被选中。
+    // 全被拦下时【停止】而不是绕过闸门——它是用户显式要的约束，偷偷放行等于闸门形同虚设；
+    // stopReason 带回 UI，好跟"没有候选能提升 ρ"这个原因区分开。
+    let picked = [];
+    if (monotoneGate) {
+      for (let i = 0; i < cands.length && i < gateTopK && picked.length < beamWidth; i++) {
+        const zz = bucketZigzag(bucketsOn(test, cands[i].built)).inversionCount;
+        if (zz <= cands[i].beam.zigzag) picked.push({ ...cands[i], zigzag: zz });
       }
-      return computeRankBuckets(pairs, threshold)?.buckets ?? null;
-    };
-    best.testBuckets = bucketsOn(test);
-    best.inBuckets = bucketsOn(rows);
-    best.testZigzag = bucketZigzag(best.testBuckets);
-    best.inZigzag = bucketZigzag(best.inBuckets);
-    delete best.built;
-    path.push(best);
-    pathSpecs = [...pathSpecs, { field: best.field, camp: best.camp }];
-    chosen.add(best.camp + ':' + best.field);
-    baseTestRho = best.testRho; baseInRho = best.inRho;
+      if (!picked.length) { stopReason = 'monotoneGate'; break; }
+    } else {
+      picked = cands.slice(0, beamWidth).map(c => ({ ...c, zigzag: Infinity }));
+    }
+
+    // ④ 落地：每个选中的扩展变成一条新 beam（旧 beam 不保留——保留会让搜索退化成"永远不前进"）。
+    const nextBeams = [];
+    for (const p of picked) {
+      const inRho = scoreOf(rows, p.built);
+      const entry = {
+        field: p.field, camp: p.camp, testRho: p.testRho, inRho, deltaTest: p.deltaTest,
+        deltaIn: Number.isFinite(p.beam.inRho) ? inRho - p.beam.inRho : inRho,
+      };
+      entry.overfit = Number.isFinite(entry.deltaIn) && entry.deltaIn > 0 && entry.deltaTest < entry.deltaIn * 0.4;
+      // 逐步诊断：这一步选中之后 held-out / 样本内各自的分档剖面与锯齿数，导出报告直接能看出
+      // 是哪一步、哪个字段引入的锯齿，不用再人工在 UI 上逐步点 onAdopt 对照图。
+      entry.testBuckets = bucketsOn(test, p.built);
+      entry.inBuckets = bucketsOn(rows, p.built);
+      entry.testZigzag = bucketZigzag(entry.testBuckets);
+      entry.inZigzag = bucketZigzag(entry.inBuckets);
+      let beam = {
+        specs: p.specs, path: [...p.beam.path, entry],
+        chosen: new Set([...p.beam.chosen, p.camp + ':' + p.field]),
+        chosenFields: new Set([...p.beam.chosenFields, p.field]),
+        testRho: p.testRho, inRho,
+        zigzag: monotoneGate ? p.zigzag : Infinity,
+      };
+      // ⑤ 后向剔除（方案D）：刚加进来的因子可能顶替掉早先选的某一个——前向贪心自己发现不了，
+      // 它只会加不会减。逐个试删【除本步新增外】的已选因子，删掉后 held-out ρ 不降就真删
+      // （同样的 ρ 用更少因子达成，K折 k* 和后面的精配权都受益）。单遍扫描不迭代到收敛：
+      // 成本 O(k) 已经够，反复扫描容易在等值解之间来回震荡。
+      if (backward && beam.specs.length >= 3) beam = shrinkBeam(beam);
+      consider(beam);
+      nextBeams.push(beam);
+    }
+    beams = nextBeams;
   }
-  return { path, baseTestRho, nTrain: train.length, nTest: test.length };
+
+  const path = bestBeam ? bestBeam.path : [];
+  // crossCampBlocked 只保留【最终路径里真的占着位】的那些——beam 搜索过程中被拦、
+  // 但占位因子后来又被后向剔除/换分支丢掉的，报出来会误导（那个字段其实没被挡住）。
+  const finalFields = new Set([...startFields, ...path.map(p => p.field)]);
+  return { path, baseTestRho: path.length ? bestBeam.testRho : baseTestRho0,
+    nTrain: train.length, nTest: test.length, stopReason,
+    crossCampBlocked: crossCampBlocked.filter(b => finalFields.has(b.field)),
+    beamWidth, backward, monotoneGate };
+
+  // 后向剔除的实现：挂在函数内部，直接闭包用 buildOf/scoreOf/train/test。
+  function shrinkBeam(beam) {
+    let { specs, path: bp, testRho } = beam;
+    for (let j = 0; j < specs.length - 1; j++) {
+      if (specs.length <= 2) break;   // 至少留 2 个，否则"删到只剩 1 个"没有组合意义
+      const trial = specs.filter((_, k) => k !== j);
+      const r = scoreOf(test, autoWeights(buildOf(trial, train)));
+      // >= 而不是 >：ρ 打平时优先要少的那个（奥卡姆），但不接受任何下降。
+      if (Number.isFinite(r) && r >= testRho) {
+        const dropped = specs[j];
+        specs = trial;
+        bp = bp.filter(e => !(e.field === dropped.field && e.camp === dropped.camp));
+        testRho = r;
+        j--;   // 数组左移了，下一轮从同一下标继续
+      }
+    }
+    if (specs === beam.specs) return beam;
+    return { ...beam, specs, path: bp, testRho,
+      chosen: new Set([...startKeys, ...specs.map(s => s.camp + ':' + s.field)]),
+      // 删掉一个因子后它的字段名要一起腾出来，否则被后向剔除删掉的字段仍占着跨阵营闸门的位置。
+      chosenFields: new Set([...startFields, ...specs.map(s => s.field)]) };
+  }
 }
 
 // ---------- 因子推荐：选字段（held-out 贪心）→ 精配权 → 过拟合校验 → K折定因子数 ----------
@@ -838,7 +1138,9 @@ export function recommendFactorPath(rows, startFactors, candidates, opts = {}) {
 // candidates: [{ field, camp, interval, auc }]（两阵营合并，需带 interval；字段范围由调用方决定）。
 // opts.startFactors（"组合路径"模式）：非空时贪心从这份起点池出发，只找【新增】字段——起点池不
 // 重复挑选、也不计入 held-out 曲线的因子数 k（视为用户已采信，见 heldOutFactorCurve 的 baseFactors）。
-// 返回 { path, factors, rhoBefore, rhoAfter, rhoTrain, rhoTest, overfit, nTrain, nTest,
+// opts.blacklist：透传给 recommendFactorPath，见那里的说明。收尾三件套（精配权/影子权重/K折曲线）
+// 都只对贪心选出来的 path 做，黑名单在选字段那一步就已经生效，这里不需要再过滤一次。
+// 返回 { path, factors, rhoBefore, rhoAfter, rhoTrain, rhoTest, overfit, testAboveTrain, rhoGapSe, nTrain, nTest,
 //        zeroedFields, n, heldoutCurve, recommendedCount, factorsTrimmed } 或 { path: [], error }。
 // path 每项来自 recommendFactorPath，带 deltaTest/deltaIn/overfit/testZigzag 等逐步诊断。
 export function recommendFactorPool(rows, candidates, opts = {}) {
@@ -852,19 +1154,29 @@ export function recommendFactorPool(rows, candidates, opts = {}) {
     // 既然拦不住，就没有理由为它放宽——保持原值。
     maxSteps = 12, minGain = 0.003, maxRounds = 40,
     trainRatio = 0.7, timeField = 'swapBeginTime', splitMethod = 'time',
-    startFactors: startPool = [] } = opts;
+    startFactors: startPool = [], blacklist = [],
+    // 三个搜索增强原样透传给 recommendFactorPath（默认值=不开，见那里的说明）。收尾三件套
+    // （精配权/影子权重/K折曲线）不受影响：它们只对贪心最终选出来的 path 做，跟怎么搜出来的无关。
+    allowCrossCamp = false,
+    beamWidth = 1, backward = false, monotoneGate = false, gateTopK = 20 } = opts;
   const scoreOf = (rowsSet, factorSet) => scorePoolRho(rowsSet, factorSet, missingPolicy);
   if (!(candidates || []).some(c => c && c.interval)) return { path: [], error: '没有可推荐的候选（先扫描）' };
 
   // ① 选字段：held-out 贪心。边界在 train 段推、增量在 test 段读，只收验证段真涨的候选。
   const sel = recommendFactorPath(rows, startPool, candidates,
-    { threshold, missingPolicy, shape, maxSteps, minGain, trainRatio, timeField, splitMethod });
+    { threshold, missingPolicy, shape, maxSteps, minGain, trainRatio, timeField, splitMethod, blacklist,
+      allowCrossCamp, beamWidth, backward, monotoneGate, gateTopK });
   const path = sel.path || [];
   if (!path.length) {
     return { path: [], baseTestRho: sel.baseTestRho, nTrain: sel.nTrain, nTest: sel.nTest,
-      error: sel.error || (startPool.length
-        ? '当前池子已经不错——没有候选能让验证段ρ再提升（或都是负贡献）。'
-        : '没有候选能让验证段ρ提升（先降低阈值或多攒数据）') };
+      stopReason: sel.stopReason, crossCampBlocked: sel.crossCampBlocked || [],
+      // 被单调性闸门拦光跟"没有候选能提升ρ"是两回事：前者是有候选能涨 ρ、但每个都会让分档
+      // 倒挂变多，用户该做的是关掉闸门或放宽 gateTopK，不是跑去降阈值/攒数据。
+      error: sel.error || (sel.stopReason === 'monotoneGate'
+        ? '有候选能提升验证段ρ，但都会让 held-out 分档的倒挂变多，被单调性闸门拦下了——关掉闸门可以看它们是什么。'
+        : startPool.length
+          ? '当前池子已经不错——没有候选能让验证段ρ再提升（或都是负贡献）。'
+          : '没有候选能让验证段ρ提升（先降低阈值或多攒数据）') };
   }
 
   // buildWithBase 而不是裸 buildFactors：起点池里重建不出来的因子（heroOnly 滤掉了 evil 候选、
@@ -906,6 +1218,19 @@ export function recommendFactorPool(rows, candidates, opts = {}) {
   const rhoTrain = bestShadow.rho;   // = scoreOf(train, shadowFactors)，坐标上升内部已经算过
   const rhoTest = scoreOf(test, applyWeights(fullFactors, bestShadow.w));
   const overfit = Number.isFinite(rhoTrain) && rhoTrain > 0 && Number.isFinite(rhoTest) && rhoTest < rhoTrain * 0.4;
+  // 反向异常：test 明显【高于】train。原来只查 `rhoTest < rhoTrain*0.4` 这一个方向，于是
+  // train 0.193 / test 0.308 会被判成"没有明显塌陷，这份权重站得住脚"——而 readme 26.2.1 记的
+  // 那次真实泄漏（事后字段 post_buy_max_drawdown_pct 进池）正是这个形态（train 0.243 / test 0.325），
+  // 当时的结论原话是"以后见到 test 显著高于 train，第一反应该是查泄漏，不是庆祝稳健"。
+  //
+  // 【刻意不做显著性门槛】：把两段 ρ 之差跟抽样噪声比一下就知道门槛没用——
+  // 26.2.1 那次 z≈1.1、用户这次 z≈1.5，都够不着 1.96，但前者确认是真泄漏。
+  // 秩相关在 n=200~500 上的噪声本来就压得住这个量级的差距。所以这里只做【形态提示】，
+  // 不声称是证据，同时把噪声量级 rhoGapSe 一并返回，让 UI 能明说"这个差距本身不构成证据"。
+  const rhoSe = (r, n) => (Number.isFinite(r) && n > 3 ? (1 - r * r) / Math.sqrt(n - 1) : NaN);
+  const rhoGapSe = Math.hypot(rhoSe(rhoTrain, train.length) || 0, rhoSe(rhoTest, test.length) || 0);
+  const testAboveTrain = Number.isFinite(rhoTrain) && rhoTrain > 0
+    && Number.isFinite(rhoTest) && rhoTest > rhoTrain * 1.2;
 
   // ④ held-out 因子数验证曲线（K折）+ 1-SE 推荐因子数 k*：回答"这次新推荐的 N 个里几个能泛化"。
   // 选字段已经是 held-out 的了，为什么还要这条？两者管的不是同一件事：贪心的 test 段是【固定的
@@ -923,9 +1248,13 @@ export function recommendFactorPool(rows, candidates, opts = {}) {
   }
 
   return { path, factors: newFactors, rhoBefore, rhoAfter: bestW.rho,
-    rhoTrain, rhoTest, overfit, nTrain: train.length, nTest: test.length,
+    rhoTrain, rhoTest, overfit, testAboveTrain, rhoGapSe, nTrain: train.length, nTest: test.length,
     baseTestRho: sel.baseTestRho, zeroedFields, n: rows.length,
-    heldoutCurve, recommendedCount, factorsTrimmed };
+    heldoutCurve, recommendedCount, factorsTrimmed,
+    // 搜索配置回带给 UI：同一份结果，"单路径贪出来的"和"beam=5+后向剔除搜出来的"可信度不同，
+    // 报告里不写清楚，过几天回头看会分不清这条路径是怎么来的。
+    stopReason: sel.stopReason, crossCampBlocked: sel.crossCampBlocked || [],
+    search: { beamWidth, backward, monotoneGate, gateTopK } };
 }
 
 // held-out 因子数验证曲线：固定贪心选出来的因子顺序 pathSpecs，用 K 折随机交叉验证逐前缀评估——
@@ -1030,12 +1359,30 @@ export function heldOutFactorCurve(rows, candidates, pathSpecs, opts = {}) {
 }
 
 // ---------- 打分与回测 ----------
-// 总分归一到 -100~100：Σ(±w·s)/Σw × 100。按权重和归一而不是假设 Σw=100——用户手动改权重后
-// 总和可能不是 100，归一保证 cutoff 的含义（"满分的百分之几"）不随之漂移。
+// 总分 = Σ(±w·s) / **Σ勇者权重** × 100。
+//
+// 【2026-07-29 口径变更，必读】分母从「Σ全部权重」改成「Σ勇者权重」，跟实盘策略对齐。
+// 起因见 readme 第 32/33 节：策略模板的归一是 `wsum += Math.max(0, weight)`，而
+// campLibrary.buildAllChecksRow 把邪恶因子的权重写成【负数】（`w = -Math.abs(weight)`），
+// 于是策略侧的分母里只有勇者那一半；review 这边原本累加的是全部权重（邪恶的负号在 s 上、
+// weight 恒非负）。两边分子一致、分母差一个正的常数倍——排序完全一致（ρ/十分位/AUC 都不受
+// 影响），但 **cutoff 的绝对值两边不通用**，而「发送到策略」同步 CUTOFF 是原样搬的。
+// 用户真实因子池实测：勇者 29.7 / 邪恶 70.5，尺度比 3.37×，页面上的 cutoff=-42 搬到线上
+// 等价于 -141.7，写出去却是 -42 —— 线上闸门比回测紧得多、触发数大幅缩水。
+//
+// 为什么是 review 改而不是策略改：策略侧的 `Math.max(0, weight)` 是为了挡一个真实事故加的
+// （见 strategySpec.js 的 `wsum-no-clamp` 规则：邪恶负权重把分母拉小，邪恶没触发时 score 反而
+// 被推过 100，实测跑出过 120 分）。改回去等于把那个 bug 请回来。
+//
+// 分母的语义因此变成「**满分上限**」：勇者全中、邪恶一个不踩 = 100 分，这也是 score 能达到的
+// 最大值。邪恶阵营的"最好情况"是 s=0（没踩中危险区、不贡献），不是 -w，所以它不该进分母。
+// 代价是分数下界不再是 -100：邪恶权重占比越高越负，上面那个池子最低能到 -237。
+// 阈值扫描/cutoff 输入框的下界都跟着实际分数走，不再硬编码 -100。
+//
+// 纯勇者池（没有 evil 因子）行为跟改动前**完全一致**，分数仍落在 0~100。
 //
 // 两阵营符号：勇者阵营（camp!=='evil'）命中自己的区间 = +weight·s（加分）；
 // 邪恶阵营（camp==='evil'）命中自己的区间（输家密集/危险区）= -weight·s（减分）。
-// 纯勇者阵营场景下（没有 evil 因子）行为与之前完全一致，分数仍落在 0~100。
 //
 // 缺失口径只有一种：**缺失记 0 分**（不加不减）。惩罚的是数据覆盖而不是盘质量，偏保守，
 // 但它跟策略侧「生成上线代码」(lib/onlineExport.js) 的行为一致——这是不能变的约束，
@@ -1052,10 +1399,22 @@ export function scoreRow(row, factors, opts = {}) {
     const v = getFeatureValue(row, f.field);
     const hit = trapScore(v, f.lo0, f.lo1, f.hi1, f.hi0);
     const s = f.camp === 'evil' ? -hit : hit;   // 邪恶阵营命中危险区 → 负分
-    total += s * f.weight; wsum += f.weight;
+    total += s * f.weight;
+    // 分母只累加勇者权重（= 满分上限），跟策略模板的 `wsum += Math.max(0, weight)` 逐字对齐。
+    if (f.camp !== 'evil') wsum += f.weight;
     return s;
   });
+  // 纯邪恶池（Σ勇者权重=0）：满分上限是 0，归一无定义。这里【原样复刻策略侧的 `wsum > 0 ? … : 0`】
+  // 返回 0，而不是自作主张换个分母兜底——在这一个最难察觉的场景上偷偷跟线上不一致，正是这次
+  // 要修的那个 bug 的形状。代价是分数全为 0（ρ 会变成 NaN），所以 UI 侧有一条专门的告警
+  // （FactorLab.jsx 的 heroWeightZero）提醒"至少要有一个勇者因子"，不能让它静默。
   return { score: wsum > 0 ? total / wsum * 100 : 0, perFactor };
+}
+
+// 池子的满分上限（= scoreRow 的归一分母）。UI 要用它判断"纯邪恶池"这个死角，
+// 报告也要用它说明分数尺度，抽出来免得三处各写各的 reduce。
+export function heroWeightSum(factors) {
+  return (factors || []).reduce((a, f) => a + (f.camp === 'evil' ? 0 : (Number(f.weight) || 0)), 0);
 }
 
 function getFeatureValue(row, field) {
@@ -1161,14 +1520,27 @@ export function backtestFactors(rows, factors, winThreshold = WIN_THRESHOLD, sco
 // runOOSBacktest（单次70/30）和 runWalkForwardBacktest（多段滚动）共用这一份，避免逻辑分叉。
 //
 // fieldSpecs 支持两种写法：字符串数组（向后兼容，全部当勇者阵营处理，行为与改动前完全一致），
-// 或 {field, camp} 对象数组（camp='hero'|'evil'，两阵营各自在训练段用各自的区间挖掘重新扫描）。
+// 或 {field, camp, weight?} 对象数组（camp='hero'|'evil'，两阵营各自在训练段用各自的区间挖掘
+// 重新扫描；weight 只在 opts.keepWeights 打开时才读，见下）。
 //
+// 2026-07-29 修：cutoff 必须【每段自己在 train 上定】，不能沿用页面上那个全样本 cutoff。
+// 原因是本函数默认走 autoWeights 重新配权（buildFactors 结尾），跟用户手调的权重不是同一套
+// 分数分布——同一个数值 cutoff 套过去会整体平移。实测（3因子合成样本、手调配比 20.9:79.1）：
+// 手调池子 cutoff=-58 触发 42%，同一个 cutoff 套到重新配权的段上 train 触发 91%~94%，
+// lift 全塌成 1.00，train/test 两侧命中率退化成各自的基准高倍率，整份外推报告零信息量。
+// 现在默认 cutoffMode='train'：用 recommendCutoff 在该段训练集上重新定阈值（净超额命中数最大，
+// 带 minN 保护），再原样套到该段验证——这才是"一切都在 train 上定"的 walk-forward 语义。
+//
+// opts.keepWeights=true 则只让训练段重挖区间、权重沿用因子池里手调的那一套（fieldSpecs[].weight），
+// 用来单独检验"区间是不是过拟合"而不掺进"配权变了"这个变量。scoreRow 是按 Σ勇者权重 归一的，
+// 所以沿用原始权重就能精确复现因子池的分数尺度，不需要另外缩放。
 // 2026-07-28 新增 factorDecay（逐因子归因）：训练段每个因子的 AUC（c.auc）扫描时已经算好，这里
 // 补一份该字段在验证段独立重算的 AUC，两者差值大的就是"验证段失效"的候选嫌疑字段——用于回答
 // "总分lift塌了，是哪个字段拖累的"，是粗略的诊断线索，不是严格统计检验（两段各自的最优方向
 // 都是独立选出来的，不排除方向翻转；仅供定位排查，不作为下线某字段的唯一依据）。
 async function backtestOneSplit(train, test, fieldSpecs, winThreshold, opts) {
-  const { bootstrapB = 100, minCoverage = 0.3, shape = 'trap', missingPolicy = 'zero' } = opts;
+  const { bootstrapB = 100, minCoverage = 0.3, shape = 'trap', missingPolicy = 'zero',
+          keepWeights = false, cutoffMode = 'train', cutoff: fixedCutoff = 0 } = opts;
   const specs = fieldSpecs.map(s => (typeof s === 'string' ? { field: s, camp: 'hero' } : s));
   const heroFields = specs.filter(s => s.camp !== 'evil').map(s => s.field);
   const evilFields = specs.filter(s => s.camp === 'evil').map(s => s.field);
@@ -1178,7 +1550,9 @@ async function backtestOneSplit(train, test, fieldSpecs, winThreshold, opts) {
     evilFields.length ? scanFactorCandidates(train, evilFields, { ...scanOpts, camp: 'evil' }) : null,
   ]);
   const candidates = scans.filter(Boolean).flatMap(s => s.candidates);
-  const { factors, skipped } = buildFactors(train, candidates, specs, winThreshold, { shape });
+  const built = buildFactors(train, candidates, specs, winThreshold, { shape });
+  const skipped = built.skipped;
+  const { factors, weightSource } = applyKeepWeights(built.factors, specs, keepWeights);
   if (!factors.length) {
     return { error: '训练段推导不出任何有效因子', skipped, trainSize: train.length, testSize: test.length };
   }
@@ -1190,12 +1564,40 @@ async function backtestOneSplit(train, test, fieldSpecs, winThreshold, opts) {
     return { field: f.field, camp: f.camp, trainAuc: f.auc, testAuc: t.auc, testN: t.n, testPos: t.pos,
              aucDrop: Number.isFinite(f.auc) && Number.isFinite(t.auc) ? f.auc - t.auc : NaN };
   });
+  const trainBt = backtestFactors(train, factors, winThreshold, { missingPolicy });
+  // 该段自己的 cutoff：只看训练段的扫描结果，验证段一眼都不能看（否则就是用未来信息定阈值）。
+  // recommendCutoff 触发数不够 minN 时返回 null——那说明这段训练集在任何档位上都薄，
+  // 退回调用方传进来的 fixedCutoff 并把 cutoffSource 标出来，让报告能说清楚这一段的阈值不是训出来的。
+  const rec = cutoffMode === 'fixed' ? null : recommendCutoff(trainBt.sweep);
+  const cutoff = rec ? rec.cut : fixedCutoff;
   return {
-    trainFactors: factors, skipped, factorDecay,
+    trainFactors: factors, skipped, factorDecay, weightSource,
+    cutoff, cutoffSource: rec ? 'train' : (cutoffMode === 'fixed' ? 'fixed' : 'fallback'),
     trainSize: train.length, testSize: test.length,
-    train: backtestFactors(train, factors, winThreshold, { missingPolicy }),
+    train: trainBt,
     test: backtestFactors(test, factors, winThreshold, { missingPolicy }),
   };
+}
+
+// keepWeights：把因子池里手调的权重按 field+camp 贴回训练段重新推导出来的因子上。
+// 只有【每一个】因子都能在 specs 里找到有限权重时才整体沿用——只贴回一部分会造出一套
+// "一半手调一半自动"的混合权重，那个分数尺度既不是池子的也不是自动的，比两者都难解释。
+function applyKeepWeights(factors, specs, keepWeights) {
+  if (!keepWeights || !factors.length) return { factors, weightSource: 'auto' };
+  const byKey = new Map(specs.map(s => [(s.camp === 'evil' ? 'evil' : 'hero') + ':' + s.field, Number(s.weight)]));
+  const picked = factors.map(f => byKey.get(f.camp + ':' + f.field));
+  if (!picked.every(w => Number.isFinite(w) && w >= 0) || !picked.some(w => w > 0)) {
+    return { factors, weightSource: 'auto-fallback' };
+  }
+  return { factors: factors.map((f, i) => ({ ...f, weight: picked[i] })), weightSource: 'pool' };
+}
+
+// cutoff 是否已经失效：训练段在该阈值下触发了几乎全部样本 → 这个 cutoff 根本没在筛任何东西，
+// 命中率退化成基准高倍率、lift 恒等于 1.00，该段的外推结论不成立（不是"泛化好"，是"没测到"）。
+// 页面和导出报告共用这一份判定，避免两处口径不一致。
+export function assessCutoffInert(point, size, maxFrac = 0.95) {
+  const frac = size > 0 && point ? point.triggered / size : NaN;
+  return { frac, inert: Number.isFinite(frac) && frac >= maxFrac };
 }
 
 // 时间外推验证：单次 70/30 切分（保留原样，向后兼容——返回形状没变，`backtestReportExport.js`
@@ -1214,9 +1616,12 @@ export async function runOOSBacktest(rows, fieldSpecs, winThreshold = WIN_THRESH
 // 如果恰好切在行情转折点附近，结果可能纯粹是运气好/坏，不代表参数真的稳。这里训练段固定用最早
 // trainRatio 比例做"起步窗口"（跟 runOOSBacktest 同一个默认值，第 0 段跟单次切分完全等价），
 // 剩下的验证池切成 splits 段连续时间窗、扩张窗口滚动（每段训练集 = 从最早到该段验证窗口开始
-// 为止的全部历史，不是只用起步窗口）——逐段各自独立推导区间/权重、套到该段验证。多段都稳定，
-// 比单次切分可信得多；只有某几段衰减，也能看出是不是特定行情阶段的问题，而不是参数本身坏了。
+// 为止的全部历史，不是只用起步窗口）——逐段各自独立推导区间/权重/cutoff、套到该段验证。多段都
+// 稳定，比单次切分可信得多；只有某几段衰减，也能看出是不是特定行情阶段的问题，而不是参数本身坏了。
 // opts.onProgress({completed,total}) 供 UI 显示"验证 2/5 段"这类进度。
+// opts.keepWeights / opts.cutoffMode / opts.cutoff 透传给 backtestOneSplit，语义见那边注释；
+// 每段返回值多带 cutoff/cutoffSource/weightSource 三个字段，调用方必须用【每段自己的 cutoff】
+// 去 sweepAt，不能再套页面上那个全样本 cutoff（那正是 2026-07-29 修掉的那个坑）。
 export async function runWalkForwardBacktest(rows, fieldSpecs, winThreshold = WIN_THRESHOLD, opts = {}) {
   const { trainRatio = 0.7, splits = 5, onProgress, ...restOpts } = opts;
   const ordered = rows.slice().sort((a, b) => timeAnchor(a) - timeAnchor(b));
@@ -1339,8 +1744,25 @@ export function classifyFieldOrigin(field) {
   if (isAssembledField(field)) {
     return { original: false, reason: isKlineVolumeField(field) ? 'K线量能组装字段，原始 ctx 中不存在' : '组装/派生字段，原始 ctx 中不存在' };
   }
-  if (field.startsWith('holder_') || field.startsWith('chip_analysis.')) {
-    return { original: false, reason: '持仓/筹码聚合字段，原始 ctx 中不存在' };
+  // holder_* 是从 ctx.holders 那个数组聚合出来的（占比/基尼/标签比例…），原始 ctx 里确实没有对应
+  // 标量，一律拦掉。
+  //
+  // chip_analysis.* 【不能】跟着一起拦：ctx 里 chip_analysis 本身就是平台给的一个块，
+  // current_mcap / above_percent / below_percent / total_holding_percent / inner_sell_ratio /
+  // inner_address_holding / inner_holding_address_count 这些标量是【原样存在】的，
+  // buildRows 只是 flattenObject 展开了一层（见 data.js「标量字段由 flattenObject 自动展开」）。
+  // 从数组算出来的那几个（above_below_ratio / price_to_peak_ratio / price_concentration_hhi /
+  // top5_hold_percent / top5_transfer_in_ratio）在 DERIVED_KEYS 里，上面 isAssembledField 那道
+  // 已经拦住了，轮不到这里。
+  //
+  // 曾经这里连 chip_analysis. 一起拦，后果是 resolveCtxAccessor 直接短路、【根本不去探测 ctx】，
+  // 于是「有 N 个因子映射不回原始 ctx」那条上线告警对 chip_analysis.current_mcap 恒为误报——
+  // 它明明就是 ctx.logearn.mcap 的副本（data.js CHIP_FIELD_EXCLUDE 处已写明）。用户被这条告警
+  // 建议"删掉因子或自己在实盘复刻"，而实际上线取值毫无问题。
+  // 剩下的 chip_analysis.* 交给 resolveCtxAccessor 的数值探测判定：对得上就是 direct，
+  // 对不上会给出"原始 ctx 中找不到与该字段数值一致的路径"——那是核对过的结论，不是拍脑袋的前缀规则。
+  if (field.startsWith('holder_')) {
+    return { original: false, reason: '持仓聚合字段（从 ctx.holders 数组算出），原始 ctx 中不存在' };
   }
   return { original: true };
 }

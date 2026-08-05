@@ -1,19 +1,8 @@
-// 1.5段策略 v30
+// 1.5段策略 v31
 // 【依赖 kline_and_indicators 与 chip_analysis 与 gmgn，单币深度分析场景，非实时流批量场景】
 //
-// 本版改动（相对 v29）：
-// 新增"前10持有占比"限制：gmgn.stat.top_10_holder_rate（原始0-1小数×100转%）< 30。
-// 新增"创建者持仓"限制：gmgn.stat.creator_hold_rate（原始0-1小数×100转%）< 0.5。
-// 新增"top_rat_trader占比"限制：gmgn.stat.top_rat_trader_percentage（原始0-1小数×100转%）< 1。
-// 新增"dev团队持仓"限制：gmgn.stat.dev_team_hold_rate（原始0-1小数×100转%）< 1。
-//
-// v29改动（相对 v28）：
-// 新增"筹码限制"：chip_analysis.below_percent（当前价下方筹码占比）> above_percent（上方筹码占比）。
-//
-// v28改动（相对 v27）：
-// 恢复并新增"新钱包持仓（扣除我关注地址持仓占比后）< 70"限制。
-// 关注地址持仓占比 = sum(walletPositionMap[*].token_balance)/total_supply*100（占总发行量%），
-// 用 new_volume 减去它再判 < 70。
+// 本版改动（相对 v30）：
+// 平台白名单新增 flap（Flap）。
 
 try {
   const nowSec = Math.floor(Date.now() / 1000)
@@ -28,8 +17,11 @@ try {
   const TOP_RAT_TRADER_PERCENTAGE_LIMIT = 1  // gmgn.stat.top_rat_trader_percentage 上限（%）
   const DEV_TEAM_HOLD_RATE_LIMIT = 1  // gmgn.stat.dev_team_hold_rate 上限（%）
 
+  //const Holders = ctx.holders || []
   const hasChip = !!ctx.chip_analysis
   const hasKline = !!ctx.kline_and_indicators && Array.isArray(ctx.kline_and_indicators.avg_price_bars)
+  const gmgnStat = ctx.gmgn?.stat || {}
+  
   if (!hasChip || !hasKline) {
     ctx.log.error(`数据源未就绪 chip(${hasChip}) kline(${hasKline})`)
     return false
@@ -40,10 +32,12 @@ try {
 
   const PUMP_PLATFORMS = ['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA']
   const FOUR_PLATFORMS = ['four.meme', 'binance_four.meme']
+  const FLAP_PLATFORMS = ['flap']
   const platform = ctx.logearn?.platform
   const isPump = PUMP_PLATFORMS.includes(platform) && !ctx.logearn?.is_fake_pump
   const isFour = FOUR_PLATFORMS.includes(platform) && !ctx.logearn?.is_fake_four
-  const isTargetPlatform = isPump || isFour
+  const isFlap = FLAP_PLATFORMS.includes(platform)
+  const isTargetPlatform = isPump || isFour || isFlap
 
   const swapBeginTime = ctx.logearn?.swap_begin_time || 0
   const ageSec = swapBeginTime > 0 ? (nowSec - swapBeginTime) : Infinity
@@ -67,7 +61,7 @@ try {
   const shitVolume = ctx.logearn?.shit_volume ?? 999
   const shitOk = shitVolume < 7
 
-  const gmgnStat = ctx.gmgn?.stat || {}
+ 
   const top10HolderRatePct = (gmgnStat.top_10_holder_rate ?? 0) * 100
   const top10HolderRateOk = top10HolderRatePct < TOP10_HOLDER_RATE_LIMIT
   const creatorHoldRatePct = (gmgnStat.creator_hold_rate ?? 0) * 100
@@ -170,18 +164,18 @@ try {
     }
   }
 
-  const platformLabel = isPump ? 'Pump' : (isFour ? 'four' : (platform || 'unknown'))
+  const platformLabel = isPump ? 'Pump' : (isFour ? 'four' : (isFlap ? 'flap' : (platform || 'unknown')))
   const checks = [
     ['毕业', graduated, launchTime, '>0'],
-    ['平台', isTargetPlatform, platformLabel, 'Pump/four'],
-    //['时长h', withinWindow, ageHour === Infinity ? 'NA' : ageHour.toFixed(1), '<=15'],
+    ['平台', isTargetPlatform, platformLabel, 'Pump/four/flap'],
+    ['时长h', withinWindow, ageHour === Infinity ? 'NA' : ageHour.toFixed(1), '<=15'],
     ['市值', mcapOk, mcap.toFixed(0), '<120k'],
     ['内盘卖出', innerSellOk, innerSellRatio, '>=60'],
     ['筹码下大于上', chipBelowAboveOk, `below=${belowPercent.toFixed(1)}/above=${abovePercent.toFixed(1)}`, '下>上'],
     ['成本线上', deviationOk, avgPriceDeviationPct, '>0'],
     ['垃圾盘', shitOk, shitVolume, '<7'],
     ['前10持有占比', top10HolderRateOk, top10HolderRatePct.toFixed(1), '<30'],
-    ['创建者持仓', creatorHoldRateOk, creatorHoldRatePct.toFixed(2), '<1'],
+    ['创建者持仓', creatorHoldRateOk, creatorHoldRatePct.toFixed(2), '<0.5'],
     ['top_rat_trader占比', topRatTraderPercentageOk, topRatTraderPercentagePct.toFixed(2), '<1'],
     ['dev团队持仓', devTeamHoldRateOk, devTeamHoldRatePct.toFixed(2), '<1'],
     ['新钱包', newOk, `${newVolumeAdj.toFixed(1)}(原${newVolumeRaw}-关注${followedHoldPercent.toFixed(1)})`, '<70'],

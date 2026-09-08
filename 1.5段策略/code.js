@@ -1,8 +1,8 @@
-// 1.5段策略 v31
-// 【依赖 kline_and_indicators 与 chip_analysis 与 gmgn，单币深度分析场景，非实时流批量场景】
+// 1.5段策略 v32
+// 【依赖 kline_and_indicators 与 chip_analysis 与 gmgn 与 holders，单币深度分析场景，非实时流批量场景】
 //
-// 本版改动（相对 v30）：
-// 平台白名单新增 flap（Flap）。
+// 本版改动（相对 v31）：
+// 新增 holders 持有人质量校验：优质占比(quality.good_pct)>10% 散户占比(distribution.push.retail.pct)<20% DEV及关联占比(distribution.risk.dev.pct)<10%。
 
 try {
   const nowSec = Math.floor(Date.now() / 1000)
@@ -16,14 +16,17 @@ try {
   const CREATOR_HOLD_RATE_LIMIT = 0.5  // gmgn.stat.creator_hold_rate 上限（%）
   const TOP_RAT_TRADER_PERCENTAGE_LIMIT = 1  // gmgn.stat.top_rat_trader_percentage 上限（%）
   const DEV_TEAM_HOLD_RATE_LIMIT = 1  // gmgn.stat.dev_team_hold_rate 上限（%）
+  const GOOD_PCT_LIMIT = 10    // holders.stats.quality.good_pct 下限（%）
+  const RETAIL_PCT_LIMIT = 20  // holders.distribution.push.retail.pct 上限（%）
+  const DEV_HOLD_PCT_LIMIT = 10 // holders.distribution.risk.dev.pct 上限（%）
 
-  //const Holders = ctx.holders || []
   const hasChip = !!ctx.chip_analysis
   const hasKline = !!ctx.kline_and_indicators && Array.isArray(ctx.kline_and_indicators.avg_price_bars)
+  const hasHolders = !!ctx.holders
   const gmgnStat = ctx.gmgn?.stat || {}
-  
-  if (!hasChip || !hasKline) {
-    ctx.log.error(`数据源未就绪 chip(${hasChip}) kline(${hasKline})`)
+
+  if (!hasChip || !hasKline || !hasHolders) {
+    ctx.log.error(`数据源未就绪 chip(${hasChip}) kline(${hasKline}) holders(${hasHolders})`)
     return false
   }
 
@@ -70,6 +73,15 @@ try {
   const topRatTraderPercentageOk = topRatTraderPercentagePct < TOP_RAT_TRADER_PERCENTAGE_LIMIT
   const devTeamHoldRatePct = (gmgnStat.dev_team_hold_rate ?? 0) * 100
   const devTeamHoldRateOk = devTeamHoldRatePct < DEV_TEAM_HOLD_RATE_LIMIT
+
+  const holdersStats = ctx.holders?.stats || {}
+  const holdersDist = ctx.holders?.distribution || {}
+  const goodPct = holdersStats.quality?.good_pct ?? 0
+  const goodPctOk = goodPct > GOOD_PCT_LIMIT
+  const retailPct = holdersDist.push?.retail?.pct ?? 999
+  const retailPctOk = retailPct < RETAIL_PCT_LIMIT
+  const devHoldPct = holdersDist.risk?.dev?.pct ?? 999
+  const devHoldPctOk = devHoldPct < DEV_HOLD_PCT_LIMIT
 
   // 关注地址集合 + 关注地址持仓占比
   const followedSet = new Set()
@@ -178,6 +190,9 @@ try {
     ['创建者持仓', creatorHoldRateOk, creatorHoldRatePct.toFixed(2), '<0.5'],
     ['top_rat_trader占比', topRatTraderPercentageOk, topRatTraderPercentagePct.toFixed(2), '<1'],
     ['dev团队持仓', devTeamHoldRateOk, devTeamHoldRatePct.toFixed(2), '<1'],
+    ['优质占比', goodPctOk, goodPct.toFixed(1), '>10'],
+    ['散户占比', retailPctOk, retailPct.toFixed(1), '<20'],
+    ['DEV及关联占比', devHoldPctOk, devHoldPct.toFixed(1), '<10'],
     ['新钱包', newOk, `${newVolumeAdj.toFixed(1)}(原${newVolumeRaw}-关注${followedHoldPercent.toFixed(1)})`, '<70'],
     ['单地址持仓', holdOk, maxHold.toFixed(1), '<10'],
     ['单地址转账', transferOk, maxTransferIn.toFixed(1), '<10'],

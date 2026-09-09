@@ -1,5 +1,18 @@
-// 威科夫策略 v1.9
+// 威科夫策略 v2.1
 // 【依赖 kline_and_indicators.kline_bars/avg_price_bars 与 logearn.v_breakout_volume_list，单币深度分析场景】
+//
+// v2.1 宽松版（实盘漏抓大量"横盘大金狗"，教科书门槛对链上币偏严，定向放宽）：
+// 1. 【删 反弹慢于砸盘】v1.8 引入时即有记录：误杀 JLY(+478%)/PolarBear(+59%)，特征无区分度，回滚。
+// 2. 【SOS新鲜度放宽】3根/90s → 5根/300s。扫描不是每根 bar 都跑，窗口太窄导致"币对形态对但来晚了"。
+// 3. 【AR反弹 10%→5%】横盘大金狗区间窄，SC 后反弹不足 10% 就震荡的全被拦，这条对目标形态是精确打击。
+// 4. 【SC放量降为软条件，1.3→1.15】899 条漏斗 51% 死在 SC放量；链上币"无 climax 阴跌见底"很常见，
+//    或 climax 落在 K线窗口（90~300根）之外。不放量不再拦截，仅日志 ⚠️ 标注，供复盘统计。
+// 5. 【ST缩量 0.7→0.85】单根 bar 比量噪音大，适度放松。
+// 保持硬门槛：SOS 三连（突破/放量/强势）、成本线两条、吸筹区间时长、持仓结构、池子流动性。
+//
+// v2.0 精简：
+// 【去掉 AO 系两条检查】AO动能（ao0>0，v1.2）与 AO峰值衰减（v1.7）。AO 是动量指标，
+// 和威科夫模型（价量结构）没有关系，策略回归纯威科夫结构判定。
 //
 // v1.9 修复（899 条实盘日志漏斗分析，51% 卡在 SC放量）：
 // 1. 【SC 锚定改为窗口内量最大根】原来用 V转 low_price_time 精确时间匹配，但“最低价那一秒”常落在
@@ -7,7 +20,7 @@
 //    改为：vLowTime ±SC_TIME_TOLERANCE 窗口内取成交量最大的已收线 bar 作为 SC（符合威科夫 climax 定义）；
 //    scLow 取窗口内最低 low（不用放量根自己的 low，否则 ST不破位/Spring 的锚会上移）。
 // 2. 【未命中日志❌项排前面】原来按 checks 顺序全量输出，899 条实盘日志 100% 被截断，末端检查
-//    （SOS三连门/成本线/AO/池子）的判定从没被看到过。改为❌项在前+通过计数，截断只会吃掉✅项。
+//    （SOS三连门/成本线/池子）的判定从没被看到过。改为❌项在前+通过计数，截断只会吃掉✅项。
 //
 // v1.8 新增：
 // 【反弹慢于砸盘】反弹时长（SC底 → SOS突破，即吸筹区间实际时长）> 恐慌抛售时长（V转顶点 → 低点，
@@ -18,11 +31,8 @@
 // ——盈利单的反弹/砸盘比值(26%/54%)落在亏损单区间(23%~75%)内部，该特征在现有样本上无区分度。
 // 有意识地接受误杀：赌"拦小亏"出现频率远高于大赢家（方案c）。若后续实盘大赢家被杀率过高，回滚此检查。
 //
-// v1.7 新增（QUOKKA 实盘亏损单复盘，4 快照回放校准）：
-// 1. 【AO峰值衰减】ao0 >= AO_PEAK_RATIO × 近6根AO峰值。QUOKKA 命中时 ao0=1609 仅为峰值3328的48%
-//    ——动能衰减中的突破接力概率低（买后最高仅+23%）；其余三单 ao0 本身就是近期峰值，不受影响。
-//    注意简单的 ao0>ao1 挡不住它（衰减途中有小反弹上勾），必须比峰值。
-// 2. 【池子流动性】pool_liquidity >= MIN_POOL_LIQ。QUOKKA 池子仅$7.6K、42 仅$3K——这种深度下
+// v1.7 新增（QUOKKA 实盘亏损单复盘，4 快照回放校准；其中 AO峰值衰减 已于 v2.0 移除）：
+// 1. 【池子流动性】pool_liquidity >= MIN_POOL_LIQ。QUOKKA 池子仅$7.6K、42 仅$3K——这种深度下
 //    几千美金就能画出"放量突破"，且实际成交滑点巨大，纸面涨幅兑现不了。正例池子均 $13K+。
 //    代价：会挡掉 42（纸面+108%），换取过滤 QUOKKA 类必亏单，按可执行性优先取舍。
 //
@@ -53,7 +63,7 @@
 // 2. 新增【当前在成本线上】检查：avg_price_deviation_pct > 0（口径同 1.5段/苏醒接力）。
 // 3. 新增【吸筹区间时长】下限：SC 到 SOS 至少 RANGE_MIN_BARS 根。三个正例买点前都有充分横盘吸筹；
 //    反例 MEOW 是 V 转后没有吸筹区间直接拉起再砸——回调完直接反弹的不叫吸筹，过滤掉。
-// 4. 新增【AO 动能】检查：最新 AO > 0（正例 MEMIPEDE/cet 买点时 AO 均在零轴上方，反例均为负）。
+// 4. 新增【AO 动能】检查（已于 v2.0 移除）。
 //
 // v1.1 修复：resolution 单位（"5"=5分钟，不是5秒）导致 SC 时间容差远小于一根K线、按时间几乎必然匹配失败的 bug。
 // 现直接用实际 bar 间距作为粒度，与 vLowTime 的秒级时间戳对齐。
@@ -64,26 +74,24 @@
 //   AR  (Automatic Rally)  = SC 后的自动反弹高点，定义交易区间上沿（阻力）
 //   ST  (Secondary Test)   = 回落二次测试 SC 低点：不破位（允许小幅 Spring 假跌破）且量能萎缩
 //   SOS (Sign of Strength) = 放量突破 AR 上沿【且站上成本线】的强势宽幅阳线 —— 唯一买点，且必须是"刚发生"
-const VERSION = 'wyckoff-v1.9'
+const VERSION = 'wyckoff-v2.1'
 
 // ---------- 参数 ----------
-const SC_VOL_MULT = 1.3      // SC 放量倍数：SC 量 > 前段均量 × 1.3
+const SC_VOL_MULT = 1.15     // SC 放量倍数（v2.1 软条件，1.3→1.15）：不达标不拦截，仅日志标注
 const SC_TIME_TOLERANCE = 3  // SC 定位容差（按 K线根数 × 实际bar间距）
-const AR_MIN_RALLY = 0.10    // AR 有效反弹幅度下限（相对 SC 低点，10%）
+const AR_MIN_RALLY = 0.05    // AR 有效反弹幅度下限（v2.1 放宽 10%→5%，横盘窄区间币反弹幅度小）
 const AR_PULLBACK = 0.33     // 从反弹高点回落超过涨幅的 1/3 视为 AR 确立、进入 ST
 const ST_UNDERCUT = 0.05     // ST/Spring 允许跌破 SC 低点的幅度上限（5%）
-const ST_VOL_SHRINK = 0.7    // ST 量能萎缩：ST 低点量 < SC 量 × 0.7
+const ST_VOL_SHRINK = 0.85   // ST 量能萎缩（v2.1 放宽 0.7→0.85，单根bar比量噪音大）
 const SOS_VOL_MULT = 1.5     // SOS 放量倍数：突破量 > 区间均量 × 1.5
 const SOS_CLOSE_POS = 0.6    // SOS 收盘位置：收在 bar 振幅上部 40% 内
-const SOS_FRESH_BARS = 3     // SOS 新鲜度：突破必须发生在最近 N 根内（不追高）
-const SOS_FRESH_MAX_SEC = 90 // SOS 新鲜度时间兜底：秒级粒度下按根数太苛刻，距今 <= N 秒也算新鲜
+const SOS_FRESH_BARS = 5     // SOS 新鲜度（v2.1 放宽 3→5）：突破必须发生在最近 N 根内（不追高）
+const SOS_FRESH_MAX_SEC = 300 // SOS 新鲜度时间兜底（v2.1 放宽 90→300s）
 const MIN_BARS_BEFORE_SC = 5 // SC 前至少要有的 bar 数（算基准均量）
 const RANGE_MIN_BARS = 10    // 吸筹区间时长下限：SC 到 SOS 至少 N 根（过滤 V 转直拉的假吸筹，反例 MEOW）
 const RANGE_MIN_SEC = 120    // 吸筹区间实际时长下限（秒）：秒级粒度下 10 根只有几秒，不构成吸筹
 const MAX_NEW_VOLUME = 65    // 新钱包持仓占比上限（%）
 const MAX_SHIT_VOLUME = 5    // 垃圾钱包持仓占比上限（%）
-const AO_PEAK_RATIO = 0.6    // AO 峰值衰减下限：ao0 >= 近6根峰值 × 0.6（挡动能衰减中的突破）
-const AO_PEAK_LOOKBACK = 6   // AO 峰值回看根数
 const MIN_POOL_LIQ = 10000   // 池子流动性下限（USD）：太浅的池子放量突破可被小资金伪造且无法成交
 
 // ---------- 工具 ----------
@@ -239,36 +247,26 @@ try {
   const rangeBars = hasSos ? sosIdx - scIdx : 0
   const rangeSec = hasSos ? sosBar.t - scBar.t : 0
   const rangeLenOk = hasSos && rangeBars >= RANGE_MIN_BARS && rangeSec >= RANGE_MIN_SEC
-  // 反弹慢于砸盘（v1.8）：吸筹反弹时长必须 > 恐慌抛售时长（V顶→V低，信号时间戳口径）
-  const dropSec = hasEffectiveV && vTopTime > 0 && vLowTime > vTopTime ? vLowTime - vTopTime : 0
-  const reboundSlowOk = hasSos && dropSec > 0 && rangeSec > dropSec
   // SOS 必须站上突破时刻的成本线：成本线下方的"突破"是 UT（上冲回落），不是 SOS
   const costAtSos = hasSos ? costAt(sosBar.t) : 0
   const sosAboveCostOk = hasSos && costAtSos > 0 && sosBar.c > costAtSos
   // 当前仍在成本线上（快照时刻整体确认，口径同其他策略）
   const deviationPct = Number(ki.avg_price_deviation_pct)
   const nowAboveCostOk = Number.isFinite(deviationPct) && deviationPct > 0
-  // AO 动能在零轴上方（最新一根）
-  const aoBars = Array.isArray(ki.ao_bars) ? ki.ao_bars : []
-  const ao0 = aoBars.length ? num(aoBars[0] && aoBars[0].value) : NaN
-  const aoOk = Number.isFinite(ao0) && ao0 > 0
-  // AO 峰值衰减（v1.7）：ao0 距近期峰值衰减过多 = 动能正在退潮，突破接力概率低。
-  // 峰值 <= 0（AO 刚翻多，ao0 即峰值）时该检查自然通过
-  const aoPeak = Math.max(...aoBars.slice(0, AO_PEAK_LOOKBACK).map((b) => num(b && b.value)), 0)
-  const aoPeakOk = Number.isFinite(ao0) && (aoPeak <= 0 || ao0 >= aoPeak * AO_PEAK_RATIO)
   // 池子流动性（v1.7）
   const poolLiq = num(logearn.pool_liquidity)
   const poolOk = poolLiq >= MIN_POOL_LIQ
 
   // ---------- 汇总 ----------
   const fmt = (x, d = 6) => Number.isFinite(x) ? Number(Number(x).toFixed(d)) : 'NA'
+  // 第 5 个元素 soft=true 的检查不拦截命中，仅在日志用 ⚠️ 标注（v2.1：SC放量降级为软条件）
   const checks = [
     ['K线就绪', bars.length >= MIN_BARS_BEFORE_SC + 5, bars.length + '根', '>= ' + (MIN_BARS_BEFORE_SC + 5)],
     ['新钱包持仓', newVolOk, newVolValid ? fmt(newVolRaw, 2) + '%' : '失效(' + fmt(newVolRaw, 2) + ',24h口径)跳过', '< ' + MAX_NEW_VOLUME + '%（值有效时）'],
     ['垃圾钱包持仓', shitVolOk, shitVolValid ? fmt(shitVolRaw, 2) + '%' : '失效(' + fmt(shitVolRaw, 2) + ',24h口径)跳过', '< ' + MAX_SHIT_VOLUME + '%（值有效时）'],
     ['有效V转', hasEffectiveV, hasEffectiveV ? 'y@' + num(recentV.signalTime) : 'n', 'confirmed且未收尾'],
     ['SC定位', scOk, scOk ? 'idx' + scIdx + '@' + scBar.t + '(粒度' + resolutionSec + 's)' : '未定位', 'V低点匹配到bar且前置>=' + MIN_BARS_BEFORE_SC + '根'],
-    ['SC放量', scVolOk, scOk ? fmt(scBar.v, 0) + '/均' + fmt(preAvgVol, 0) : 'NA', '> 均量x' + SC_VOL_MULT],
+    ['SC放量', scVolOk, scOk ? fmt(scBar.v, 0) + '/均' + fmt(preAvgVol, 0) : 'NA', '> 均量x' + SC_VOL_MULT + '（软条件不拦截）', true],
     ['AR反弹', arOk, arOk || arIdx > 0 ? '高' + fmt(arHigh) + '(+' + (arRallyPct * 100).toFixed(1) + '%)' + (arConfirmed ? '已确立' : '未回落') : 'NA', '>=+' + (AR_MIN_RALLY * 100) + '%且已回落确立'],
     ['ST不破位', stHoldOk, hasSt ? '低' + fmt(stLow) + '/SC低' + fmt(scLow) : '无ST', '>= SC低x' + (1 - ST_UNDERCUT)],
     ['ST缩量', stVolOk, hasSt ? fmt(stVol, 0) + '/SC量' + fmt(scOk ? scBar.v : 0, 0) : '无ST', '< SC量x' + ST_VOL_SHRINK],
@@ -277,11 +275,8 @@ try {
     ['SOS强势', sosStrongOk, hasSos ? '阳线' + (sosBar.c > sosBar.o ? 'y' : 'n') + '/收位' + (sosClosePos * 100).toFixed(0) + '%' : 'NA', '阳线且收位>=' + (SOS_CLOSE_POS * 100) + '%'],
     ['SOS新鲜', sosFreshOk, hasSos ? '距今' + sosBarsAgo + '根/' + sosSecAgo + 's' : 'NA', '< ' + SOS_FRESH_BARS + '根 或 <= ' + SOS_FRESH_MAX_SEC + 's'],
     ['吸筹区间', rangeLenOk, hasSos ? rangeBars + '根/' + rangeSec + 's' : 'NA', '>= ' + RANGE_MIN_BARS + '根 且 >= ' + RANGE_MIN_SEC + 's'],
-    ['反弹慢于砸盘', reboundSlowOk, hasSos ? '反弹' + rangeSec + 's/砸盘' + dropSec + 's' : 'NA', '反弹时长 > 砸盘时长(V顶→V低)'],
     ['SOS站上成本线', sosAboveCostOk, hasSos ? '收' + fmt(sosBar.c) + '/成本' + fmt(costAtSos) : 'NA', '收盘 > 突破时成本线'],
     ['当前成本线上', nowAboveCostOk, Number.isFinite(deviationPct) ? deviationPct.toFixed(1) + '%' : '缺失', '偏离% > 0'],
-    ['AO动能', aoOk, Number.isFinite(ao0) ? fmt(ao0, 2) : '缺失', 'AO > 0'],
-    ['AO峰值衰减', aoPeakOk, Number.isFinite(ao0) ? fmt(ao0, 0) + '/峰' + fmt(aoPeak, 0) + '(' + (aoPeak > 0 ? (ao0 / aoPeak * 100).toFixed(0) : 'NA') + '%)' : '缺失', '>= 峰值x' + AO_PEAK_RATIO],
     ['池子流动性', poolOk, '$' + fmt(poolLiq, 0), '>= $' + MIN_POOL_LIQ],
   ]
 
@@ -293,13 +288,14 @@ try {
     : !arOk ? (barsAfterSc < MIN_BARS_BEFORE_SC ? 'A阶段(SC刚发生,结构未展开,SC后仅' + barsAfterSc + '根收线bar,等待)' : 'A阶段(SC后待AR确立)')
     : !stOk ? 'B阶段(ST测试中)' : !hasSos ? 'C阶段(待SOS突破)' : 'D阶段(SOS)'
   const head = 'VER=' + VERSION + ' [' + symbol + '] K' + ki.resolution + ' 阶段=' + phase
-  const fmtItem = ([n, ok, a, e]) => `${n}${ok ? '✅' : '❌'}: ${a} [期望 ${e}]`
+  const fmtItem = ([n, ok, a, e, soft]) => `${n}${ok ? '✅' : soft ? '⚠️' : '❌'}: ${a} [期望 ${e}]`
 
   // 未命中把❌项排前面输出（v1.9：日志会被截断，❌项在前保证截断只吃掉✅项，漏斗分析不受影响）
-  const fails = checks.filter((c) => !c[1])
+  // v2.1：软条件（soft=true）不达标不拦截，仅 ⚠️ 标注
+  const fails = checks.filter((c) => !c[1] && !c[4])
   if (fails.length) {
-    const passes = checks.filter((c) => c[1])
-    ctx.log.error('未命中 ' + head + ' 通过' + passes.length + '/' + checks.length + '  ||  ' + fails.concat(passes).map(fmtItem).join('  |  '))
+    const rest = checks.filter((c) => c[1] || c[4])
+    ctx.log.error('未命中 ' + head + ' 通过' + checks.filter((c) => c[1]).length + '/' + checks.length + '  ||  ' + fails.concat(rest).map(fmtItem).join('  |  '))
     return false
   }
   ctx.log.success('命中<威科夫SOS买点> ' + head + '  ||  ' + checks.map(fmtItem).join('  |  '))

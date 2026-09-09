@@ -1,8 +1,8 @@
-// 苏醒接力策略 v1.2
+// 苏醒接力策略 v1.3
 // Pump / four.meme / flap 发射 + 30分钟内苏醒信号价格逐个抬高 + 最新苏醒在成本线上
-// + 已毕业到外盘（过滤内盘）+ 毕业满1小时（过滤刚毕业1h内）
+// 阶段过滤：已毕业外盘且毕业满1h 通过；或 内盘但生命周期>24h 也通过（其余内盘/刚毕业1h内 过滤）
 // 注：单地址持仓 / 转账持仓 / 精选信号 三条已停用（保留代码备查，chip 数据在部分平台不稳）
-const STRATEGY_VERSION = 'v1.2'
+const STRATEGY_VERSION = 'v1.3'
 
 const ALLOW_PLATFORMS = [
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump（SOL）
@@ -24,14 +24,20 @@ const symbol = logearn.symbol || 'UNKNOWN'
 const deviationPct = num(ki.avg_price_deviation_pct)
 const nowTs = Math.floor(Date.now() / 1000)
 
-// 生命周期（天）
+// 生命周期
 const swapBegin = num(logearn.swap_begin_time)
-const ageDays = swapBegin > 0 ? (nowTs - swapBegin) / 86400 : Infinity
+const ageSec = swapBegin > 0 ? nowTs - swapBegin : Infinity
+const ageDays = ageSec === Infinity ? Infinity : ageSec / 86400
+const ageHours = ageSec === Infinity ? Infinity : ageSec / 3600
 
 // 毕业（内盘->外盘）：launch_time 有值即已毕业
 const launchTime = num(logearn.launch_time)
 const launched = launchTime > 0
 const afterLaunchSec = launched ? nowTs - launchTime : -1
+
+// 阶段过滤：已毕业外盘且毕业满1h 通过；或 内盘但生命周期>24h 通过
+const stagePass = (launched && afterLaunchSec >= 3600) || (!launched && ageHours > 24)
+const stageActual = launched ? `外盘毕业${(afterLaunchSec / 60).toFixed(0)}分` : `内盘${ageHours === Infinity ? 'NA' : ageHours.toFixed(1)}h`
 
 // 苏醒信号列表：新→旧
 const wakeSorted = (Array.isArray(logearn.breakout_volume_10x_list) ? logearn.breakout_volume_10x_list : []).slice().sort((a, b) => num(b.signalTime) - num(a.signalTime))
@@ -66,8 +72,7 @@ const maxTransferIn = nonFollowed.reduce((m, h) => Math.max(m, num(h.transfer_in
 
 const checks = [
   ['平台', ALLOW_PLATFORMS.includes(logearn.platform), logearn.platform, 'pump/four/flap'],
-  ['已毕业外盘', launched, launched ? '已毕业' : '内盘', 'launch_time>0'],
-  ['毕业满1h', launched && afterLaunchSec >= 3600, launched ? (afterLaunchSec / 60).toFixed(0) + '分' : 'NA', '>=3600s'],
+  ['阶段(外盘满1h或内盘>24h)', stagePass, stageActual, '外盘>=1h 或 内盘>24h'],
   ['30分钟内多苏醒', !!prevWake && inWindow > 1 && gap <= WINDOW, `${inWindow}个/间隔${gap}s`, '>1且<=1800s'],
   ['价格>前一个', !!prevWake && latestMcap > prevMcap, `${latestMcap.toFixed(0)}>${prevMcap.toFixed(0)}`, '当前市值>前一个'],
   ['成本线上', deviationPct > 0, deviationPct.toFixed(1) + '%', '>0'],

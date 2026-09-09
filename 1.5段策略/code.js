@@ -1,34 +1,42 @@
-// 1.5段策略 v32
-// 【依赖 kline_and_indicators 与 chip_analysis 与 gmgn 与 holders，单币深度分析场景，非实时流批量场景】
+// 1.5段策略 v36
+// 【依赖 kline_and_indicators 与 chip_analysis，单币深度分析场景，非实时流批量场景】
 //
-// 本版改动（相对 v31）：
-// 新增 holders 持有人质量校验：优质占比(quality.good_pct)>10% 散户占比(distribution.push.retail.pct)<20% DEV及关联占比(distribution.risk.dev.pct)<10%。
+// 本版改动（相对 v35）：
+// 暂时注释掉黑名单功能（垃圾钱包超门槛拉黑），垃圾盘仍作为普通 check 参与过滤（不通过而已，不拉黑）。
 
 try {
   const nowSec = Math.floor(Date.now() / 1000)
-  const RETRACE_TOLERANCE = 0.10
+  const RETRACE_TOLERANCE = 0.20
   const HOLD_LIMIT = 10
   const TRANSFER_LIMIT = 10
   const MIN_V_DURATION = 120 // V转回撤持续时间下限（秒）= 2分钟
   const MCAP_LIMIT = 120000  // 买入市值上限（USD）
   const NEW_LIMIT = 70       // 新钱包持仓上限（%，已扣关注地址）
-  const TOP10_HOLDER_RATE_LIMIT = 30 // gmgn.stat.top_10_holder_rate 上限（%）
-  const CREATOR_HOLD_RATE_LIMIT = 0.5  // gmgn.stat.creator_hold_rate 上限（%）
-  const TOP_RAT_TRADER_PERCENTAGE_LIMIT = 1  // gmgn.stat.top_rat_trader_percentage 上限（%）
-  const DEV_TEAM_HOLD_RATE_LIMIT = 1  // gmgn.stat.dev_team_hold_rate 上限（%）
-  const GOOD_PCT_LIMIT = 10    // holders.stats.quality.good_pct 下限（%）
-  const RETAIL_PCT_LIMIT = 20  // holders.distribution.push.retail.pct 上限（%）
-  const DEV_HOLD_PCT_LIMIT = 10 // holders.distribution.risk.dev.pct 上限（%）
+  const SHIT_LIMIT = 7       // 垃圾钱包持仓门槛（%）
 
   const hasChip = !!ctx.chip_analysis
   const hasKline = !!ctx.kline_and_indicators && Array.isArray(ctx.kline_and_indicators.avg_price_bars)
-  const hasHolders = !!ctx.holders
-  const gmgnStat = ctx.gmgn?.stat || {}
 
-  if (!hasChip || !hasKline || !hasHolders) {
-    ctx.log.error(`数据源未就绪 chip(${hasChip}) kline(${hasKline}) holders(${hasHolders})`)
+  if (!hasChip || !hasKline) {
+    ctx.log.error(`数据源未就绪 chip(${hasChip}) kline(${hasKline})`)
     return false
   }
+
+  const shitVolume = ctx.logearn?.shit_volume ?? 999
+
+  // ===== 黑名单：垃圾钱包持仓超门槛，永久拉黑（暂时停用）=====
+  // const ca = ctx.logearn?.token_address
+  // const blacklistChecks = [
+  //   ['垃圾钱包超门槛', shitVolume >= SHIT_LIMIT, shitVolume, `>= ${SHIT_LIMIT}`],
+  // ]
+  // const blackHit = blacklistChecks.filter(c => c[1])
+  // if (blackHit.length && ca) {
+  //   const reason = blackHit.map(([name, ok, actual, expect]) => `${name}${ok ? '✅' : '❌'}(${ok}): ${actual} [期望 ${expect}]`).join('  |  ')
+  //   ctx.add_blacklist(ca, reason)
+  //   return false
+  // }
+
+  const isBsc = ctx.logearn?.chain === 56
 
   const launchTime = ctx.logearn?.launch_time || 0
   const graduated = launchTime > 0
@@ -61,27 +69,7 @@ try {
   const avgPriceDeviationPct = ctx.kline_and_indicators?.avg_price_deviation_pct ?? -999
   const deviationOk = avgPriceDeviationPct > 0
 
-  const shitVolume = ctx.logearn?.shit_volume ?? 999
-  const shitOk = shitVolume < 7
-
- 
-  const top10HolderRatePct = (gmgnStat.top_10_holder_rate ?? 0) * 100
-  const top10HolderRateOk = top10HolderRatePct < TOP10_HOLDER_RATE_LIMIT
-  const creatorHoldRatePct = (gmgnStat.creator_hold_rate ?? 0) * 100
-  const creatorHoldRateOk = creatorHoldRatePct < CREATOR_HOLD_RATE_LIMIT
-  const topRatTraderPercentagePct = (gmgnStat.top_rat_trader_percentage ?? 0) * 100
-  const topRatTraderPercentageOk = topRatTraderPercentagePct < TOP_RAT_TRADER_PERCENTAGE_LIMIT
-  const devTeamHoldRatePct = (gmgnStat.dev_team_hold_rate ?? 0) * 100
-  const devTeamHoldRateOk = devTeamHoldRatePct < DEV_TEAM_HOLD_RATE_LIMIT
-
-  const holdersStats = ctx.holders?.stats || {}
-  const holdersDist = ctx.holders?.distribution || {}
-  const goodPct = holdersStats.quality?.good_pct ?? 0
-  const goodPctOk = goodPct > GOOD_PCT_LIMIT
-  const retailPct = holdersDist.push?.retail?.pct ?? 999
-  const retailPctOk = retailPct < RETAIL_PCT_LIMIT
-  const devHoldPct = holdersDist.risk?.dev?.pct ?? 999
-  const devHoldPctOk = devHoldPct < DEV_HOLD_PCT_LIMIT
+  const shitOk = shitVolume < SHIT_LIMIT
 
   // 关注地址集合 + 关注地址持仓占比
   const followedSet = new Set()
@@ -95,10 +83,10 @@ try {
   const totalSupply = ctx.logearn?.total_supply || 0
   const followedHoldPercent = totalSupply > 0 ? (followedBalanceSum / totalSupply * 100) : 0
 
-  // 新钱包持仓（扣关注）
+  // 新钱包持仓（扣关注）—— BSC 链豁免此规则
   const newVolumeRaw = ctx.logearn?.new_volume ?? 999
   const newVolumeAdj = newVolumeRaw - followedHoldPercent
-  const newOk = newVolumeAdj < NEW_LIMIT
+  const newOk = isBsc ? true : (newVolumeAdj < NEW_LIMIT)
 
   const top5 = ctx.chip_analysis?.top5_holders || []
   let maxHold = 0, maxTransferIn = 0
@@ -185,20 +173,13 @@ try {
     ['内盘卖出', innerSellOk, innerSellRatio, '>=60'],
     ['筹码下大于上', chipBelowAboveOk, `below=${belowPercent.toFixed(1)}/above=${abovePercent.toFixed(1)}`, '下>上'],
     ['成本线上', deviationOk, avgPriceDeviationPct, '>0'],
-    ['垃圾盘', shitOk, shitVolume, '<7'],
-    ['前10持有占比', top10HolderRateOk, top10HolderRatePct.toFixed(1), '<30'],
-    ['创建者持仓', creatorHoldRateOk, creatorHoldRatePct.toFixed(2), '<0.5'],
-    ['top_rat_trader占比', topRatTraderPercentageOk, topRatTraderPercentagePct.toFixed(2), '<1'],
-    ['dev团队持仓', devTeamHoldRateOk, devTeamHoldRatePct.toFixed(2), '<1'],
-    ['优质占比', goodPctOk, goodPct.toFixed(1), '>10'],
-    ['散户占比', retailPctOk, retailPct.toFixed(1), '<20'],
-    ['DEV及关联占比', devHoldPctOk, devHoldPct.toFixed(1), '<10'],
-    ['新钱包', newOk, `${newVolumeAdj.toFixed(1)}(原${newVolumeRaw}-关注${followedHoldPercent.toFixed(1)})`, '<70'],
+    ['垃圾盘', shitOk, shitVolume, `< ${SHIT_LIMIT}`],
+    ['新钱包', newOk, isBsc ? 'BSC豁免' : `${newVolumeAdj.toFixed(1)}(原${newVolumeRaw}-关注${followedHoldPercent.toFixed(1)})`, isBsc ? 'BSC豁免' : '<70'],
     ['单地址持仓', holdOk, maxHold.toFixed(1), '<10'],
     ['单地址转账', transferOk, maxTransferIn.toFixed(1), '<10'],
     ['有效V转', hasEffectiveV, hasEffectiveV ? 'y' : 'n', 'confirmed&未收尾'],
     ['V转持续min', vDurationOk, hasEffectiveV ? (vDurationSec / 60).toFixed(1) : 'NA', '>2'],
-    ['V转路径', retraceBreakOk, retraceInfo, '低点<成本*1.1'],
+    ['V转路径', retraceBreakOk, retraceInfo, '低点<成本*1.2'],
   ]
   const passed = checks.every(c => c[1])
   if (!passed) {

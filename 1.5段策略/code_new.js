@@ -1,11 +1,10 @@
-// 1.5段策略 v39（分支版，基于 v32 继续演进，未合并 code.js v34~v36 的改动）
+// 1.5段策略 v41（在 v40 基础上按我的风格微调）
 // 【依赖 kline_and_indicators 与 chip_analysis 与 holders 与 inner_chip_analysis，单币深度分析场景，非实时流批量场景】
 //
-
-// v37 改动（相对 v36）：
-// 新增捆绑回撤联动校验：内盘筹码捆绑簇净买入占比(inner_chip_analysis.stats.clusters.bundle.buy_pct)>70%时，
-// 要求 V转回撤幅度(n_pattern_retracement)必须>60%，否则不通过（捆绑筹码集中且回撤不深=风险更高）。
-// 保留 holders 质量校验（优质占比>10% / 散户占比<20% / DEV及关联占比<10%），code.js 没有。
+// v41 改动（相对 v40）：
+// 1. 把 inner_chip_analysis 整体上提到最顶部声明区：与 chip/kline/holders 一起做数据源就绪判断（hasInnerChip），
+//    并把捆绑簇净买入占比 bundleBuyPct/bundleOverLimit 提到顶部一次性取好，下方只做与 V转回撤的联动判断。
+// 2. 逻辑口径与 v40 完全一致（RETRACE_TOLERANCE=0.20，捆绑>70% 时 V转回撤需>60%）。
 
 try {
   const nowSec = Math.floor(Date.now() / 1000)
@@ -21,14 +20,21 @@ try {
   const BUNDLE_BUY_PCT_LIMIT = 70   // 内盘捆绑簇净买入占比门槛（%），超过则加严 V转回撤要求
   const BUNDLE_RETRACE_MIN = 0.6    // 捆绑超门槛时，V转回撤幅度(n_pattern_retracement, 0-1)下限
 
+  // ===== 数据源就绪判断（统一放最顶部）=====
   const hasChip = !!ctx.chip_analysis
   const hasKline = !!ctx.kline_and_indicators && Array.isArray(ctx.kline_and_indicators.avg_price_bars)
   const hasHolders = !!ctx.holders
+  const hasInnerChip = !!ctx.inner_chip_analysis // 未毕业(launch_time=0)时整体为 null
 
   if (!hasChip || !hasKline || !hasHolders) {
-    ctx.log.error(`数据源未就绪 chip(${hasChip}) kline(${hasKline}) holders(${hasHolders})`)
+    ctx.log.error(`数据源未就绪 chip(${hasChip}) kline(${hasKline}) holders(${hasHolders}) innerChip(${hasInnerChip})`)
     return false
   }
+
+  // ===== 内盘筹码分析：顶部一次性取好捆绑簇净买入占比 =====
+  const innerChip = hasInnerChip ? ctx.inner_chip_analysis : null
+  const bundleBuyPct = innerChip?.stats?.clusters?.bundle?.buy_pct ?? 0
+  const bundleOverLimit = bundleBuyPct > BUNDLE_BUY_PCT_LIMIT
 
   const launchTime = ctx.logearn?.launch_time || 0
   const graduated = launchTime > 0
@@ -68,7 +74,7 @@ try {
   const holdersDist = ctx.holders?.distribution || {}
   const goodPct = holdersStats.quality?.good_pct ?? 0
   const goodPctOk = goodPct > GOOD_PCT_LIMIT
-  const retailPct = holdersDist.risk?.retail?.pct ?? 999
+  const retailPct = holdersDist.risk?.retail?.pct ?? 999 // retail 属于推涨组 push
   const retailPctOk = retailPct < RETAIL_PCT_LIMIT
   const devHoldPct = holdersDist.risk?.dev?.pct ?? 999
   const devHoldPctOk = devHoldPct < DEV_HOLD_PCT_LIMIT
@@ -126,9 +132,7 @@ try {
   }
   const hasEffectiveV = !!recentV
 
-  // 内盘筹码捆绑簇净买入占比超门槛时，V转回撤幅度必须更深，否则不通过
-  const bundleBuyPct = ctx.inner_chip_analysis?.stats?.clusters?.bundle?.buy_pct ?? 0
-  const bundleOverLimit = bundleBuyPct > BUNDLE_BUY_PCT_LIMIT
+  // 内盘捆绑簇净买入占比超门槛时，V转回撤幅度必须更深，否则不通过（bundleBuyPct 已在顶部取好）
   const vRetracement = hasEffectiveV ? (recentV?.n_pattern_retracement ?? 0) : 0
   const bundleRetraceOk = !bundleOverLimit || (hasEffectiveV && vRetracement > BUNDLE_RETRACE_MIN)
 
@@ -205,7 +209,7 @@ try {
   const orderTimeStr = new Date(nowSec * 1000).toISOString()
   const orderMcap = mcap
   const orderPriceUsd = currentPriceUsd
-  ctx.log.success(`命中<1.5段> [下单快照] 时间=${orderTimeStr}(${orderTimeSec}) 市值=$${orderMcap.toFixed(0)} 价格=$${orderPriceUsd} | V转阶段=${vStageLabel} [${vStageDetail}] | ${retraceInfo} 持续${(vDurationSec / 60).toFixed(1)}min 持仓${maxHold.toFixed(1)} 卖出${innerSellRatio} 偏离${avgPriceDeviationPct}`)
+  ctx.log.success(`命中<1.5段> [下单快照] 时间=${orderTimeStr}(${orderTimeSec}) 市值=$${orderMcap.toFixed(0)} 价格=$${orderPriceUsd} | V转阶段=${vStageLabel} [${vStageDetail}] | ${retraceInfo} 持续${(vDurationSec / 60).toFixed(1)}min 持仓${maxHold.toFixed(1)} 卖出${innerSellRatio} 偏离${avgPriceDeviationPct} 捆绑${bundleBuyPct.toFixed(1)}`)
   return true
 } catch (e) {
   ctx.log.error('策略异常: ' + (e && e.message ? e.message : String(e)))

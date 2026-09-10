@@ -1,29 +1,29 @@
-// 1.5段策略 v32
-// 【依赖 kline_and_indicators 与 chip_analysis 与 gmgn 与 holders，单币深度分析场景，非实时流批量场景】
+// 1.5段策略 v39（分支版，基于 v32 继续演进，未合并 code.js v34~v36 的改动）
+// 【依赖 kline_and_indicators 与 chip_analysis 与 holders 与 inner_chip_analysis，单币深度分析场景，非实时流批量场景】
 //
-// 本版改动（相对 v31）：
-// 新增 holders 持有人质量校验：优质占比(quality.good_pct)>10% 散户占比(distribution.push.retail.pct)<20% DEV及关联占比(distribution.risk.dev.pct)<10%。
+
+// v37 改动（相对 v36）：
+// 新增捆绑回撤联动校验：内盘筹码捆绑簇净买入占比(inner_chip_analysis.stats.clusters.bundle.buy_pct)>70%时，
+// 要求 V转回撤幅度(n_pattern_retracement)必须>60%，否则不通过（捆绑筹码集中且回撤不深=风险更高）。
+// 保留 holders 质量校验（优质占比>10% / 散户占比<20% / DEV及关联占比<10%），code.js 没有。
 
 try {
   const nowSec = Math.floor(Date.now() / 1000)
-  const RETRACE_TOLERANCE = 0.10
+  const RETRACE_TOLERANCE = 0.20
   const HOLD_LIMIT = 10
   const TRANSFER_LIMIT = 10
   const MIN_V_DURATION = 120 // V转回撤持续时间下限（秒）= 2分钟
   const MCAP_LIMIT = 120000  // 买入市值上限（USD）
   const NEW_LIMIT = 70       // 新钱包持仓上限（%，已扣关注地址）
-  const TOP10_HOLDER_RATE_LIMIT = 30 // gmgn.stat.top_10_holder_rate 上限（%）
-  const CREATOR_HOLD_RATE_LIMIT = 0.5  // gmgn.stat.creator_hold_rate 上限（%）
-  const TOP_RAT_TRADER_PERCENTAGE_LIMIT = 1  // gmgn.stat.top_rat_trader_percentage 上限（%）
-  const DEV_TEAM_HOLD_RATE_LIMIT = 1  // gmgn.stat.dev_team_hold_rate 上限（%）
   const GOOD_PCT_LIMIT = 10    // holders.stats.quality.good_pct 下限（%）
   const RETAIL_PCT_LIMIT = 20  // holders.distribution.push.retail.pct 上限（%）
   const DEV_HOLD_PCT_LIMIT = 10 // holders.distribution.risk.dev.pct 上限（%）
+  const BUNDLE_BUY_PCT_LIMIT = 70   // 内盘捆绑簇净买入占比门槛（%），超过则加严 V转回撤要求
+  const BUNDLE_RETRACE_MIN = 0.6    // 捆绑超门槛时，V转回撤幅度(n_pattern_retracement, 0-1)下限
 
   const hasChip = !!ctx.chip_analysis
   const hasKline = !!ctx.kline_and_indicators && Array.isArray(ctx.kline_and_indicators.avg_price_bars)
   const hasHolders = !!ctx.holders
-  const gmgnStat = ctx.gmgn?.stat || {}
 
   if (!hasChip || !hasKline || !hasHolders) {
     ctx.log.error(`数据源未就绪 chip(${hasChip}) kline(${hasKline}) holders(${hasHolders})`)
@@ -64,21 +64,11 @@ try {
   const shitVolume = ctx.logearn?.shit_volume ?? 999
   const shitOk = shitVolume < 7
 
- 
-  const top10HolderRatePct = (gmgnStat.top_10_holder_rate ?? 0) * 100
-  const top10HolderRateOk = top10HolderRatePct < TOP10_HOLDER_RATE_LIMIT
-  const creatorHoldRatePct = (gmgnStat.creator_hold_rate ?? 0) * 100
-  const creatorHoldRateOk = creatorHoldRatePct < CREATOR_HOLD_RATE_LIMIT
-  const topRatTraderPercentagePct = (gmgnStat.top_rat_trader_percentage ?? 0) * 100
-  const topRatTraderPercentageOk = topRatTraderPercentagePct < TOP_RAT_TRADER_PERCENTAGE_LIMIT
-  const devTeamHoldRatePct = (gmgnStat.dev_team_hold_rate ?? 0) * 100
-  const devTeamHoldRateOk = devTeamHoldRatePct < DEV_TEAM_HOLD_RATE_LIMIT
-
   const holdersStats = ctx.holders?.stats || {}
   const holdersDist = ctx.holders?.distribution || {}
   const goodPct = holdersStats.quality?.good_pct ?? 0
   const goodPctOk = goodPct > GOOD_PCT_LIMIT
-  const retailPct = holdersDist.push?.retail?.pct ?? 999
+  const retailPct = holdersDist.risk?.retail?.pct ?? 999
   const retailPctOk = retailPct < RETAIL_PCT_LIMIT
   const devHoldPct = holdersDist.risk?.dev?.pct ?? 999
   const devHoldPctOk = devHoldPct < DEV_HOLD_PCT_LIMIT
@@ -136,6 +126,12 @@ try {
   }
   const hasEffectiveV = !!recentV
 
+  // 内盘筹码捆绑簇净买入占比超门槛时，V转回撤幅度必须更深，否则不通过
+  const bundleBuyPct = ctx.inner_chip_analysis?.stats?.clusters?.bundle?.buy_pct ?? 0
+  const bundleOverLimit = bundleBuyPct > BUNDLE_BUY_PCT_LIMIT
+  const vRetracement = hasEffectiveV ? (recentV?.n_pattern_retracement ?? 0) : 0
+  const bundleRetraceOk = !bundleOverLimit || (hasEffectiveV && vRetracement > BUNDLE_RETRACE_MIN)
+
   let vDurationSec = 0
   let vDurationOk = false
   if (hasEffectiveV) {
@@ -186,10 +182,6 @@ try {
     ['筹码下大于上', chipBelowAboveOk, `below=${belowPercent.toFixed(1)}/above=${abovePercent.toFixed(1)}`, '下>上'],
     ['成本线上', deviationOk, avgPriceDeviationPct, '>0'],
     ['垃圾盘', shitOk, shitVolume, '<7'],
-    ['前10持有占比', top10HolderRateOk, top10HolderRatePct.toFixed(1), '<30'],
-    ['创建者持仓', creatorHoldRateOk, creatorHoldRatePct.toFixed(2), '<0.5'],
-    ['top_rat_trader占比', topRatTraderPercentageOk, topRatTraderPercentagePct.toFixed(2), '<1'],
-    ['dev团队持仓', devTeamHoldRateOk, devTeamHoldRatePct.toFixed(2), '<1'],
     ['优质占比', goodPctOk, goodPct.toFixed(1), '>10'],
     ['散户占比', retailPctOk, retailPct.toFixed(1), '<20'],
     ['DEV及关联占比', devHoldPctOk, devHoldPct.toFixed(1), '<10'],
@@ -198,7 +190,8 @@ try {
     ['单地址转账', transferOk, maxTransferIn.toFixed(1), '<10'],
     ['有效V转', hasEffectiveV, hasEffectiveV ? 'y' : 'n', 'confirmed&未收尾'],
     ['V转持续min', vDurationOk, hasEffectiveV ? (vDurationSec / 60).toFixed(1) : 'NA', '>2'],
-    ['V转路径', retraceBreakOk, retraceInfo, '低点<成本*1.1'],
+    ['V转路径', retraceBreakOk, retraceInfo, '低点<成本*1.2'],
+    ['捆绑回撤门槛', bundleRetraceOk, `捆绑${bundleBuyPct.toFixed(1)}%${hasEffectiveV ? '/回撤' + (vRetracement * 100).toFixed(1) + '%' : ''}`, bundleOverLimit ? '捆绑>70%时回撤需>60%' : '捆绑<=70%不限'],
   ]
   const passed = checks.every(c => c[1])
   if (!passed) {

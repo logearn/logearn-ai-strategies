@@ -1,16 +1,16 @@
 // ==============================================================
-// 单代币强势盘策略  v1.0.2
+// 单代币强势盘策略  v1.0.3
 // 条件：平台白名单(含 four.meme) + 年龄 1分钟~500分钟 + 市值<12w
-//       + Top10持仓<30% + 创建者持仓<1% + 内鬼<10% + 垃圾钱包<5%
-//       + 买入次数>50 + 成本线偏离 2~120% + AO 上升 + AC 上升
+//       + 垃圾钱包<5% + 买入次数>50 + 成本线偏离 2~120% + AO 上升 + AC 上升
 // 说明：checks 顺序 = 判定优先级，先排最便宜、最易 false 的结构性硬条件，
 //       AO/AC 动量类计算放最后；全程仅一条日志输出。
-// 注：gmgn 里的占比字段均为 0-1 小数，×100 转成百分比。
+// 变更：v1.0.3 去掉全部 GMGN(ctx.gmgn/gmgn_info) 相关代码——
+//       原 Top10持仓%/创建者持仓%/内鬼% 三个 GMGN 依赖项及访问次数展示一并移除。
 //     筹码分析(ctx.chip_analysis)仅做日志展示、不参与判定。
 // ==============================================================
 
 // ---------- 版本号 ----------
-const VERSION = 'v1.0.2'
+const VERSION = 'v1.0.3'
 
 // ---------- 工具函数 ----------
 const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : 0 }
@@ -22,9 +22,6 @@ const DEV_MIN = 2           // 成本线偏离下限（%）
 const DEV_MAX = 120         // 成本线偏离上限（%）
 const AGE_MIN_SEC = 60      // 生命周期下限：< 1 分钟直接淘汰
 const AGE_MAX_MIN = 500     // 生命周期上限（分钟）
-const TOP10_MAX = 30        // Top10 持仓% 上限
-const CREATOR_MAX = 1       // 创建者持仓% 上限
-const RAT_MAX = 10          // 内鬼/插队交易者% 上限
 const SHIT_MAX = 5          // 垃圾钱包占比上限（%）
 const BUYTX_MIN = 50        // 24h 买入次数下限
 
@@ -41,18 +38,9 @@ const ALLOW_PLATFORMS = [
 const ki = ctx.kline_and_indicators || {}
 const aoBars = Array.isArray(ki.ao_bars) ? ki.ao_bars : []
 const logearn = ctx.logearn || {}
-const gmgn = ctx.gmgn || {}
-const dev = gmgn.dev || {}
-const stat = gmgn.stat || {}
 const chip = ctx.chip_analysis || {}
 const symbol = logearn.symbol || ki.symbol || 'UNKNOWN'
-
-const visitingCount = gmgn.visiting_count != null ? gmgn.visiting_count : 0
-
-// gmgn 占比字段（0-1 小数 → 百分比）
-const top10Pct = num(dev.top_10_holder_rate) * 100
-const creatorPct = num(stat.creator_hold_rate) * 100
-const ratPct = num(stat.top_rat_trader_percentage) * 100
+const innerChip = ctx.inner_chip_analysis || {}
 
 // ---------- 筹码分析（仅展示，不参与判定）----------
 const chipAbove = num(chip.above_percent)          // 当前价上方筹码%（抛压）
@@ -105,9 +93,6 @@ const checks = [
   ['年龄(秒)', launchTime > 0 && ageSec >= AGE_MIN_SEC, ageSec, '>= ' + AGE_MIN_SEC],
   ['年龄(分)', launchTime > 0 && ageMin <= AGE_MAX_MIN, Number.isFinite(ageMin) ? ageMin.toFixed(1) : 'NA', '<= ' + AGE_MAX_MIN],
   ['市值', effMcap > 0 && effMcap < MCAP_MAX, effMcap.toFixed(0), '>0 且 < ' + MCAP_MAX],
-  ['Top10持仓%', top10Pct < TOP10_MAX, top10Pct.toFixed(1), '< ' + TOP10_MAX],
-  ['创建者持仓%', creatorPct < CREATOR_MAX, creatorPct.toFixed(2), '< ' + CREATOR_MAX],
-  ['内鬼%', ratPct < RAT_MAX, ratPct.toFixed(1), '< ' + RAT_MAX],
   ['垃圾钱包%', num(logearn.shit_volume) < SHIT_MAX, num(logearn.shit_volume).toFixed(1), '< ' + SHIT_MAX],
   ['买入次数', buyTxD1 > BUYTX_MIN, buyTxD1, '> ' + BUYTX_MIN],
   ['偏离%', deviationPct > DEV_MIN && deviationPct < DEV_MAX, deviationPct.toFixed(1), DEV_MIN + '~' + DEV_MAX],
@@ -116,8 +101,8 @@ const checks = [
 ]
 
 // ---------- 输出（全程仅一条日志，筹码摘要仅拼接展示、不参与 passed）----------
-const head = VERSION + ' 访问' + visitingCount + ' [' + symbol + '] K' + ki.resolution + '  ' + chipSummary
-const detail = checks.map(([name, ok, actual, expect]) => `${name}(${ok}): ${actual} [期望 ${expect}]`).join('  |  ')
+const head = VERSION + ' [' + symbol + '] K' + ki.resolution + '  ' + chipSummary
+const detail = checks.map(([name, ok, actual, expect]) => `${name}${ok ? '✅' : '❌'}(${ok}): ${actual} [期望 ${expect}]`).join('  |  ')
 const passed = checks.every((c) => c[1])
 if (!passed) {
   const fails = checks.filter((c) => !c[1]).map((c) => `${c[0]}=${c[2]}`).join(' ')

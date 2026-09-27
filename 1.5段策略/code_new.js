@@ -1,10 +1,8 @@
-// 1.5段策略 v41（在 v40 基础上按我的风格微调）
+// 1.5段策略 v43（在 v42 基础上新增：聪明钱S1(P元帅/KOL/大户)持仓占比 < 30%）
 // 【依赖 kline_and_indicators 与 chip_analysis 与 holders 与 inner_chip_analysis，单币深度分析场景，非实时流批量场景】
 //
-// v41 改动（相对 v40）：
-// 1. 把 inner_chip_analysis 整体上提到最顶部声明区：与 chip/kline/holders 一起做数据源就绪判断（hasInnerChip），
-//    并把捆绑簇净买入占比 bundleBuyPct/bundleOverLimit 提到顶部一次性取好，下方只做与 V转回撤的联动判断。
-// 2. 逻辑口径与 v40 完全一致（RETRACE_TOLERANCE=0.20，捆绑>70% 时 V转回撤需>60%）。
+// v43 改动（相对 v42）：
+// 1. 新增 S1 门槛：holders.distribution.push.smart_t1.pct < 30%（聪明钱 T1：P元帅/KOL/大户等）。
 
 try {
   const nowSec = Math.floor(Date.now() / 1000)
@@ -17,6 +15,8 @@ try {
   const GOOD_PCT_LIMIT = 10    // holders.stats.quality.good_pct 下限（%）
   const RETAIL_PCT_LIMIT = 20  // holders.distribution.push.retail.pct 上限（%）
   const DEV_HOLD_PCT_LIMIT = 10 // holders.distribution.risk.dev.pct 上限（%）
+  const UNDERWATER_PCT_LIMIT = 35 // holders.distribution.risk.underwater.pct 上限（%）
+  const SMART_T1_PCT_LIMIT = 30 // holders.distribution.push.smart_t1.pct 上限（%），S1=P元帅/KOL/大户
   const BUNDLE_BUY_PCT_LIMIT = 70   // 内盘捆绑簇净买入占比门槛（%），超过则加严 V转回撤要求
   const BUNDLE_RETRACE_MIN = 0.6    // 捆绑超门槛时，V转回撤幅度(n_pattern_retracement, 0-1)下限
 
@@ -78,6 +78,10 @@ try {
   const retailPctOk = retailPct < RETAIL_PCT_LIMIT
   const devHoldPct = holdersDist.risk?.dev?.pct ?? 999
   const devHoldPctOk = devHoldPct < DEV_HOLD_PCT_LIMIT
+  const underwaterPct = holdersDist.risk?.underwater?.pct ?? 999
+  const underwaterOk = underwaterPct < UNDERWATER_PCT_LIMIT
+  const smartT1Pct = holdersDist.push?.smart_t1?.pct ?? 999 // S1=P元帅/KOL/大户
+  const smartT1Ok = smartT1Pct < SMART_T1_PCT_LIMIT
 
   // 关注地址集合 + 关注地址持仓占比
   const followedSet = new Set()
@@ -189,6 +193,8 @@ try {
     ['优质占比', goodPctOk, goodPct.toFixed(1), '>10'],
     ['散户占比', retailPctOk, retailPct.toFixed(1), '<20'],
     ['DEV及关联占比', devHoldPctOk, devHoldPct.toFixed(1), '<10'],
+    ['套牢盘占比', underwaterOk, underwaterPct.toFixed(1), '<35'],
+    ['S1占比', smartT1Ok, smartT1Pct.toFixed(1), '<30'],
     ['新钱包', newOk, `${newVolumeAdj.toFixed(1)}(原${newVolumeRaw}-关注${followedHoldPercent.toFixed(1)})`, '<70'],
     ['单地址持仓', holdOk, maxHold.toFixed(1), '<10'],
     ['单地址转账', transferOk, maxTransferIn.toFixed(1), '<10'],
@@ -209,7 +215,7 @@ try {
   const orderTimeStr = new Date(nowSec * 1000).toISOString()
   const orderMcap = mcap
   const orderPriceUsd = currentPriceUsd
-  ctx.log.success(`命中<1.5段> [下单快照] 时间=${orderTimeStr}(${orderTimeSec}) 市值=$${orderMcap.toFixed(0)} 价格=$${orderPriceUsd} | V转阶段=${vStageLabel} [${vStageDetail}] | ${retraceInfo} 持续${(vDurationSec / 60).toFixed(1)}min 持仓${maxHold.toFixed(1)} 卖出${innerSellRatio} 偏离${avgPriceDeviationPct} 捆绑${bundleBuyPct.toFixed(1)}`)
+  ctx.log.success(`命中<1.5段> [下单快照] 时间=${orderTimeStr}(${orderTimeSec}) 市值=$${orderMcap.toFixed(0)} 价格=$${orderPriceUsd} | V转阶段=${vStageLabel} [${vStageDetail}] | ${retraceInfo} 持续${(vDurationSec / 60).toFixed(1)}min 持仓${maxHold.toFixed(1)} 卖出${innerSellRatio} 偏离${avgPriceDeviationPct} 套牢${underwaterPct.toFixed(1)} S1=${smartT1Pct.toFixed(1)} 捆绑${bundleBuyPct.toFixed(1)}`)
   return true
 } catch (e) {
   ctx.log.error('策略异常: ' + (e && e.message ? e.message : String(e)))

@@ -1,16 +1,16 @@
 // ==============================================================
-// 单代币强势盘策略  v1.0.3
-// 条件：平台白名单(含 four.meme) + 年龄 1分钟~500分钟 + 市值<12w
-//       + 垃圾钱包<5% + 买入次数>50 + 成本线偏离 2~120% + AO 上升 + AC 上升
-// 说明：checks 顺序 = 判定优先级，先排最便宜、最易 false 的结构性硬条件，
-//       AO/AC 动量类计算放最后；全程仅一条日志输出。
-// 变更：v1.0.3 去掉全部 GMGN(ctx.gmgn/gmgn_info) 相关代码——
-//       原 Top10持仓%/创建者持仓%/内鬼% 三个 GMGN 依赖项及访问次数展示一并移除。
-//     筹码分析(ctx.chip_analysis)仅做日志展示、不参与判定。
+// 单代币强势盘策略  v1.0.4
+// 变更：去掉所有 GMGN(ctx.gmgn) 依赖——
+//   · 移除"创建者持仓/内鬼"两条（原取自 gmgn.stat，无同源替代字段，直接删除）
+//   · 移除日志里的 visiting_count（gmgn 字段）
+// 保留：四链平台白名单 + 年龄 1分钟~500分钟 + 市值<12w
+//       + 垃圾钱包<5% + 优质持仓>1% + 买入次数>50
+//       + 成本线偏离 2~120% + AO 上升 + AC 上升
+// 说明：checks 顺序 = 判定优先级；筹码分析仅日志展示、不参与判定；全程仅一条日志。
 // ==============================================================
 
 // ---------- 版本号 ----------
-const VERSION = 'v1.0.3'
+const VERSION = 'v1.0.4'
 
 // ---------- 工具函数 ----------
 const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : 0 }
@@ -24,23 +24,84 @@ const AGE_MIN_SEC = 60      // 生命周期下限：< 1 分钟直接淘汰
 const AGE_MAX_MIN = 500     // 生命周期上限（分钟）
 const SHIT_MAX = 5          // 垃圾钱包占比上限（%）
 const BUYTX_MIN = 50        // 24h 买入次数下限
+const GOOD_PCT_MIN = 1      // Holders 优质持仓占比下限（%）
 
-// 发射平台白名单
-const ALLOW_PLATFORMS = [
-  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump 内盘
-  'FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4g6W1', // LetsBonk 1
-  'BuM6KDpWiTcxvrpXywWFiw45R2RNH8WURdvqoTDV1BW4', // LetsBonk 2
-  'four.meme',                                    // Four.meme
-  'binance_four.meme'                             // Binance Four.meme
-]
+// 发射平台白名单：以下为四链全量列表，删除或注释某一行即可禁用该平台。
+// 按链匹配平台白名单；Solana 地址区分大小写，EVM 平台标识统一小写。
+const CHAIN_PLATFORMS = {
+  // Solana (chain 3)
+  3: {
+    '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P': 'Pump',
+    '6BwHHDg3u1854jC8PDLXvR4spTcLNaoBxLJNGC4nTESt': 'StonkFun 1',
+    '4E876qZTE9FJMrBzgVtBrSrzz2TLivB5Y5QXPjB4gZL7': 'StonkFun 2',
+  },
+  // BSC (chain 56)
+  56: {
+    'four.meme': 'Four',
+    'binance_four.meme': 'Binance Four',
+    'flap': 'Flap',
+    '0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0': 'Flap',
+    '0xec4549cadce5da21df6e6422d448034b5233bfbc': 'Four',
+    '0x5c952063c7fc8610ffdb798152d69f0b9550762b': 'Four',
+    '0x3508dca95a64c9378cb07ef6f40553a50905372a': 'Four',
+  },
+  // Robinhood Chain (chain 4663)
+  4663: {
+    '0x0000ffffbe8efe702c8703ae3477ff5de3d319c0': 'Pools.instant',
+    '0x22e99278308b393ea1260859b181ad7e78f5eeed': 'Long.xyz',
+    '0x8660a7f019c7943b0b0a91b8e39aff3b6db6ae62': 'Pair.fund',
+    '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e': 'Pons V2'
+  },
+  // Arc / Circle Arc (chain 5042)
+  5042: {
+    '0xd68fdd69dbdb92ff0770e54c8a0840a7ba8af1b5': 'Arclab',
+    '0x24196cd6e534cfce8f480b53e70809b68ea86f29': 'Arcpad',
+    '0xb021be536808f551b31789422fd28a6c9c6e97da': 'Argus',
+    '0x3d0b83e115205edf37e48a8eb6d92e2c7492a00c': 'ARK Launch',
+    '0x9b9a136d04e8e19a934de062f0fbb929b3c7aedb': 'ARK Launch',
+    '0x16d4c13ad2a23288aa9b9384f24084edc8cbef41': 'Bullcheese',
+    '0xdfef2f90f7e52609cc89b80b68ff6a1c86c4ddc4': 'Dyor.fun',
+    '0x6a62919ccbf0c19e0c4e084f986b582b4492dda4': 'Faze',
+    '0x3f29dd25d1f6ad3d09d1d4a880f8a869e3039153': 'Lift',
+    '0x1ca37b3c40e89aad48b5ad3352269c2293cfd3da': 'Lift',
+    '0xe740cc40b4b173b62af54d79d50db34610600c54': 'LiquidLaunch',
+    '0x3324d45dbda511e3333f5177c90f7c5dd30d24b5': 'Long.supply',
+    '0xb6c6f77ee74af874a183bfd77dd0176d1ac91de6': 'Minara',
+    '0x20eead6db6b3d0a4491e9073119dd0ebff166acc': 'O1',
+    '0x815542e8b392389a1389e22e588e4b62a67ade72': 'OpenLaunch',
+    '0x7b9720bc177e8b6f96962e9b15891f27108cad40': 'Peach',
+    '0x4b638c1502a07a8e1a26112ee98f51a3f34bc93a': 'RadarDEX',
+    '0x18d33de5eefb2f91b09385f35f6a1317659cc1f9': 'Synthra',
+    '0xcad7ee36ac193bf2eddb7b3e2736c5bdb8269c8b': 'TollyPad',
+    '0x0dcad158e98bc24455f9e94f46709d8a5f6d1255': 'Warp',
+    '0x27117b11c5c6f886eb1ffb32d814557aad4f6c43': 'Zyora',
+  },
+}
+const platform = ctx.logearn?.platform
+const chain = Number(ctx.logearn?.chain)
+const chainPlatforms = CHAIN_PLATFORMS[chain]
+const platformKey = chain === 3 ? String(platform || '') : String(platform || '').toLowerCase()
+const chainPlatformName = chainPlatforms && Object.prototype.hasOwnProperty.call(chainPlatforms, platformKey)
+  ? chainPlatforms[platformKey] : null
+const isPump = chain === 3 && (chainPlatformName === 'Pump' || chainPlatformName === 'Pump AMM')
+const isFour = chain === 56 && (chainPlatformName === 'Four' || chainPlatformName === 'Binance Four')
+const isTargetPlatform = !!chainPlatformName
+  && !(isPump && ctx.logearn?.is_fake_pump)
+  && !(isFour && ctx.logearn?.is_fake_four)
 
-// ---------- 取数据 ----------
+const platformLabel = chainPlatformName ? `${chainPlatformName}(chain ${chain})`
+  : `${platform || 'unknown'}(chain ${chain})`
+
+// ---------- 取数据（已移除 ctx.gmgn 全部依赖）----------
 const ki = ctx.kline_and_indicators || {}
 const aoBars = Array.isArray(ki.ao_bars) ? ki.ao_bars : []
 const logearn = ctx.logearn || {}
 const chip = ctx.chip_analysis || {}
 const symbol = logearn.symbol || ki.symbol || 'UNKNOWN'
-const innerChip = ctx.inner_chip_analysis || {}
+
+// ---------- Holders（LogEarn 自有快照，不需 GMGN key）----------
+const holdersStats = ctx.holders?.stats || {}
+const goodPct = num(holdersStats.quality?.good_pct)   // 优质持仓占比%（已是百分比口径）
 
 // ---------- 筹码分析（仅展示，不参与判定）----------
 const chipAbove = num(chip.above_percent)          // 当前价上方筹码%（抛压）
@@ -89,11 +150,12 @@ const acOk = ac0 !== null && ac1 !== null && ac0 > 0 && ac0 > ac1
 
 // ---------- 逐条判定（顺序=优先级）----------
 const checks = [
-  ['平台', ALLOW_PLATFORMS.indexOf(logearn.platform) !== -1, String(logearn.platform), '白名单(含four.meme)'],
+  ['平台', isTargetPlatform, platformLabel, 'Solana(3)/BSC(56)/Robinhood(4663)/Arc(5042)平台白名单'],
   ['年龄(秒)', launchTime > 0 && ageSec >= AGE_MIN_SEC, ageSec, '>= ' + AGE_MIN_SEC],
   ['年龄(分)', launchTime > 0 && ageMin <= AGE_MAX_MIN, Number.isFinite(ageMin) ? ageMin.toFixed(1) : 'NA', '<= ' + AGE_MAX_MIN],
   ['市值', effMcap > 0 && effMcap < MCAP_MAX, effMcap.toFixed(0), '>0 且 < ' + MCAP_MAX],
   ['垃圾钱包%', num(logearn.shit_volume) < SHIT_MAX, num(logearn.shit_volume).toFixed(1), '< ' + SHIT_MAX],
+  ['优质持仓%', goodPct > GOOD_PCT_MIN, goodPct.toFixed(2), '> ' + GOOD_PCT_MIN],
   ['买入次数', buyTxD1 > BUYTX_MIN, buyTxD1, '> ' + BUYTX_MIN],
   ['偏离%', deviationPct > DEV_MIN && deviationPct < DEV_MAX, deviationPct.toFixed(1), DEV_MIN + '~' + DEV_MAX],
   ['AO', aoOk, ao0.toFixed(0) + '/' + ao1.toFixed(0), 'ao0>0 且 ao0>ao1'],
@@ -102,7 +164,7 @@ const checks = [
 
 // ---------- 输出（全程仅一条日志，筹码摘要仅拼接展示、不参与 passed）----------
 const head = VERSION + ' [' + symbol + '] K' + ki.resolution + '  ' + chipSummary
-const detail = checks.map(([name, ok, actual, expect]) => `${name}${ok ? '✅' : '❌'}(${ok}): ${actual} [期望 ${expect}]`).join('  |  ')
+const detail = checks.map(([name, ok, actual, expect]) => `${name}(${ok}): ${actual} [期望 ${expect}]`).join('  |  ')
 const passed = checks.every((c) => c[1])
 if (!passed) {
   const fails = checks.filter((c) => !c[1]).map((c) => `${c[0]}=${c[2]}`).join(' ')

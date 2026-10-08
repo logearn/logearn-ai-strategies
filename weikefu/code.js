@@ -1,23 +1,34 @@
-// 威科夫策略 v3.6 精简版
-// SC → AR → SOS 结构（ST仅展示）；V转高点至所选信号时间必须 > 2小时（B口径：signalTime - top_price_time）。
-// v3.5：同步1.5段策略的平台白名单及假Pump/Four过滤。
-// v3.1：已完成突破的 V转也参与检测，按 signalTime 选最新已确认信号。
-// 历史最高市值 max_up_mcap 必须 > 500k。
-// v3.0 新增：当前市值 > 100k（logearn.mcap）。
-// 不限制 SC 至 SOS 区间时长、SOS 成交量；SOS 仅要求最新 close > AR 上沿。
-// 依赖 logearn.v_breakout_volume_list、kline_and_indicators.kline_bars；chip_analysis.price_bars 仅用于日志。
-// SC低点至AR高点的区间筹码占比仅输出，不参与判断；边界桶按市值重叠宽度估算。
-// V转用于定位 SC；当前最新K线为SOS候选，之前各次已确认反弹的最高点为AR。
-// ST 从最终AR之后至SOS候选之前寻找，仅展示支撑测试，不参与命中判断。
-// 移除 SC 放量、前置均量样本数、SOS 阳线/收位、成本线、持仓占比和池子过滤。
-// SOS：最新 close > AR 上沿；不检查前一根位置，允许最新 K线尚未收线。
-// 历史突破不直接命中；当前仍在上沿上方时可持续满足 SOS。
-const VERSION = 'wyckoff-v3.6'
+// ==============================================================
+// 威科夫策略 v1
+// 执行顺序：前置静默过滤 → SC/AR/SOS 结构判定与日志。
+//
+// 【前置过滤】以下全部满足才继续，否则静默返回 false：
+//   1. 平台在 Solana(3)/BSC(56)/Robinhood(4663)/Arc(5042)白名单中，排除假Pump/Four。
+//   2. 当前市值 > $100,000（logearn.mcap）。
+//
+// 【命中条件】以下全部满足才返回 true，否则输出未命中日志：
+//   1. 历史最高市值 max_up_mcap > $500,000。
+//   2. 内盘钱包数：有 inner_chip_analysis 时要求 wallet_count > 100；为 null（如部分 Robinhood 无内盘）则跳过不限制。
+//   3. 有效V转（最新 confirmed，含已完成突破）。
+//   4. V转持续时间（B口径：signalTime - top_price_time）：
+//      币龄≤1天 → >2小时；币龄>1天 → >7小时（挡短命小威科夫）。
+//   5. SC 定位到 V低点附近已收线 bar。
+//   6. AR 反弹 >=+5% 且已回落确立。
+//   7. SOS：最新 close > AR 上沿（允许最新K线未收线）。
+//
+// 【仅展示】ST 支撑测试、SC～AR 区间筹码占比不参与判定。
+// 依赖 logearn.v_breakout_volume_list、kline_and_indicators.kline_bars、inner_chip_analysis；
+// chip_analysis.price_bars 仅用于日志。
+// ==============================================================
+const VERSION = 'v1'
 
 // ---------- 参数 ----------
 const MIN_HISTORICAL_MCAP = 500000 // 历史最高市值（USD），严格大于500k
 const MIN_MCAP = 100000 // 当前市值下限（USD），严格大于 100k
-const V_MIN_DURATION_SEC = 2 * 3600 // B口径：V转signalTime减高点时间，严格大于2小时
+const MIN_INNER_WALLET_COUNT = 100 // 内盘净买入去重钱包数下限，严格大于100
+const AGE_DAY_SEC = 24 * 3600 // 币龄分档阈值：1天
+const V_MIN_DURATION_YOUNG_SEC = 2 * 3600 // 币龄≤1天：V转时长严格大于2小时
+const V_MIN_DURATION_OLD_SEC = 7 * 3600 // 币龄>1天：V转时长严格大于7小时
 const V_MIN_RETRACEMENT = 0.60 // 所选V转回撤深度，严格大于60%
 const SC_TIME_TOLERANCE = 3  // SC 定位容差（按 K线根数 × 实际bar间距）
 const AR_MIN_RALLY = 0.05    // AR 有效反弹幅度下限（v2.1 放宽 10%→5%，横盘窄区间币反弹幅度小）
@@ -126,11 +137,23 @@ try {
   const platformLabel = chainPlatformName ? `${chainPlatformName}(chain ${chain})`
     : `${platform || 'unknown'}(chain ${chain})`
 
-  // ---------- 0. 当前市值 ----------
+  // ---------- 0. 当前市值 / 内盘钱包数 ----------
   const mcap = num(logearn.mcap)
   const mcapOk = mcap > MIN_MCAP
   const historicalMcap = num(logearn.max_up_mcap)
   const historicalMcapOk = historicalMcap > MIN_HISTORICAL_MCAP
+  // 无内盘（如部分 Robinhood）时 inner_chip_analysis 为 null → 跳过不限制；有数据才卡 wallet_count
+  const innerChip = ctx.inner_chip_analysis
+  const innerWalletCount = innerChip ? num(innerChip.wallet_count) : 0
+  const innerWalletCountOk = !innerChip || innerWalletCount > MIN_INNER_WALLET_COUNT
+
+  // ---------- 前置静默条件 beforeChecks（不过则静默返回，不打日志）----------
+  // 条件：1.平台白名单(排除假Pump/Four)  2.当前市值 > $100,000
+  const beforeChecks = [
+    ['平台', isTargetPlatform, platformLabel, 'Solana(3)/BSC(56)/Robinhood(4663)/Arc(5042)平台白名单，排除假Pump/Four'],
+    ['当前市值', mcapOk, '$' + Math.round(mcap), '> ' + MIN_MCAP],
+  ]
+  if (!beforeChecks.every((c) => c[1])) return false
 
   // ---------- 1. 消费 V转信号（取最新 confirmed，包含已完成突破的信号） ----------
   const vList = Array.isArray(logearn.v_breakout_volume_list) ? logearn.v_breakout_volume_list : []
@@ -146,8 +169,13 @@ try {
   const vRetracement = hasEffectiveV ? Number(recentV.n_pattern_retracement) : NaN
   const vRetracementValid = hasEffectiveV && recentV.n_pattern_retracement != null && Number.isFinite(vRetracement) && vRetracement >= 0 && vRetracement <= 1
   const vRetracementOk = vRetracementValid && vRetracement > V_MIN_RETRACEMENT
+  // 币龄分档决定 V 时长门槛：≤1天仍 >2h；>1天抬到 >7h，挡 3~4h 短命小威科夫
+  const nowSec = Math.floor(Date.now() / 1000)
+  const swapBegin = toSec(logearn.swap_begin_time)
+  const tokenAgeSec = swapBegin > 0 ? Math.max(0, nowSec - swapBegin) : 0
+  const vMinDurationSec = tokenAgeSec > AGE_DAY_SEC ? V_MIN_DURATION_OLD_SEC : V_MIN_DURATION_YOUNG_SEC
   const vDurationSec = vSignalTime - vTopTime
-  const vDurationOk = hasEffectiveV && vTopTime > 0 && vSignalTime > 0 && vDurationSec > V_MIN_DURATION_SEC
+  const vDurationOk = hasEffectiveV && vTopTime > 0 && vSignalTime > 0 && vDurationSec > vMinDurationSec
 
   // ---------- 2. K线整理（原始新→旧，转为时间正序） ----------
   const rawBars = Array.isArray(ki.kline_bars) ? ki.kline_bars : []
@@ -278,13 +306,13 @@ try {
   const fmt = (x, d = 6) => Number.isFinite(x) ? Number(Number(x).toFixed(d)) : 'NA'
   const chipInfo = '区间筹码占比（仅展示）: ' + (!chipDataOk ? '筹码数据缺失或无效' : !chipRangeOk ? 'SC/AR区间未确定' : '估算' + fmt(rangeChipPercent, 2) + '% / 市值[' + fmt(scLow, 2) + ', ' + fmt(arHigh, 2) + ']（占总发行量，边界桶按重叠折算）')
   const stInfo = 'ST（仅展示）: ' + (!hasSt ? '无ST' : '低' + fmt(stLow) + '/SC低' + fmt(scLow) + (stHoldOk ? '（支撑未破）' : '（低于SC的95%）'))
+  // 平台/当前市值已在 beforeChecks 静默过滤，此处不再重复
   const checks = [
-    ['平台', isTargetPlatform, platformLabel, 'Solana(3)/BSC(56)/Robinhood(4663)/Arc(5042)平台白名单，排除假Pump/Four'],
     ['历史最高市值', historicalMcapOk, '$' + Math.round(historicalMcap), '> ' + MIN_HISTORICAL_MCAP],
-    ['当前市值', mcapOk, '$' + Math.round(mcap), '> 100000'],
+    ['内盘钱包数', innerWalletCountOk, innerChip ? String(innerWalletCount) : '无内盘(跳过)', innerChip ? '> ' + MIN_INNER_WALLET_COUNT : 'null 不限制'],
     ['有效V转', hasEffectiveV, hasEffectiveV ? 'y@' + num(recentV.signalTime) : 'n', '最新confirmed（含已完成突破）'],
     // ['V转回撤深度', vRetracementOk, vRetracementValid ? fmt(vRetracement * 100, 2) + '%' : '回撤数据缺失或无效', '> ' + (V_MIN_RETRACEMENT * 100) + '%'],
-    ['V转持续时间', vDurationOk, vTopTime > 0 && vSignalTime > 0 ? vDurationSec + '秒' : '时间缺失', '> ' + V_MIN_DURATION_SEC + '秒（signalTime - top_price_time）'],
+    ['V转持续时间', vDurationOk, vTopTime > 0 && vSignalTime > 0 ? vDurationSec + '秒/币龄' + tokenAgeSec + '秒' : '时间缺失', '> ' + vMinDurationSec + '秒（' + (tokenAgeSec > AGE_DAY_SEC ? '币龄>1天' : '币龄≤1天') + '，signalTime - top_price_time）'],
     ['SC定位', scOk, scOk ? 'idx' + scIdx + '@' + scBar.t + '(粒度' + resolutionSec + 's)' : '未定位', 'V低点匹配到已收线bar'],
     ['AR反弹', arOk, arOk || arIdx > 0 ? '候选' + arCandidateCount + '个/最高' + fmt(arHigh) + '(+' + (arRallyPct * 100).toFixed(1) + '%)' + (arConfirmed ? '已确立' : '未回落') : 'NA', '>=+' + (AR_MIN_RALLY * 100) + '%且已回落确立，取SOS之前最高候选'],
     ['SOS突破', hasSos, latestBar ? '最新收' + fmt(latestBar.c) + '/上沿' + fmt(arHigh) : 'K线不足', '最新收 > 已确认AR上沿'],
@@ -293,9 +321,8 @@ try {
   // 结构可见性：SC 后已收线的 bar 数。太少说明 SC 刚发生、AR/ST/SOS 还没来得及形成——
   // 这是"等待结构展开"，不是"形态不符"，日志上区分开
   const barsAfterSc = scOk ? scMaxIdx - scIdx : 0
-  const phase = !isTargetPlatform ? '平台不符'
-    : !mcapOk ? '市值不足'
-    : !historicalMcapOk ? '历史最高市值不足'
+  const phase = !historicalMcapOk ? '历史最高市值不足'
+    : !innerWalletCountOk ? '内盘钱包数不足'
     : !hasEffectiveV ? '无V转'
     : !scOk ? 'SC未定位'
     : !arOk ? (barsAfterSc < 2 ? 'A阶段(SC刚发生,结构未展开,SC后仅' + barsAfterSc + '根收线bar,等待)' : 'A阶段(SC后待AR确立)')

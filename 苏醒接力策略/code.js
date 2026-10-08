@@ -40,7 +40,6 @@ const CHAIN_PLATFORMS = {
   },
   // Robinhood Chain (chain 4663)
   4663: {
-    'uniswap': 'Uniswap',
     '0xc783221ab1db0244203458417981b4631e80b988': 'Launch.fun v1',
     '0x6fda94aceedc5a97171469a8873d00fb9983bb8c': 'Launch.fun v2',
     '0x77dc6f6361b7b99456fc3761ce5b7dda80d83f9d': 'Trench.today',

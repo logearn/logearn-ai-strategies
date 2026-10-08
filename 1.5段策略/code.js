@@ -1,10 +1,17 @@
-// 1.5段策略 v41（在 v40 基础上按我的风格微调）
-// 【依赖 kline_and_indicators 与 chip_analysis 与 holders 与 inner_chip_analysis，单币深度分析场景，非实时流批量场景】
+// ==============================================================
+// 1.5 段策略 v1（release v1）
+// 作用：在 V 转反弹阶段筛选可下单候选，依赖 K 线、筹码、持仓和内盘筹码快照。
 //
-// v41 改动（相对 v40）：
-// 1. 把 inner_chip_analysis 整体上提到最顶部声明区：与 chip/kline/holders 一起做数据源就绪判断（hasInnerChip），
-//    并把捆绑簇净买入占比 bundleBuyPct/bundleOverLimit 提到顶部一次性取好，下方只做与 V转回撤的联动判断。
-// 2. 逻辑口径与 v40 完全一致（RETRACE_TOLERANCE=0.20，捆绑>70% 时 V转回撤需>60%）。
+// 【数据源】chip_analysis、kline_and_indicators、holders 必须就绪；
+//            inner_chip_analysis 可为空（未毕业时按无内盘筹码处理）。
+// 【平台】Solana/BSC/Robinhood/Arc 四链发射平台白名单，排除假 Pump/Four。
+// 【市值与持仓】市值 0~$120,000；优质持仓 >10%；散户筹码 <20%；DEV及关联 <10%；
+//              新钱包 <70%；Top5 单钱包持仓 <=10%；Top5 转入筹码 <=10%。
+// 【V转结构】使用有效 V 转，要求回调时长 >120 秒，并验证低点低于成本线×1.2；
+//             当前持仓、内盘卖出率和价格偏离也必须满足对应阈值。
+// 【捆绑风控】内盘捆绑簇净买入 >70% 时，V 转回撤幅度必须 >60%。
+// 【输出】所有条件通过后输出 1.5 段下单快照；任一条件失败返回 false。
+// ==============================================================
 
 try {
   const nowSec = Math.floor(Date.now() / 1000)
@@ -76,7 +83,6 @@ try {
     },
     // Robinhood Chain (chain 4663)
     4663: {
-      'uniswap': 'Uniswap',
       '0xc783221ab1db0244203458417981b4631e80b988': 'Launch.fun v1',
       '0x6fda94aceedc5a97171469a8873d00fb9983bb8c': 'Launch.fun v2',
       '0x77dc6f6361b7b99456fc3761ce5b7dda80d83f9d': 'Trench.today',

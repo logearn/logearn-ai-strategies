@@ -1,9 +1,18 @@
-// 1.5段策略 v45（在 v44 基础上：时长限制改为「毕业后时长 <= 15h」）
-// 【依赖 kline_and_indicators 与 chip_analysis 与 holders 与 inner_chip_analysis，单币深度分析场景，非实时流批量场景】
+// ==============================================================
+// 1.5 段策略 v45（单币深度分析版）
+// 依赖：kline_and_indicators、chip_analysis、holders、inner_chip_analysis；非实时流批量场景。
 //
-// v45 改动（相对 v44）：
-// 1. 时长门槛从「开盘(swap_begin_time)至今 <= 15h」改为「毕业(launch_time)至今 <= 15h」。
-// 平台筛选更新：与 code.js 同步四链平台白名单，保留 Pump/Four 假盘过滤。
+// 【版本变更】毕业(launch_time)至今 <=15 小时；平台筛选与 code.js 同步四链白名单，
+//            并保留 Pump/Four 假盘过滤。
+// 【数据源】chip_analysis、K线、holders 必须就绪；inner_chip_analysis 可为空。
+// 【平台与市值】四链白名单；市值 0~$200,000。
+// 【持仓结构】优质持仓 >10%；散户 <20%；DEV及关联 <10%；套牢盘 <35%；S1 <30%；
+//              新钱包 <70%；Top5 单钱包持仓 <=10%；Top5 转入筹码 <=10%。
+// 【V转结构】有效 V 转回调持续 >120 秒，低点低于成本线×1.2；当前持仓、内盘卖出率、
+//             价格偏离和毕业后时长均需满足策略条件。
+// 【捆绑风控】内盘捆绑簇净买入 >70% 时，V 转回撤幅度必须 >60%。
+// 【输出】全部条件通过后输出 1.5 段下单快照；任一条件失败返回 false。
+// ==============================================================
 
 try {
   const nowSec = Math.floor(Date.now() / 1000)
@@ -11,7 +20,7 @@ try {
   const HOLD_LIMIT = 10
   const TRANSFER_LIMIT = 10
   const MIN_V_DURATION = 120 // V转回撤持续时间下限（秒）= 2分钟
-  const MCAP_LIMIT = 120000  // 买入市值上限（USD）
+  const MCAP_LIMIT = 200000  // 买入市值上限（USD）
   const NEW_LIMIT = 70       // 新钱包持仓上限（%，已扣关注地址）
   const GOOD_PCT_LIMIT = 10    // holders.stats.quality.good_pct 下限（%）
   const RETAIL_PCT_LIMIT = 20  // holders.distribution.push.retail.pct 上限（%）
@@ -139,11 +148,23 @@ try {
   const sinceLaunchHour = sinceLaunchSec / 3600
   const withinWindow = graduated && sinceLaunchSec <= 15 * 3600
 
-  const mcap = ctx.logearn?.mcap || 0
-  const mcapOk = mcap > 0 && mcap < MCAP_LIMIT
-
   const innerSellRatio = ctx.chip_analysis?.inner_sell_ratio || 0
   const innerSellOk = innerSellRatio >= 60
+
+  // ===== 前置静默条件 beforeChecks（不过则静默返回，不打日志）=====
+  const beforeChecks = [
+    ['毕业', graduated, launchTime, '>0'],
+    ['平台', isTargetPlatform, platformLabel, 'Solana(3)/BSC(56)/Robinhood(4663)/Arc(5042)平台白名单'],
+    ['毕业后时长h', withinWindow, sinceLaunchHour === Infinity ? 'NA' : sinceLaunchHour.toFixed(1), '<=15'],
+    ['内盘卖出', innerSellOk, innerSellRatio, '>=60'],
+  ]
+  const beforePassed = beforeChecks.every(c => c[1])
+  if (!beforePassed) {
+    return false
+  }
+
+  const mcap = ctx.logearn?.mcap || 0
+  const mcapOk = mcap > 0 && mcap < MCAP_LIMIT
 
   const CHIP_BUFFER = 2 // 筹码下大于上的容忍buff（%）
   const abovePercent = ctx.chip_analysis?.above_percent || 0
@@ -267,11 +288,7 @@ try {
   }
 
   const checks = [
-    ['毕业', graduated, launchTime, '>0'],
-    ['平台', isTargetPlatform, platformLabel, 'Solana(3)/BSC(56)/Robinhood(4663)/Arc(5042)平台白名单'],
-    ['毕业后时长h', withinWindow, sinceLaunchHour === Infinity ? 'NA' : sinceLaunchHour.toFixed(1), '<=15'],
-    ['市值', mcapOk, mcap.toFixed(0), '<120k'],
-    ['内盘卖出', innerSellOk, innerSellRatio, '>=60'],
+    ['市值', mcapOk, mcap.toFixed(0), '<200k'],
     ['筹码下大于上', chipBelowAboveOk, `below=${belowPercent.toFixed(1)}/above=${abovePercent.toFixed(1)}`, '下>上'],
     ['成本线上', deviationOk, avgPriceDeviationPct, '>0'],
     ['垃圾盘', shitOk, shitVolume, '<7'],
@@ -288,10 +305,13 @@ try {
     ['V转路径', retraceBreakOk, retraceInfo, '低点<成本*1.2'],
     ['捆绑回撤门槛', bundleRetraceOk, `捆绑${bundleBuyPct.toFixed(1)}%${hasEffectiveV ? '/回撤' + (vRetracement * 100).toFixed(1) + '%' : ''}`, bundleOverLimit ? '捆绑>70%时回撤需>60%' : '捆绑<=70%不限'],
   ]
+  const failedChecks = checks.filter(c => !c[1])
+  const passedChecks = checks.filter(c => c[1])
+  const sortedChecks = [...failedChecks, ...passedChecks]
   const passed = checks.every(c => c[1])
   if (!passed) {
-    const fails = checks.filter(c => !c[1]).map(([n, , a, e]) => `${n}=${a}[${e}]`).join(' | ')
-    ctx.log.error(`未命中 ${fails}${hasEffectiveV ? ' | V转阶段=' + vStageLabel : ''}`)
+    const detail = sortedChecks.map(([name, ok, actual, expect]) => `${name}(${ok ? '✅' : '❌'}): ${actual} [期望 ${expect}]`).join('  |  ')
+    ctx.log.error(`未命中  ${detail}${hasEffectiveV ? '  |  V转阶段=' + vStageLabel : ''}`)
     return false
   }
 

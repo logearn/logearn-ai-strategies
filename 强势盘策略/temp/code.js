@@ -1,16 +1,14 @@
 // ==============================================================
-// 单代币强势盘策略  v1.0.4
-// 变更：去掉所有 GMGN(ctx.gmgn) 依赖——
-//   · 移除"创建者持仓/内鬼"两条（原取自 gmgn.stat，无同源替代字段，直接删除）
-//   · 移除日志里的 visiting_count（gmgn 字段）
-// 保留：四链平台白名单 + 年龄 1分钟~500分钟 + 市值<12w
-//       + 垃圾钱包<5% + 优质持仓>1% + 买入次数>50
-//       + 成本线偏离 2~120% + AO 上升 + AC 上升
-// 说明：checks 顺序 = 判定优先级；筹码分析仅日志展示、不参与判定；全程仅一条日志。
+// 单代币强势盘策略  v1.0.7
+// 变更：黑名单条件组「垃圾钱包」新增第二数据源——
+//       ctx.holders.distribution.risk.shit.pct（🗑 垃圾钱包标签桶：持仓/总发行量%），
+//       与原 logearn.shit_volume 同阈值：任一 >= 5 即命中拉黑。
+// 保留：狙击及关联% > 30 拉黑 + 四链平台白名单 + 年龄 1分钟~500分钟 + 市值<12w
+//       + 优质持仓>1% + 买入次数>50 + 成本线偏离 2~120% + AO 上升 + AC 上升
 // ==============================================================
 
 // ---------- 版本号 ----------
-const VERSION = 'v1.0.4'
+const VERSION = 'v1.0.7'
 
 // ---------- 工具函数 ----------
 const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : 0 }
@@ -22,7 +20,8 @@ const DEV_MIN = 2           // 成本线偏离下限（%）
 const DEV_MAX = 120         // 成本线偏离上限（%）
 const AGE_MIN_SEC = 60      // 生命周期下限：< 1 分钟直接淘汰
 const AGE_MAX_MIN = 500     // 生命周期上限（分钟）
-const SHIT_MAX = 5          // 垃圾钱包占比上限（%）
+const SHIT_MAX = 5          // 垃圾钱包占比上限（%）—— 黑名单组：>= 此值即拉黑（两个数据源共用）
+const SNIPER_MAX = 30       // 狙击及关联钱包占比上限（%）—— 黑名单组：> 此值即拉黑
 const BUYTX_MIN = 50        // 24h 买入次数下限
 const GOOD_PCT_MIN = 1      // Holders 优质持仓占比下限（%）
 
@@ -98,10 +97,15 @@ const aoBars = Array.isArray(ki.ao_bars) ? ki.ao_bars : []
 const logearn = ctx.logearn || {}
 const chip = ctx.chip_analysis || {}
 const symbol = logearn.symbol || ki.symbol || 'UNKNOWN'
+const ca = logearn.token_address
 
 // ---------- Holders（LogEarn 自有快照，不需 GMGN key）----------
 const holdersStats = ctx.holders?.stats || {}
 const goodPct = num(holdersStats.quality?.good_pct)   // 优质持仓占比%（已是百分比口径）
+// 🔫 狙击仓及关联（distribution.risk.sniper：开盘前入场/sniper_group 及关联，pct = 持仓/总发行量%）
+const sniperPct = num(ctx.holders?.distribution?.risk?.sniper?.pct)
+// 🗑 垃圾钱包标签桶（distribution.risk.shit：pct = 该桶持仓/总发行量%）
+const shitHoldersPct = num(ctx.holders?.distribution?.risk?.shit?.pct)
 
 // ---------- 筹码分析（仅展示，不参与判定）----------
 const chipAbove = num(chip.above_percent)          // 当前价上方筹码%（抛压）
@@ -148,13 +152,28 @@ const ac0 = calcAC(0)
 const ac1 = calcAC(1)
 const acOk = ac0 !== null && ac1 !== null && ac0 > 0 && ac0 > ac1
 
+// ---------- 黑名单条件组（命中即永久拉黑并淘汰；本策略黑名单）----------
+const shitVolPct = num(logearn.shit_volume)
+const blacklistChecks = [
+  ['垃圾钱包(持仓量)占比过高', shitVolPct >= SHIT_MAX, shitVolPct.toFixed(1), '>= ' + SHIT_MAX],
+  ['垃圾钱包(Holders桶)占比过高', shitHoldersPct >= SHIT_MAX, shitHoldersPct.toFixed(1), '>= ' + SHIT_MAX],
+  ['狙击及关联占比过高', sniperPct > SNIPER_MAX, sniperPct.toFixed(1), '> ' + SNIPER_MAX],
+]
+const blackHit = blacklistChecks.filter((c) => c[1])
+if (blackHit.length) {
+  const reason = blackHit.map(([name, ok, actual, expect]) => `${name}(${ok}): ${actual} [期望 ${expect}]`).join('  |  ')
+  ctx.add_blacklist(ca, reason)
+  // 按用户要求：拉黑的同时本策略也自行输出一条日志
+  ctx.log.error('本策略拉黑 ' + VERSION + ' [' + symbol + '] ' + reason)
+  return false
+}
+
 // ---------- 逐条判定（顺序=优先级）----------
 const checks = [
   ['平台', isTargetPlatform, platformLabel, 'Solana(3)/BSC(56)/Robinhood(4663)/Arc(5042)平台白名单'],
   ['年龄(秒)', launchTime > 0 && ageSec >= AGE_MIN_SEC, ageSec, '>= ' + AGE_MIN_SEC],
   ['年龄(分)', launchTime > 0 && ageMin <= AGE_MAX_MIN, Number.isFinite(ageMin) ? ageMin.toFixed(1) : 'NA', '<= ' + AGE_MAX_MIN],
   ['市值', effMcap > 0 && effMcap < MCAP_MAX, effMcap.toFixed(0), '>0 且 < ' + MCAP_MAX],
-  ['垃圾钱包%', num(logearn.shit_volume) < SHIT_MAX, num(logearn.shit_volume).toFixed(1), '< ' + SHIT_MAX],
   ['优质持仓%', goodPct > GOOD_PCT_MIN, goodPct.toFixed(2), '> ' + GOOD_PCT_MIN],
   ['买入次数', buyTxD1 > BUYTX_MIN, buyTxD1, '> ' + BUYTX_MIN],
   ['偏离%', deviationPct > DEV_MIN && deviationPct < DEV_MAX, deviationPct.toFixed(1), DEV_MIN + '~' + DEV_MAX],

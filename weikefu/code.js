@@ -1,121 +1,153 @@
-// 威科夫策略 v2.1
-// 【依赖 kline_and_indicators.kline_bars/avg_price_bars 与 logearn.v_breakout_volume_list，单币深度分析场景】
-//
-// v2.1 宽松版（实盘漏抓大量"横盘大金狗"，教科书门槛对链上币偏严，定向放宽）：
-// 1. 【删 反弹慢于砸盘】v1.8 引入时即有记录：误杀 JLY(+478%)/PolarBear(+59%)，特征无区分度，回滚。
-// 2. 【SOS新鲜度放宽】3根/90s → 5根/300s。扫描不是每根 bar 都跑，窗口太窄导致"币对形态对但来晚了"。
-// 3. 【AR反弹 10%→5%】横盘大金狗区间窄，SC 后反弹不足 10% 就震荡的全被拦，这条对目标形态是精确打击。
-// 4. 【SC放量降为软条件，1.3→1.15】899 条漏斗 51% 死在 SC放量；链上币"无 climax 阴跌见底"很常见，
-//    或 climax 落在 K线窗口（90~300根）之外。不放量不再拦截，仅日志 ⚠️ 标注，供复盘统计。
-// 5. 【ST缩量 0.7→0.85】单根 bar 比量噪音大，适度放松。
-// 保持硬门槛：SOS 三连（突破/放量/强势）、成本线两条、吸筹区间时长、持仓结构、池子流动性。
-//
-// v2.0 精简：
-// 【去掉 AO 系两条检查】AO动能（ao0>0，v1.2）与 AO峰值衰减（v1.7）。AO 是动量指标，
-// 和威科夫模型（价量结构）没有关系，策略回归纯威科夫结构判定。
-//
-// v1.9 修复（899 条实盘日志漏斗分析，51% 卡在 SC放量）：
-// 1. 【SC 锚定改为窗口内量最大根】原来用 V转 low_price_time 精确时间匹配，但“最低价那一秒”常落在
-//    砸完之后的缩量假摔小 K 上（实盘大量 SC量 26/均234 这种倒挂案例），真正的天量恐慌根在它前后。
-//    改为：vLowTime ±SC_TIME_TOLERANCE 窗口内取成交量最大的已收线 bar 作为 SC（符合威科夫 climax 定义）；
-//    scLow 取窗口内最低 low（不用放量根自己的 low，否则 ST不破位/Spring 的锚会上移）。
-// 2. 【未命中日志❌项排前面】原来按 checks 顺序全量输出，899 条实盘日志 100% 被截断，末端检查
-//    （SOS三连门/成本线/池子）的判定从没被看到过。改为❌项在前+通过计数，截断只会吃掉✅项。
-//
-// v1.8 新增：
-// 【反弹慢于砸盘】反弹时长（SC底 → SOS突破，即吸筹区间实际时长）> 恐慌抛售时长（V转顶点 → 低点，
-// 用信号自带时间戳 vLowTime - vTopTime）。恐慌砸盘是快速的，健康的吸筹反弹应慢于砸盘——
-// 反弹比砸盘还快的多是资金对倒直拉，不是真吸筹。相当于把吸筹区间的固定时长下限换成动态下限。
-// 威科夫因果法则：吸筹构建"因"需要时间，"因"的规模决定"果"。
-// 【回测取舍】9 快照回放：拦下 Sovicat/SISYPUSS/Neeps 三个亏损单，但误杀 JLY(+478%) 和 PolarBear(+59%)
-// ——盈利单的反弹/砸盘比值(26%/54%)落在亏损单区间(23%~75%)内部，该特征在现有样本上无区分度。
-// 有意识地接受误杀：赌"拦小亏"出现频率远高于大赢家（方案c）。若后续实盘大赢家被杀率过高，回滚此检查。
-//
-// v1.7 新增（QUOKKA 实盘亏损单复盘，4 快照回放校准；其中 AO峰值衰减 已于 v2.0 移除）：
-// 1. 【池子流动性】pool_liquidity >= MIN_POOL_LIQ。QUOKKA 池子仅$7.6K、42 仅$3K——这种深度下
-//    几千美金就能画出"放量突破"，且实际成交滑点巨大，纸面涨幅兑现不了。正例池子均 $13K+。
-//    代价：会挡掉 42（纸面+108%），换取过滤 QUOKKA 类必亏单，按可执行性优先取舍。
-//
-// v1.6 修复（OnlyMarms 实盘日志复盘）：
-// 1. SC 定位排除最新一根未收线 bar（bar起始+粒度>当前时间视为未收线）。V低点落在刚开的小时线上时，
-//    半成品 volume 会让"SC放量"必然误判；排除后 SC 锚到前一根完整的砸盘 bar，后续重触发评估可正常推进。
-// 2. 阶段日志区分"结构未展开(SC刚发生,等待)"与"形态不符"，复盘时不再混淆。
-// 注意：SOS 仍允许发生在未收线 bar 上（入场时效优先，等收线太慢），其放量/收位判定基于已累计部分。
-//
-// v1.5 修复（代码 review 采纳两条）：
-// 1. 区间均量基线不再包含 SC 那根恐慌巨量（slice 起点 scIdx+1）——原来把 climax 塞进分母，
-//    SOS 放量门槛被系统性抬高，真突破容易被误杀。
-// 2. new_volume/shit_volume（24h 口径）为负=数据失效时，原来 -1<65 恒真、门槛静默失效；
-//    改为显式判定：值有效（>=0）才启用检查，失效跳过并在日志标注。不按年龄关闭（本策略要吃老币）。
-//
-// v1.4 适配：平台K线粒度按 token 年龄自适应（calcAutoKlineResolution，1S~1D 保证 90~300 根）。
-// 秒级粒度下"按根数"的阈值时间含义会坍缩（10根1S=10秒的"吸筹区间"、3根内突破=3秒就过期），
-// 因此给根数阈值加时间双约束——不做升维聚合（极新币聚合后根数不够，该被过滤而不是被重采样）：
-// 1. 吸筹区间：根数 >= RANGE_MIN_BARS 且实际时长 >= RANGE_MIN_SEC（2分钟，同 1.5段 V转持续下限口径）。
-// 2. SOS新鲜度：距今 < SOS_FRESH_BARS 根【或】距今 <= SOS_FRESH_MAX_SEC 秒（秒级粒度下按根数几乎必然过期）。
-//
-// v1.3 新增：持仓结构门槛（合并自另一分支的修改）—— 新钱包持仓占比 < 65%，垃圾钱包持仓占比 < 2%。
-//
-// v1.2 改动（按 6 个实盘案例校准，3 正例 FDK/MEMIPEDE/cet、3 反例 BabyCate/CALLOUT/MEOW）：
-// 1. 新增【SOS 站上成本线】硬性检查：SOS 收盘必须 > 突破时刻的成本线（avg_price_bars 回溯）。
-//    三个反例的共同点是"反弹发生在成本线下方"（BabyCate 反弹到 24.9K 但成本线 14K 在头顶、
-//    CALLOUT 价格 6.5K vs 成本线 33.9K）——成本线下方的突破上方全是套牢盘，不是 SOS 是 UT（上冲回落）。
-// 2. 新增【当前在成本线上】检查：avg_price_deviation_pct > 0（口径同 1.5段/苏醒接力）。
-// 3. 新增【吸筹区间时长】下限：SC 到 SOS 至少 RANGE_MIN_BARS 根。三个正例买点前都有充分横盘吸筹；
-//    反例 MEOW 是 V 转后没有吸筹区间直接拉起再砸——回调完直接反弹的不叫吸筹，过滤掉。
-// 4. 新增【AO 动能】检查（已于 v2.0 移除）。
-//
-// v1.1 修复：resolution 单位（"5"=5分钟，不是5秒）导致 SC 时间容差远小于一根K线、按时间几乎必然匹配失败的 bug。
-// 现直接用实际 bar 间距作为粒度，与 vLowTime 的秒级时间戳对齐。
-//
-// 思路：消费 V转信号（v_breakout_volume_list），把 V转低点映射为威科夫吸筹模型的 SC（卖出高潮），
-// 然后在 K线上依次校验吸筹四阶段，买点定在 SOS：
-//   SC  (Selling Climax)   = V转回调低点，要求放量（恐慌抛售）
-//   AR  (Automatic Rally)  = SC 后的自动反弹高点，定义交易区间上沿（阻力）
-//   ST  (Secondary Test)   = 回落二次测试 SC 低点：不破位（允许小幅 Spring 假跌破）且量能萎缩
-//   SOS (Sign of Strength) = 放量突破 AR 上沿【且站上成本线】的强势宽幅阳线 —— 唯一买点，且必须是"刚发生"
-const VERSION = 'wyckoff-v2.1'
+// 威科夫策略 v3.6 精简版
+// SC → AR → SOS 结构（ST仅展示）；V转高点至所选信号时间必须 > 2小时（B口径：signalTime - top_price_time）。
+// v3.5：同步1.5段策略的平台白名单及假Pump/Four过滤。
+// v3.1：已完成突破的 V转也参与检测，按 signalTime 选最新已确认信号。
+// 历史最高市值 max_up_mcap 必须 > 500k。
+// v3.0 新增：当前市值 > 100k（logearn.mcap）。
+// 不限制 SC 至 SOS 区间时长、SOS 成交量；SOS 仅要求最新 close > AR 上沿。
+// 依赖 logearn.v_breakout_volume_list、kline_and_indicators.kline_bars；chip_analysis.price_bars 仅用于日志。
+// SC低点至AR高点的区间筹码占比仅输出，不参与判断；边界桶按市值重叠宽度估算。
+// V转用于定位 SC；当前最新K线为SOS候选，之前各次已确认反弹的最高点为AR。
+// ST 从最终AR之后至SOS候选之前寻找，仅展示支撑测试，不参与命中判断。
+// 移除 SC 放量、前置均量样本数、SOS 阳线/收位、成本线、持仓占比和池子过滤。
+// SOS：最新 close > AR 上沿；不检查前一根位置，允许最新 K线尚未收线。
+// 历史突破不直接命中；当前仍在上沿上方时可持续满足 SOS。
+const VERSION = 'wyckoff-v3.6'
 
 // ---------- 参数 ----------
-const SC_VOL_MULT = 1.15     // SC 放量倍数（v2.1 软条件，1.3→1.15）：不达标不拦截，仅日志标注
+const MIN_HISTORICAL_MCAP = 500000 // 历史最高市值（USD），严格大于500k
+const MIN_MCAP = 100000 // 当前市值下限（USD），严格大于 100k
+const V_MIN_DURATION_SEC = 2 * 3600 // B口径：V转signalTime减高点时间，严格大于2小时
+const V_MIN_RETRACEMENT = 0.60 // 所选V转回撤深度，严格大于60%
 const SC_TIME_TOLERANCE = 3  // SC 定位容差（按 K线根数 × 实际bar间距）
 const AR_MIN_RALLY = 0.05    // AR 有效反弹幅度下限（v2.1 放宽 10%→5%，横盘窄区间币反弹幅度小）
 const AR_PULLBACK = 0.33     // 从反弹高点回落超过涨幅的 1/3 视为 AR 确立、进入 ST
 const ST_UNDERCUT = 0.05     // ST/Spring 允许跌破 SC 低点的幅度上限（5%）
-const ST_VOL_SHRINK = 0.85   // ST 量能萎缩（v2.1 放宽 0.7→0.85，单根bar比量噪音大）
-const SOS_VOL_MULT = 1.5     // SOS 放量倍数：突破量 > 区间均量 × 1.5
-const SOS_CLOSE_POS = 0.6    // SOS 收盘位置：收在 bar 振幅上部 40% 内
-const SOS_FRESH_BARS = 5     // SOS 新鲜度（v2.1 放宽 3→5）：突破必须发生在最近 N 根内（不追高）
-const SOS_FRESH_MAX_SEC = 300 // SOS 新鲜度时间兜底（v2.1 放宽 90→300s）
-const MIN_BARS_BEFORE_SC = 5 // SC 前至少要有的 bar 数（算基准均量）
-const RANGE_MIN_BARS = 10    // 吸筹区间时长下限：SC 到 SOS 至少 N 根（过滤 V 转直拉的假吸筹，反例 MEOW）
-const RANGE_MIN_SEC = 120    // 吸筹区间实际时长下限（秒）：秒级粒度下 10 根只有几秒，不构成吸筹
-const MAX_NEW_VOLUME = 65    // 新钱包持仓占比上限（%）
-const MAX_SHIT_VOLUME = 5    // 垃圾钱包持仓占比上限（%）
-const MIN_POOL_LIQ = 10000   // 池子流动性下限（USD）：太浅的池子放量突破可被小资金伪造且无法成交
 
 // ---------- 工具 ----------
 const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : 0 }
 const toSec = (t) => { const n = Number(t) || 0; return n > 1e12 ? Math.floor(n / 1000) : n }
-const avg = (a) => (a.length ? a.reduce((s, b) => s + b, 0) / a.length : 0)
 
 try {
   const logearn = ctx.logearn || {}
   const ki = ctx.kline_and_indicators || {}
   const symbol = logearn.symbol || ki.symbol || 'UNKNOWN'
 
-  // ---------- 1. 消费 V转信号（confirmed 且未收尾，取最新） ----------
+  // 按链匹配平台白名单；Solana 地址区分大小写，EVM 平台标识统一小写。
+  const CHAIN_PLATFORMS = {
+    // Solana (chain 3)
+    3: {
+      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P': 'Pump',
+      'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA': 'Pump AMM',
+      '9SkAtSxgNUMvT9bGb93v6rLU5MjW1XibykqoGtqT9dbg': 'WenDev',
+      'LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj': 'Launpad',
+      'FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4g6W1': 'LetsBonk 1',
+      'BuM6KDpWiTcxvrpXywWFiw45R2RNH8WURdvqoTDV1BW4': 'LetsBonk 2',
+      '4Bu96XjU84XjPDSpveTVf6LYGCkfW5FK7SNkREWcEfV4': 'Labs',
+      'Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB': 'Pools',
+      'FbKf76ucsQssF7XZBuzScdJfugtsSKwZFYztKsMEhWZM': 'Moonshit',
+      'Bov7gMQ88BQbtFMTxQ5e8grtrwG4ryQGAV9Mih2j9SxK': 'Dynamic DBC',
+      'BAGSB9TpGrZxQbEsrEznv5jXXdwyP6AXerN8aVRiAmcv': 'Bags',
+      'GybkUNYVNk1FZMt9myAfvpSVgoKBgaueMTvszwBN4qYx': 'AnoncoinIt',
+      '8rE9CtCjwhSmbwL5fbJBtRFsS3ohfMcDFeTTC7t4ciUA': 'Studio',
+      '7UNpFBfTdWrcfS7aBQzEaPgZCfPJe8BDgHzwmWUZaMaF': 'TrendFun',
+      'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc': 'Whirl',
+      'MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG': 'Moonshot',
+      'boop8hVGQGqehUK2iVEMEnMrL5RbjywRzHKBmBE7ry4': 'Boop',
+      'HEAVENoP2qxoeuF8Dj2oT1GHEnu49U5mJYkdeC8BAX2o': 'Heaven',
+      '6BwHHDg3u1854jC8PDLXvR4spTcLNaoBxLJNGC4nTESt': 'StonkFun 1',
+      '4E876qZTE9FJMrBzgVtBrSrzz2TLivB5Y5QXPjB4gZL7': 'StonkFun 2',
+    },
+    // BSC (chain 56)
+    56: {
+      'four.meme': 'Four',
+      'binance_four.meme': 'Binance Four',
+      'flap': 'Flap',
+      '0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0': 'Flap',
+      '0xec4549cadce5da21df6e6422d448034b5233bfbc': 'Four',
+      '0x5c952063c7fc8610ffdb798152d69f0b9550762b': 'Four',
+      '0x3508dca95a64c9378cb07ef6f40553a50905372a': 'Four',
+    },
+    // Robinhood Chain (chain 4663)
+    4663: {
+      '0xc783221ab1db0244203458417981b4631e80b988': 'Launch.fun v1',
+      '0x6fda94aceedc5a97171469a8873d00fb9983bb8c': 'Launch.fun v2',
+      '0x77dc6f6361b7b99456fc3761ce5b7dda80d83f9d': 'Trench.today',
+      '0x0000ffffbe8efe702c8703ae3477ff5de3d319c0': 'Pools.instant',
+      '0x22e99278308b393ea1260859b181ad7e78f5eeed': 'Long.xyz',
+      '0x8660a7f019c7943b0b0a91b8e39aff3b6db6ae62': 'Pair.fund',
+      '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e': 'Pons V2',
+      '0xce9c48cfa068947f77738c81be406b53338e5b0d': 'O1',
+      '0xeb7c034704ef8dcd2d32324c1545f62fb4ad0862': 'Doppler Airlock',
+      '0x26605f322f7ff986f381bb9a6e3f5dab0beaeb09': 'Flap.sh',
+      '0x4f7609b3e944eaeae758341369055c1c24f3229a': 'Imortal',
+      '0xbedd8e29ebbd8c6b233cdae3b25a4ae5227e65d9': 'Imortal',
+      '0x44c8d2b22da696d90cd1b8cb3eaccb943ab005ca': 'Imortal',
+      '0xc4edbe1df58ac18d2e1591b34ac6e929c1df0ce7': 'Imortal',
+      '0xe64ac4113848bbc1a6dde1a6d1da96720a36f297': 'O1',
+    },
+    // Arc / Circle Arc (chain 5042)
+    5042: {
+      '0xd68fdd69dbdb92ff0770e54c8a0840a7ba8af1b5': 'Arclab',
+      '0x24196cd6e534cfce8f480b53e70809b68ea86f29': 'Arcpad',
+      '0xb021be536808f551b31789422fd28a6c9c6e97da': 'Argus',
+      '0x3d0b83e115205edf37e48a8eb6d92e2c7492a00c': 'ARK Launch',
+      '0x9b9a136d04e8e19a934de062f0fbb929b3c7aedb': 'ARK Launch',
+      '0x16d4c13ad2a23288aa9b9384f24084edc8cbef41': 'Bullcheese',
+      '0xdfef2f90f7e52609cc89b80b68ff6a1c86c4ddc4': 'Dyor.fun',
+      '0x6a62919ccbf0c19e0c4e084f986b582b4492dda4': 'Faze',
+      '0x3f29dd25d1f6ad3d09d1d4a880f8a869e3039153': 'Lift',
+      '0x1ca37b3c40e89aad48b5ad3352269c2293cfd3da': 'Lift',
+      '0xe740cc40b4b173b62af54d79d50db34610600c54': 'LiquidLaunch',
+      '0x3324d45dbda511e3333f5177c90f7c5dd30d24b5': 'Long.supply',
+      '0xb6c6f77ee74af874a183bfd77dd0176d1ac91de6': 'Minara',
+      '0x20eead6db6b3d0a4491e9073119dd0ebff166acc': 'O1',
+      '0x815542e8b392389a1389e22e588e4b62a67ade72': 'OpenLaunch',
+      '0x7b9720bc177e8b6f96962e9b15891f27108cad40': 'Peach',
+      '0x4b638c1502a07a8e1a26112ee98f51a3f34bc93a': 'RadarDEX',
+      '0x18d33de5eefb2f91b09385f35f6a1317659cc1f9': 'Synthra',
+      '0xcad7ee36ac193bf2eddb7b3e2736c5bdb8269c8b': 'TollyPad',
+      '0x0dcad158e98bc24455f9e94f46709d8a5f6d1255': 'Warp',
+      '0x27117b11c5c6f886eb1ffb32d814557aad4f6c43': 'Zyora',
+    },
+  }
+  const platform = ctx.logearn?.platform
+  const chain = Number(ctx.logearn?.chain)
+  const chainPlatforms = CHAIN_PLATFORMS[chain]
+  const platformKey = chain === 3 ? String(platform || '') : String(platform || '').toLowerCase()
+  const chainPlatformName = chainPlatforms && Object.prototype.hasOwnProperty.call(chainPlatforms, platformKey)
+    ? chainPlatforms[platformKey] : null
+  const isPump = chain === 3 && (chainPlatformName === 'Pump' || chainPlatformName === 'Pump AMM')
+  const isFour = chain === 56 && (chainPlatformName === 'Four' || chainPlatformName === 'Binance Four')
+  const isTargetPlatform = !!chainPlatformName
+    && !(isPump && ctx.logearn?.is_fake_pump)
+    && !(isFour && ctx.logearn?.is_fake_four)
+
+  const platformLabel = chainPlatformName ? `${chainPlatformName}(chain ${chain})`
+    : `${platform || 'unknown'}(chain ${chain})`
+
+  // ---------- 0. 当前市值 ----------
+  const mcap = num(logearn.mcap)
+  const mcapOk = mcap > MIN_MCAP
+  const historicalMcap = num(logearn.max_up_mcap)
+  const historicalMcapOk = historicalMcap > MIN_HISTORICAL_MCAP
+
+  // ---------- 1. 消费 V转信号（取最新 confirmed，包含已完成突破的信号） ----------
   const vList = Array.isArray(logearn.v_breakout_volume_list) ? logearn.v_breakout_volume_list : []
-  const vFinished = (v) => (num(v?.fibon_break4) > 0) || (v?.fibon_break4_time != null && num(v.fibon_break4_time) !== 0)
   let recentV = null
   for (const v of vList) {
     if (v?.n_pattern_confirmed !== true) continue
-    if (vFinished(v)) continue
     if (!recentV || num(v.signalTime) > num(recentV.signalTime)) recentV = v
   }
   const hasEffectiveV = !!recentV
   const vTopTime = hasEffectiveV ? toSec(recentV.top_price_time) : 0
   const vLowTime = hasEffectiveV ? toSec(recentV.low_price_time) : 0
+  const vSignalTime = hasEffectiveV ? toSec(recentV.signalTime) : 0
+  const vRetracement = hasEffectiveV ? Number(recentV.n_pattern_retracement) : NaN
+  const vRetracementValid = hasEffectiveV && recentV.n_pattern_retracement != null && Number.isFinite(vRetracement) && vRetracement >= 0 && vRetracement <= 1
+  const vRetracementOk = vRetracementValid && vRetracement > V_MIN_RETRACEMENT
+  const vDurationSec = vSignalTime - vTopTime
+  const vDurationOk = hasEffectiveV && vTopTime > 0 && vSignalTime > 0 && vDurationSec > V_MIN_DURATION_SEC
 
   // ---------- 2. K线整理（原始新→旧，转为时间正序） ----------
   const rawBars = Array.isArray(ki.kline_bars) ? ki.kline_bars : []
@@ -139,16 +171,7 @@ try {
   }
   if (resolutionSec <= 0) resolutionSec = num(ki.resolution) > 0 ? num(ki.resolution) * 60 : 60
 
-  // 成本线（VWAP）：按时间回溯取当时的值（avg_price_bars 新→旧），找不到历史 bar 退回当前成本线
-  // （回溯逻辑同 1.5段策略 findAvgPriceAtTime；与 kline close 同口径，可直接比较）
-  const avgPriceBars = (Array.isArray(ki.avg_price_bars) ? ki.avg_price_bars : []).map((b) => ({ t: toSec(b?.time), v: Number(b?.value) }))
-  const currentAvgPrice = num(ki.current_avg_price)
-  const costAt = (t) => {
-    for (const b of avgPriceBars) { if (b.t <= t && Number.isFinite(b.v) && b.v > 0) return b.v }
-    return currentAvgPrice > 0 ? currentAvgPrice : 0
-  }
-
-  // ---------- 3. SC：定位 V转低点对应的 bar，校验放量 ----------
+  // ---------- 3. SC：定位 V转低点附近的已收线 bar ----------
   // 【v1.6】最新一根若还在走（bar 起始时间 + 粒度 > 当前时间）视为未收线：SC 不允许锚在它上面。
   // 半成品 bar 的 volume 只累计了一部分，拿去比"前段均量×2"必然失真（实测：V低点落在刚开1分钟的
   // 小时线上，量 6464 vs 均量 164748 被误判为"SC没放量"）。
@@ -176,129 +199,118 @@ try {
       scWindowLow = minLow
     }
   }
-  const scOk = scIdx >= MIN_BARS_BEFORE_SC
+  const scOk = scIdx >= 0
   const scBar = scOk ? bars[scIdx] : null
-  const preVols = scOk ? bars.slice(Math.max(0, scIdx - 10), scIdx).map((b) => b.v) : []
-  const preAvgVol = avg(preVols)
-  const scVolOk = scOk && preAvgVol > 0 && scBar.v > preAvgVol * SC_VOL_MULT
   const scLow = scOk ? (Number.isFinite(scWindowLow) ? scWindowLow : scBar.l) : 0
 
-  // ---------- 4. AR：SC 后的自动反弹高点（区间上沿） ----------
-  let arIdx = -1, arHigh = 0, arConfirmed = false
+  // ---------- 4. AR：当前 SOS 候选之前，多次已确认反弹中的最高点 ----------
+  // 最新 K线只用于判定 SOS，不参与 AR 高点及回落确认，避免把突破本身抬成阻力。
+  const latestIdx = bars.length - 1
+  let arIdx = -1, arHigh = 0, arConfirmed = false, arCandidateCount = 0
   if (scOk) {
     let runHigh = -Infinity, runIdx = -1
-    for (let i = scIdx + 1; i < bars.length; i++) {
+    for (let i = scIdx + 1; i < latestIdx; i++) {
       if (bars[i].h > runHigh) { runHigh = bars[i].h; runIdx = i }
       const rally = runHigh - scLow
-      if (rally > 0 && bars[i].c < runHigh - rally * AR_PULLBACK) { arConfirmed = true; break }
+      if (rally > 0 && bars[i].c < runHigh - rally * AR_PULLBACK) {
+        // 每次回落确认完成一轮反弹，随后继续寻找下一轮；只记录幅度合格的候选。
+        if (scLow > 0 && rally / scLow >= AR_MIN_RALLY) {
+          arCandidateCount++
+          // 同高时取较晚的一次，ST 随之使用最近一次同高反弹后的回测。
+          if (!arConfirmed || runHigh >= arHigh) {
+            arIdx = runIdx
+            arHigh = runHigh
+            arConfirmed = true
+          }
+        }
+        runHigh = -Infinity
+        runIdx = -1
+      }
     }
-    if (runIdx > 0) { arIdx = runIdx; arHigh = runHigh }
   }
   const arRallyPct = scLow > 0 ? (arHigh - scLow) / scLow : 0
   const arOk = arConfirmed && arIdx > scIdx && arRallyPct >= AR_MIN_RALLY
 
-  // ---------- 5. ST/Spring：二次测试不破位 + 量能萎缩 ----------
-  let stIdx = -1, stLow = Infinity, stVol = 0
+  // ---------- 5. ST/Spring：最终 AR 后、当前 SOS 候选前的最低回测点 ----------
+  let stIdx = -1, stLow = Infinity
   if (arOk) {
-    for (let i = arIdx + 1; i < bars.length; i++) {
-      if (bars[i].c > arHigh) break // 已突破上沿，ST 阶段结束
-      if (bars[i].l < stLow) { stLow = bars[i].l; stIdx = i; stVol = bars[i].v }
+    for (let i = arIdx + 1; i < latestIdx; i++) {
+      if (bars[i].l < stLow) { stLow = bars[i].l; stIdx = i }
     }
   }
   const hasSt = stIdx > arIdx
   const stHoldOk = hasSt && stLow >= scLow * (1 - ST_UNDERCUT)
-  const stVolOk = hasSt && scBar && stVol < scBar.v * ST_VOL_SHRINK
-  const stOk = hasSt && stHoldOk && stVolOk
 
-  // ---------- 6. SOS：放量突破 AR 上沿的强势阳线，且刚发生 ----------
-  let sosIdx = -1
-  if (stOk) {
-    for (let i = stIdx + 1; i < bars.length; i++) {
-      if (bars[i].c > arHigh) { sosIdx = i; break }
+  // ---------- 6. SOS：最新 K线 close 高于 AR 上沿 ----------
+  const latestBar = latestIdx >= 0 ? bars[latestIdx] : null
+  const hasSos = arOk && latestIdx > arIdx && !!latestBar && latestBar.c > arHigh
+
+  // ---------- 7. SC～AR 区间筹码 ----------
+  // 平台 K线 OHLC 与 mcap_range 均为 USD 市值，直接使用 scLow / arHigh。
+  // percent 已是“仍持有量 / 总发行量 × 100”，直接累加，不除以样本总持仓。
+  // 桶内明细未知：边界桶假定均匀分布，按重叠宽度折算；结果是估算占比。
+  const chipBars = ctx.chip_analysis?.price_bars
+  let chipDataOk = Array.isArray(chipBars) && chipBars.length > 0
+  let rangeChipPercent = 0
+  const chipRangeOk = scOk && arOk && scLow > 0 && arHigh > scLow
+  if (chipDataOk) {
+    for (const bucket of chipBars) {
+      const range = bucket?.mcap_range
+      const validNumber = (v) => (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && Number.isFinite(Number(v))
+      if (!Array.isArray(range) || range.length !== 2
+        || !validNumber(range[0]) || !validNumber(range[1]) || !validNumber(bucket?.percent)) {
+        chipDataOk = false
+        break
+      }
+      const low = Number(range[0]), high = Number(range[1]), percent = Number(bucket.percent)
+      if (low < 0 || high <= low || percent < 0 || percent > 100) {
+        chipDataOk = false
+        break
+      }
+      if (chipRangeOk) {
+        const overlap = Math.max(0, Math.min(high, arHigh) - Math.max(low, scLow))
+        rangeChipPercent += percent * overlap / (high - low)
+      }
     }
   }
-  const hasSos = sosIdx > stIdx
-  const sosBar = hasSos ? bars[sosIdx] : null
-  // 区间均量基线从 SC 的下一根起算：SC 本身是恐慌巨量根，塞进分母会抬高 SOS 放量门槛（v1.5 修复）
-  const rangeVols = hasSos ? bars.slice(scIdx + 1, sosIdx).map((b) => b.v) : []
-  const rangeAvgVol = avg(rangeVols)
-  const sosVolOk = hasSos && rangeAvgVol > 0 && sosBar.v > rangeAvgVol * SOS_VOL_MULT
-  const sosSpread = hasSos ? sosBar.h - sosBar.l : 0
-  const sosClosePos = sosSpread > 0 ? (sosBar.c - sosBar.l) / sosSpread : 1
-  const sosStrongOk = hasSos && sosBar.c > sosBar.o && sosClosePos >= SOS_CLOSE_POS
-  // 新鲜度双口径：根数（常规粒度）或 距今秒数（秒级粒度兜底），满足其一即可
-  const sosBarsAgo = hasSos ? bars.length - 1 - sosIdx : -1
-  const sosSecAgo = hasSos ? bars[bars.length - 1].t - sosBar.t : -1
-  const sosFreshOk = hasSos && (sosBarsAgo < SOS_FRESH_BARS || sosSecAgo <= SOS_FRESH_MAX_SEC)
-
-  // ---------- 7. 持仓结构门槛（v1.3，v1.5 加有效性判断）----------
-  // new_volume/shit_volume 是最近 24h 口径的实时持仓指标，超过 24h 的老币可能为负（数据失效）。
-  // 负值若直接比较会恒真（-1 < 65），静默变成"永远通过"——改为显式判定：值有效（>=0）才启用检查，
-  // 失效则跳过并在日志标注，不按年龄关闭（正例 MEMIPEDE 是 17 天老币，本策略要吃老币）。
-  const newVolRaw = Number(logearn.new_volume)
-  const shitVolRaw = Number(logearn.shit_volume)
-  const newVolValid = Number.isFinite(newVolRaw) && newVolRaw >= 0
-  const shitVolValid = Number.isFinite(shitVolRaw) && shitVolRaw >= 0
-  const newVolOk = !newVolValid || newVolRaw < MAX_NEW_VOLUME
-  const shitVolOk = !shitVolValid || shitVolRaw < MAX_SHIT_VOLUME
-
-  // ---------- 8. 实盘校准检查（v1.2）----------
-  // 吸筹区间时长：SC → SOS 根数与实际时长双约束（秒级粒度下 10 根只有几秒，必须叠加时间下限）
-  const rangeBars = hasSos ? sosIdx - scIdx : 0
-  const rangeSec = hasSos ? sosBar.t - scBar.t : 0
-  const rangeLenOk = hasSos && rangeBars >= RANGE_MIN_BARS && rangeSec >= RANGE_MIN_SEC
-  // SOS 必须站上突破时刻的成本线：成本线下方的"突破"是 UT（上冲回落），不是 SOS
-  const costAtSos = hasSos ? costAt(sosBar.t) : 0
-  const sosAboveCostOk = hasSos && costAtSos > 0 && sosBar.c > costAtSos
-  // 当前仍在成本线上（快照时刻整体确认，口径同其他策略）
-  const deviationPct = Number(ki.avg_price_deviation_pct)
-  const nowAboveCostOk = Number.isFinite(deviationPct) && deviationPct > 0
-  // 池子流动性（v1.7）
-  const poolLiq = num(logearn.pool_liquidity)
-  const poolOk = poolLiq >= MIN_POOL_LIQ
 
   // ---------- 汇总 ----------
   const fmt = (x, d = 6) => Number.isFinite(x) ? Number(Number(x).toFixed(d)) : 'NA'
-  // 第 5 个元素 soft=true 的检查不拦截命中，仅在日志用 ⚠️ 标注（v2.1：SC放量降级为软条件）
+  const chipInfo = '区间筹码占比（仅展示）: ' + (!chipDataOk ? '筹码数据缺失或无效' : !chipRangeOk ? 'SC/AR区间未确定' : '估算' + fmt(rangeChipPercent, 2) + '% / 市值[' + fmt(scLow, 2) + ', ' + fmt(arHigh, 2) + ']（占总发行量，边界桶按重叠折算）')
+  const stInfo = 'ST（仅展示）: ' + (!hasSt ? '无ST' : '低' + fmt(stLow) + '/SC低' + fmt(scLow) + (stHoldOk ? '（支撑未破）' : '（低于SC的95%）'))
   const checks = [
-    ['K线就绪', bars.length >= MIN_BARS_BEFORE_SC + 5, bars.length + '根', '>= ' + (MIN_BARS_BEFORE_SC + 5)],
-    ['新钱包持仓', newVolOk, newVolValid ? fmt(newVolRaw, 2) + '%' : '失效(' + fmt(newVolRaw, 2) + ',24h口径)跳过', '< ' + MAX_NEW_VOLUME + '%（值有效时）'],
-    ['垃圾钱包持仓', shitVolOk, shitVolValid ? fmt(shitVolRaw, 2) + '%' : '失效(' + fmt(shitVolRaw, 2) + ',24h口径)跳过', '< ' + MAX_SHIT_VOLUME + '%（值有效时）'],
-    ['有效V转', hasEffectiveV, hasEffectiveV ? 'y@' + num(recentV.signalTime) : 'n', 'confirmed且未收尾'],
-    ['SC定位', scOk, scOk ? 'idx' + scIdx + '@' + scBar.t + '(粒度' + resolutionSec + 's)' : '未定位', 'V低点匹配到bar且前置>=' + MIN_BARS_BEFORE_SC + '根'],
-    ['SC放量', scVolOk, scOk ? fmt(scBar.v, 0) + '/均' + fmt(preAvgVol, 0) : 'NA', '> 均量x' + SC_VOL_MULT + '（软条件不拦截）', true],
-    ['AR反弹', arOk, arOk || arIdx > 0 ? '高' + fmt(arHigh) + '(+' + (arRallyPct * 100).toFixed(1) + '%)' + (arConfirmed ? '已确立' : '未回落') : 'NA', '>=+' + (AR_MIN_RALLY * 100) + '%且已回落确立'],
-    ['ST不破位', stHoldOk, hasSt ? '低' + fmt(stLow) + '/SC低' + fmt(scLow) : '无ST', '>= SC低x' + (1 - ST_UNDERCUT)],
-    ['ST缩量', stVolOk, hasSt ? fmt(stVol, 0) + '/SC量' + fmt(scOk ? scBar.v : 0, 0) : '无ST', '< SC量x' + ST_VOL_SHRINK],
-    ['SOS突破', hasSos, hasSos ? '收' + fmt(sosBar.c) + '>上沿' + fmt(arHigh) : '未突破', '收盘 > AR上沿'],
-    ['SOS放量', sosVolOk, hasSos ? fmt(sosBar.v, 0) + '/区间均' + fmt(rangeAvgVol, 0) : 'NA', '> 区间均量x' + SOS_VOL_MULT],
-    ['SOS强势', sosStrongOk, hasSos ? '阳线' + (sosBar.c > sosBar.o ? 'y' : 'n') + '/收位' + (sosClosePos * 100).toFixed(0) + '%' : 'NA', '阳线且收位>=' + (SOS_CLOSE_POS * 100) + '%'],
-    ['SOS新鲜', sosFreshOk, hasSos ? '距今' + sosBarsAgo + '根/' + sosSecAgo + 's' : 'NA', '< ' + SOS_FRESH_BARS + '根 或 <= ' + SOS_FRESH_MAX_SEC + 's'],
-    ['吸筹区间', rangeLenOk, hasSos ? rangeBars + '根/' + rangeSec + 's' : 'NA', '>= ' + RANGE_MIN_BARS + '根 且 >= ' + RANGE_MIN_SEC + 's'],
-    ['SOS站上成本线', sosAboveCostOk, hasSos ? '收' + fmt(sosBar.c) + '/成本' + fmt(costAtSos) : 'NA', '收盘 > 突破时成本线'],
-    ['当前成本线上', nowAboveCostOk, Number.isFinite(deviationPct) ? deviationPct.toFixed(1) + '%' : '缺失', '偏离% > 0'],
-    ['池子流动性', poolOk, '$' + fmt(poolLiq, 0), '>= $' + MIN_POOL_LIQ],
+    ['平台', isTargetPlatform, platformLabel, 'Solana(3)/BSC(56)/Robinhood(4663)/Arc(5042)平台白名单，排除假Pump/Four'],
+    ['历史最高市值', historicalMcapOk, '$' + Math.round(historicalMcap), '> ' + MIN_HISTORICAL_MCAP],
+    ['当前市值', mcapOk, '$' + Math.round(mcap), '> 100000'],
+    ['有效V转', hasEffectiveV, hasEffectiveV ? 'y@' + num(recentV.signalTime) : 'n', '最新confirmed（含已完成突破）'],
+    // ['V转回撤深度', vRetracementOk, vRetracementValid ? fmt(vRetracement * 100, 2) + '%' : '回撤数据缺失或无效', '> ' + (V_MIN_RETRACEMENT * 100) + '%'],
+    ['V转持续时间', vDurationOk, vTopTime > 0 && vSignalTime > 0 ? vDurationSec + '秒' : '时间缺失', '> ' + V_MIN_DURATION_SEC + '秒（signalTime - top_price_time）'],
+    ['SC定位', scOk, scOk ? 'idx' + scIdx + '@' + scBar.t + '(粒度' + resolutionSec + 's)' : '未定位', 'V低点匹配到已收线bar'],
+    ['AR反弹', arOk, arOk || arIdx > 0 ? '候选' + arCandidateCount + '个/最高' + fmt(arHigh) + '(+' + (arRallyPct * 100).toFixed(1) + '%)' + (arConfirmed ? '已确立' : '未回落') : 'NA', '>=+' + (AR_MIN_RALLY * 100) + '%且已回落确立，取SOS之前最高候选'],
+    ['SOS突破', hasSos, latestBar ? '最新收' + fmt(latestBar.c) + '/上沿' + fmt(arHigh) : 'K线不足', '最新收 > 已确认AR上沿'],
   ]
 
   // 结构可见性：SC 后已收线的 bar 数。太少说明 SC 刚发生、AR/ST/SOS 还没来得及形成——
   // 这是"等待结构展开"，不是"形态不符"，日志上区分开
   const barsAfterSc = scOk ? scMaxIdx - scIdx : 0
-  const phase = !hasEffectiveV ? '无V转'
+  const phase = !isTargetPlatform ? '平台不符'
+    : !mcapOk ? '市值不足'
+    : !historicalMcapOk ? '历史最高市值不足'
+    : !hasEffectiveV ? '无V转'
     : !scOk ? 'SC未定位'
-    : !arOk ? (barsAfterSc < MIN_BARS_BEFORE_SC ? 'A阶段(SC刚发生,结构未展开,SC后仅' + barsAfterSc + '根收线bar,等待)' : 'A阶段(SC后待AR确立)')
-    : !stOk ? 'B阶段(ST测试中)' : !hasSos ? 'C阶段(待SOS突破)' : 'D阶段(SOS)'
+    : !arOk ? (barsAfterSc < 2 ? 'A阶段(SC刚发生,结构未展开,SC后仅' + barsAfterSc + '根收线bar,等待)' : 'A阶段(SC后待AR确立)')
+    : !hasSos ? 'C阶段(待SOS突破)' : 'D阶段(SOS)'
   const head = 'VER=' + VERSION + ' [' + symbol + '] K' + ki.resolution + ' 阶段=' + phase
-  const fmtItem = ([n, ok, a, e, soft]) => `${n}${ok ? '✅' : soft ? '⚠️' : '❌'}: ${a} [期望 ${e}]`
+  const fmtItem = ([n, ok, a, e]) => `${n}${ok ? '✅' : '❌'}: ${a} [期望 ${e}]`
 
   // 未命中把❌项排前面输出（v1.9：日志会被截断，❌项在前保证截断只吃掉✅项，漏斗分析不受影响）
-  // v2.1：软条件（soft=true）不达标不拦截，仅 ⚠️ 标注
-  const fails = checks.filter((c) => !c[1] && !c[4])
+  const fails = checks.filter((c) => !c[1])
   if (fails.length) {
-    const rest = checks.filter((c) => c[1] || c[4])
-    ctx.log.error('未命中 ' + head + ' 通过' + checks.filter((c) => c[1]).length + '/' + checks.length + '  ||  ' + fails.concat(rest).map(fmtItem).join('  |  '))
+    const rest = checks.filter((c) => c[1])
+    ctx.log.error('未命中 ' + head + ' 通过' + checks.filter((c) => c[1]).length + '/' + checks.length + '  ||  ' + fails.concat(rest).map(fmtItem).join('  |  ') + '  |  ' + stInfo + '  |  ' + chipInfo)
     return false
   }
-  ctx.log.success('命中<威科夫SOS买点> ' + head + '  ||  ' + checks.map(fmtItem).join('  |  '))
+  ctx.log.success('命中<威科夫SOS买点> ' + head + '  ||  ' + checks.map(fmtItem).join('  |  ') + '  |  ' + stInfo + '  |  ' + chipInfo)
   return true
 } catch (e) {
   ctx.log.error('策略异常: ' + (e && e.message ? e.message : String(e)))

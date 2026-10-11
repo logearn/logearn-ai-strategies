@@ -1,34 +1,24 @@
 // ==============================================================
-// 单代币强势盘策略 v1
-// 执行顺序：拉黑检查 → 前置静默过滤 → 命中条件与日志。
-//
-// 【拉黑】币龄 >60秒，且以下任一垃圾钱包占比 >=10%：
-//   logearn.shit_volume / holders.distribution.risk.shit.pct。
-//   命中后加入本策略黑名单、输出日志并返回 false；拉黑先于平台过滤。
-//
-// 【前置过滤】以下全部满足才继续，否则静默返回 false：
-//   1. 平台在 Solana(3)/BSC(56)/Robinhood(4663)/Arc(5042)已配置白名单中，排除假Pump/Four。
-//   2. 0 < 市值 < $120,000（取 current_mcap、mcap、fdv 三者最大值）。
-//   3. 最新AO >0，且 >上一根AO。
-//   4. 最新AC >0，且 >上一根AC；AC=当前AO减包含自身的近5根AO均值，至少需6根AO数据。
-//
-// 【命中条件】以下全部满足才返回 true，否则输出未命中日志：
-//   1. 优质持仓 >5%（holders.stats.quality.good_pct）。
-//   2. 大底座持仓 >10%（holders.distribution.push.low_base.pct）。
-//   3. 惯犯持仓 <30%（holders.distribution.risk.habitual.pct）。
-//   4. 同批次新号持仓 <10%（holders.distribution.risk.cluster_batch.pct）；缺失或无效拒绝。
-//   5. DEV及关联持仓 <5%（holders.distribution.risk.dev.pct）；不达标仅拒绝，不拉黑。
-//   6. 近5分钟秒均成交额 >$40（volume_change_5m / 300，即5分钟成交额 >$12,000）。
-//   7. 24小时买入次数 >50（buy_tx_count_d1）。
-//   8. 2% < 成本线偏离 <120%（avg_price_deviation_pct）。
-//
-// 【未启用】币龄1～500分钟命中限制、狙击及关联 >30%拉黑均已注释。
-// 【仅展示】上下方筹码、总持仓、内盘卖出率、内盘剩余持仓不参与判定。
-// Holders持仓占比按总发行量计，单位%；除同批次新号外，数值缺失/非有限值由num转为0。
+// 单代币强势盘策略  v1.0.9
+// 变更(v1.0.9)：
+//   1. 垃圾钱包(持仓量)% / 垃圾钱包(Holders桶)% / 狙击及关联% 三项，除原有「命中即拉黑」外，
+//      【同时】作为逐条判定（soft 拒绝）——拉黑有 100 分钟年龄门，早期盘够不着；加进 checks 后
+//      开盘初期这几项超标也会直接 pass=false 过滤掉（只是不永久拉黑）。
+//   2. 新增逐条判定：捆绑及关联% <= 30、高频钱包% <= 30、同源集群% <= 70。
+//   3. 拉黑年龄门 AGE_MIN_SEC 已调为 100 分钟（6000s），相关注释同步。
+// 变更(v1.0.8)：
+//   1. 新增判定「大底座% > 10」(ctx.holders.distribution.push.low_base.pct：底部低价控盘筹码)。
+//   2. 新增判定「惯犯% < 30」(ctx.holders.distribution.risk.habitual.pct：惯犯标签桶占比)。
+//      新增判定「DEV及关联% < 5」(ctx.holders.distribution.risk.dev.pct：DEV 本人/关联群/同源簇占比)。
+//   3. 新增判定「近5分钟秒均交易量 > $40」(logearn.volume_change_5m / 300)。
+//   4. 优质持仓下限 1% → 5%。
+//   5. 黑名单加年龄门：仅当年龄 > 1 分钟才启动拉黑(太早数据不稳，避免误杀)。
+// 保留：狙击及关联% > 30 拉黑 + 垃圾钱包双源 >=5 拉黑 + 四链平台白名单 + 年龄 1分钟~500分钟
+//       + 市值<12w + 买入次数>50 + 成本线偏离 2~120% + AO 上升 + AC 上升
 // ==============================================================
 
 // ---------- 版本号 ----------
-const VERSION = 'v1'
+const VERSION = 'v1.0.9'
 
 // ---------- 工具函数 ----------
 const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : 0 }
@@ -38,17 +28,19 @@ const sma = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length :
 const MCAP_MAX = 120000     // 有效市值上限（USD）
 const DEV_MIN = 2           // 成本线偏离下限（%）
 const DEV_MAX = 120         // 成本线偏离上限（%）
-const AGE_MIN_SEC = 60      // 拉黑年龄门：严格 >60秒；命中年龄下限检查已注释
-const AGE_MAX_MIN = 500     // 预留生命周期上限（分钟），命中检查已注释
-const SHIT_MAX = 10          // 垃圾钱包占比上限（%）—— 黑名单组：>= 此值即拉黑（两个数据源共用）
-const SNIPER_MAX = 30       // 预留狙击及关联钱包占比上限（%），拉黑检查已注释
+const AGE_MIN_SEC = 6000      // 拉黑年龄门（秒）= 100 分钟：年龄 <= 此值不启动【永久拉黑】（早期数据不稳，避免误杀）
+const AGE_MAX_MIN = 500     // 生命周期上限（分钟）
+const SHIT_MAX = 5          // 垃圾钱包占比上限（%）—— 黑名单组：>= 此值即拉黑（两个数据源共用）
+const SNIPER_MAX = 30       // 狙击及关联钱包占比上限（%）—— 黑名单组：> 此值即拉黑
 const BUYTX_MIN = 50        // 24h 买入次数下限
 const GOOD_PCT_MIN = 5      // Holders 优质持仓占比下限（%）
 const LOW_BASE_MIN = 10     // 大底座（低价底仓）占比下限（%）—— > 此值才算底部有控盘筹码
 const HABITUAL_MAX = 30     // 惯犯钱包占比上限（%）—— < 此值才过（惯犯太多=砸盘惯性强）
-const CLUSTER_BATCH_MAX = 10 // 同批次新号钱包持仓占总发行量须 <10%
 const DEV_HOLD_MAX = 5      // DEV及关联占比上限（%）—— < 此值才过（DEV 控盘太多=砸盘风险）
-const VOL5M_PER_SEC_MIN = 40 // 近 5 分钟平均每秒交易量下限（USD）—— 盘面热度门槛
+const VOL5M_PER_SEC_MIN = 100 // 近 5 分钟平均每秒交易量下限（USD）—— 盘面热度门槛
+const BUNDLE_MAX = 40        // 捆绑及关联占比上限（%）—— <= 此值才过（捆绑控盘太多=砸盘风险）
+const FREQUENT_MAX = 40      // 高频钱包占比上限（%）—— <= 此值才过
+const HOMOLOGY_MAX = 70      // 同源集群（时间/筹码/同批新号）占比上限（%）—— <= 此值才过
 
 // 发射平台白名单：以下为四链全量列表，删除或注释某一行即可禁用该平台。
 // 按链匹配平台白名单；Solana 地址区分大小写，EVM 平台标识统一小写。
@@ -135,10 +127,14 @@ const shitHoldersPct = num(ctx.holders?.distribution?.risk?.shit?.pct)
 const lowBasePct = num(ctx.holders?.distribution?.push?.low_base?.pct)
 // ❌ 惯犯（distribution.risk.habitual：惯犯标签桶持仓/总发行量%）
 const habitualPct = num(ctx.holders?.distribution?.risk?.habitual?.pct)
-const clusterBatchPct = ctx.holders?.distribution?.risk?.cluster_batch?.pct
-const clusterBatchValid = typeof clusterBatchPct === 'number' && Number.isFinite(clusterBatchPct) && clusterBatchPct >= 0 && clusterBatchPct <= 100
 // 🐕 DEV及关联（distribution.risk.dev：DEV本人/关联群及同源簇持仓/总发行量%）
 const devPct = num(ctx.holders?.distribution?.risk?.dev?.pct)
+// 📦 捆绑及关联（distribution.risk.bundle：捆绑本人/关联/转账连通分量持仓/总发行量%）
+const bundlePct = num(ctx.holders?.distribution?.risk?.bundle?.pct)
+// 🤖 高频钱包（distribution.risk.frequent：frequent_trader 标签桶持仓/总发行量%）
+const frequentPct = num(ctx.holders?.distribution?.risk?.frequent?.pct)
+// 🕸 同源集群总体（distribution.risk.cluster_all：时间/筹码/同批新号任一命中持仓/总发行量%）
+const homologyPct = num(ctx.holders?.distribution?.risk?.cluster_all?.pct)
 
 // ---------- 筹码分析（仅展示，不参与判定）----------
 const chipAbove = num(chip.above_percent)          // 当前价上方筹码%（抛压）
@@ -192,7 +188,7 @@ const shitVolPct = num(logearn.shit_volume)
 const blacklistChecks = [
   ['垃圾钱包(持仓量)占比过高', shitVolPct >= SHIT_MAX, shitVolPct.toFixed(1), '>= ' + SHIT_MAX],
   ['垃圾钱包(Holders桶)占比过高', shitHoldersPct >= SHIT_MAX, shitHoldersPct.toFixed(1), '>= ' + SHIT_MAX],
- // ['狙击及关联占比过高', sniperPct > SNIPER_MAX, sniperPct.toFixed(1), '> ' + SNIPER_MAX],
+  ['狙击及关联占比过高', sniperPct > SNIPER_MAX, sniperPct.toFixed(1), '> ' + SNIPER_MAX],
 ]
 const blackHit = blacklistChecks.filter((c) => c[1])
 // 年龄门：仅当年龄 > 1 分钟（AGE_MIN_SEC）才启动拉黑——太早(开盘头 1 分钟)数据不稳、狙击/垃圾占比易虚高，
@@ -205,30 +201,41 @@ if (blackHit.length && ageSec > AGE_MIN_SEC) {
   return false
 }
 
-// ---------- 前置静默条件 beforeChecks（不过则静默返回，不打日志）----------
-const beforeChecks = [
-  ['平台', isTargetPlatform, platformLabel, 'Solana(3)/BSC(56)/Robinhood(4663)/Arc(5042)平台白名单'],
-  ['市值', effMcap > 0 && effMcap < MCAP_MAX, effMcap.toFixed(0), '>0 且 < ' + MCAP_MAX],
-  ['AO', aoOk, ao0.toFixed(0) + '/' + ao1.toFixed(0), 'ao0>0 且 ao0>ao1'],
-  ['AC', acOk, (ac0 === null ? 'NA' : ac0.toFixed(1)) + '/' + (ac1 === null ? 'NA' : ac1.toFixed(1)), 'ac0>0 且 ac0>ac1']
-]
-const beforePassed = beforeChecks.every(c => c[1])
-if (!beforePassed) {
-  return false
-}
-
 // ---------- 逐条判定（顺序=优先级）----------
 const checks = [
+  ['平台', isTargetPlatform, platformLabel, 'Solana(3)/BSC(56)/Robinhood(4663)/Arc(5042)平台白名单'],
   // ['年龄(秒)', launchTime > 0 && ageSec >= AGE_MIN_SEC, ageSec, '>= ' + AGE_MIN_SEC],
   // ['年龄(分)', launchTime > 0 && ageMin <= AGE_MAX_MIN, Number.isFinite(ageMin) ? ageMin.toFixed(1) : 'NA', '<= ' + AGE_MAX_MIN],
+  ['市值', effMcap > 0 && effMcap < MCAP_MAX, effMcap.toFixed(0), '>0 且 < ' + MCAP_MAX],
+  // 至少有 9% 的优质
   ['优质持仓%', goodPct > GOOD_PCT_MIN, goodPct.toFixed(2), '> ' + GOOD_PCT_MIN],
+  // 至少有 10% 的底部筹码
   ['大底座%', lowBasePct > LOW_BASE_MIN, lowBasePct.toFixed(1), '> ' + LOW_BASE_MIN],
+  // 小于 30% 的惯犯钱包
   ['惯犯%', habitualPct < HABITUAL_MAX, habitualPct.toFixed(1), '< ' + HABITUAL_MAX],
-  ['同批次新号钱包持仓%', clusterBatchValid && clusterBatchPct < CLUSTER_BATCH_MAX, clusterBatchValid ? clusterBatchPct.toFixed(2) : '缺失或无效', '< ' + CLUSTER_BATCH_MAX],
+  // dev 集群小于 5%
   ['DEV及关联%', devPct < DEV_HOLD_MAX, devPct.toFixed(1), '< ' + DEV_HOLD_MAX],
+  // 垃圾钱包不能超过 5%
+  ['垃圾钱包(持仓量)%', shitVolPct < SHIT_MAX, shitVolPct.toFixed(1), '< ' + SHIT_MAX],
+  // 垃圾钱包不能超过 5%
+  ['垃圾钱包(Holders桶)%', shitHoldersPct < SHIT_MAX, shitHoldersPct.toFixed(1), '< ' + SHIT_MAX],
+  // 狙击钱不不能超过 30%
+  ['狙击及关联%', sniperPct <= SNIPER_MAX, sniperPct.toFixed(1), '<= ' + SNIPER_MAX],
+  // 捆绑不能超过 40%
+  ['捆绑及关联%', bundlePct <= BUNDLE_MAX, bundlePct.toFixed(1), '<= ' + BUNDLE_MAX],
+  // 高频不能超过 40%
+  ['高频钱包%', frequentPct <= FREQUENT_MAX, frequentPct.toFixed(1), '<= ' + FREQUENT_MAX],
+  // 同源集群不能超过 70%
+  ['同源集群%', homologyPct <= HOMOLOGY_MAX, homologyPct.toFixed(1), '<= ' + HOMOLOGY_MAX],
+  // ，每秒交易量 超过 $100
   ['秒均交易量$', vol5mPerSec > VOL5M_PER_SEC_MIN, vol5mPerSec.toFixed(1), '> ' + VOL5M_PER_SEC_MIN],
+  // 至少 50次交易
   ['买入次数', buyTxD1 > BUYTX_MIN, buyTxD1, '> ' + BUYTX_MIN],
+  // 必须在成本线上方
   ['偏离%', deviationPct > DEV_MIN && deviationPct < DEV_MAX, deviationPct.toFixed(1), DEV_MIN + '~' + DEV_MAX],
+  // AO. AC. 为正
+  ['AO', aoOk, ao0.toFixed(0) + '/' + ao1.toFixed(0), 'ao0>0 且 ao0>ao1'],
+  ['AC', acOk, (ac0 === null ? 'NA' : ac0.toFixed(1)) + '/' + (ac1 === null ? 'NA' : ac1.toFixed(1)), 'ac0>0 且 ac0>ac1']
 ]
 
 // ---------- 输出（全程仅一条日志，筹码摘要仅拼接展示、不参与 passed）----------

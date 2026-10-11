@@ -5,14 +5,14 @@
 //
 // 【持仓风险】以下条件必须通过，否则拒绝本次：
 //   Top30 黑名单钱包不存在；Top5 单钱包持仓 <=10%；Top5 转入筹码 <=5%；
-//   惯犯持仓 <25%；套牢盘持仓 <30%；优质持仓 >15%；风险持仓 <50%；
+//   惯犯持仓 <25%；优质持仓 >15%；风险持仓 <50%；
 //   垃圾钱包持仓 <=5%；DEV及关联钱包持仓 <=5%。
 //
 // 【拉黑条件】命中任一条件加入本策略黑名单：
 //   1. 垃圾钱包持仓 >5%。
 //   2. DEV及关联钱包持仓 >5%。
-//   3. 风险检查全部通过、当前市值 >=$50,000、下方筹码有效且 <=25%。
 //   数据缺失或无效只拒绝本次，不作为拉黑依据。
+//   （下方筹码占比不达标只拒绝本次，不再拉黑）
 //
 // 【命中条件】当前市值 >=$50,000；下方筹码 >25%；且下方筹码 >上方筹码。
 //   下方/上方筹码均按百分比口径检查；本层不使用 code1 以外的行情结构信号。
@@ -20,12 +20,11 @@
 
 // ---------- 参数 ----------
 const MIN_MCAP = 50000           // 当前交易市值下限（USD），允许等于50k
-const MIN_BELOW_PERCENT = 25     // 下方筹码占比须 >25%，<=25%拉黑
+const MIN_BELOW_PERCENT = 25     // 下方筹码占比须 >25%
 const TOP_HOLD_MAX = 10          // Top5任一钱包持仓占比上限（%）
 const TOP_TRANSFER_MAX = 5       // Top5任一钱包转入筹码占总发行量上限（%）
 const HABITUAL_MAX = 25          // 惯犯钱包持仓占总发行量须 <25%
-const UNDERWATER_MAX = 30        // 套牢盘钱包持仓占总发行量须 <30%
-const GOOD_MIN = 15              // 优质钱包持仓占总发行量须 >15%
+const GOOD_MIN = 10              // 优质钱包持仓占总发行量须 >15%
 const RISK_MAX = 50              // 风险钱包持仓占总发行量须 <50%
 const SHIT_MAX = 5               // 垃圾钱包持仓占总发行量 >5%拉黑，等于5%允许
 const DEV_MAX = 5                // DEV及关联钱包持仓占总发行量 >5%拉黑，等于5%允许
@@ -43,13 +42,11 @@ const holders = Array.isArray(ctx.holders?.list) ? ctx.holders.list : (Array.isA
 const top30 = holders.slice(0, 30)
 const risk = ctx.holders?.distribution?.risk || {}
 const habitual = risk.habitual?.pct
-const underwater = risk.underwater?.pct
 const shitPct = risk.shit?.pct
 const shitValid = typeof shitPct === 'number' && Number.isFinite(shitPct) && shitPct >= 0 && shitPct <= 100
 const devPct = risk.dev?.pct
 const devValid = typeof devPct === 'number' && Number.isFinite(devPct) && devPct >= 0 && devPct <= 100
 const habitualValid = typeof habitual === 'number' && Number.isFinite(habitual) && habitual >= 0 && habitual <= 100
-const underwaterValid = typeof underwater === 'number' && Number.isFinite(underwater) && underwater >= 0 && underwater <= 100
 const quality = ctx.holders?.stats?.quality || {}
 const goodPct = quality.good_pct
 const riskPct = quality.risk_pct
@@ -71,7 +68,6 @@ const riskChecks = [
   ['Top5单钱包持仓%', !whale, whale ? `${whale.wallet}: ${whale.total_hold_percent.toFixed(2)}%` : '未超限', '<= ' + TOP_HOLD_MAX + '%'],
   ['Top5单钱包转入%', !ratHolder, ratHolder ? `${ratHolder.wallet}: ${ratHolder.transfer_in_percent.toFixed(2)}%` : '未超限', '<= ' + TOP_TRANSFER_MAX + '%'],
   ['惯犯持仓%', habitualValid && habitual < HABITUAL_MAX, habitualValid ? habitual.toFixed(2) + '%' : '缺失或无效', '< ' + HABITUAL_MAX + '%'],
-  ['套牢盘持仓%', underwaterValid && underwater < UNDERWATER_MAX, underwaterValid ? underwater.toFixed(2) + '%' : '缺失或无效', '< ' + UNDERWATER_MAX + '%'],
   ['优质持仓%', goodValid && goodPct > GOOD_MIN, goodValid ? goodPct.toFixed(2) + '%' : '缺失或无效', '> ' + GOOD_MIN + '%'],
   ['风险持仓%', riskValid && riskPct < RISK_MAX, riskValid ? riskPct.toFixed(2) + '%' : '缺失或无效', '< ' + RISK_MAX + '%'],
   ['垃圾钱包持仓%', shitValid && shitPct <= SHIT_MAX, shitValid ? shitPct.toFixed(2) + '%' : '缺失或无效', '<= ' + SHIT_MAX + '%'],
@@ -80,11 +76,10 @@ const riskChecks = [
 const riskFailed = riskChecks.filter(c => !c[1])
 
 // ---------- 代币拉黑条件 ----------
-// 垃圾钱包、DEV及关联钱包超限各自独立拉黑；下方筹码拉黑保留风险通过、市值达标与数据有效的前提。
+// 垃圾钱包、DEV及关联钱包超限各自独立拉黑。下方筹码占比不达标不再拉黑，只在命中判断阶段拒绝本次。
 const blacklistChecks = [
   ['垃圾钱包持仓超限', shitValid && shitPct > SHIT_MAX, shitValid ? shitPct.toFixed(2) + '%' : '缺失或无效', '<= ' + SHIT_MAX + '%'],
   ['DEV及关联钱包持仓超限', devValid && devPct > DEV_MAX, devValid ? devPct.toFixed(2) + '%' : '缺失或无效', '<= ' + DEV_MAX + '%'],
-  ['下方筹码占比不达标', riskFailed.length === 0 && mcapOk && belowValid && below <= MIN_BELOW_PERCENT, belowValid ? below.toFixed(2) + '%' : '缺失或无效', '> ' + MIN_BELOW_PERCENT + '%'],
 ]
 const blackHit = blacklistChecks.filter(c => c[1])
 if (blackHit.length) {
